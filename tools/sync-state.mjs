@@ -34,6 +34,13 @@ function git(args, cwd, input, env) {
     encoding: 'utf8',
     windowsHide: true,
     maxBuffer: 32 * 1024 * 1024,
+    // 网络类 git 操作必须有超时（2026-09-17 TR6 实测：实例仓的远端若不可达，状态推送会把整轮 tick
+    // 挂住 5 分钟）。超时后抛错 → 调用方按"推送失败"记 WARN，正常继续。
+    timeout: 60000,
+    // stderr 必须**捕获**而不是让它直接喷到调用者的终端（2026-09-17 TR6 实测）：
+    // 全新实例上还没有 `sync-state` 分支时，git 会打印 `fatal: couldn't find remote ref`，
+    // 对用户来说是"吓人的红字但其实正常"。这里收起来，由调用方写进 note/状态里解释。
+    stdio: ['pipe', 'pipe', 'pipe'],
     env: env ? { ...process.env, ...env } : process.env,
   });
 }
@@ -54,8 +61,9 @@ export function readFleet(instance, { branch = 'sync-state', fetch = true } = {}
   if (fetch) {
     try {
       git(['fetch', '-q', 'origin', branch], instance);
-    } catch (e) {
-      out.note = `fetch ${branch} 失败（离线或无该分支？）：${String(e.message || e).split('\n')[0]}`;
+    } catch {
+      // 不把 git 的原始报错直接抖给用户（全新实例上 `fatal: couldn't find remote ref sync-state` 很正常）
+      out.note = `远端还没有 ${branch} 分支（首台机器推上去后才有）或离线`;
     }
   }
   let entries = [];
@@ -106,7 +114,9 @@ export function writeMachine(instance, machine, stateObj, { branch = 'sync-state
         git(['read-tree', parentTree], instance, undefined, env);
         git(['update-index', '--add', '--cacheinfo', `100644,${blob},state/${machine}.json`], instance, undefined, env);
         const tree = git(['write-tree'], instance, undefined, env).trim();
-        const args = ['commit-tree', tree, '-m', message || `state: ${machine}`];
+        // commit-tree 同样需要身份：新机器上 `fatal: unable to auto-detect email address` 会让状态推不上去（TR6 实测）。
+        // 机器生成的状态提交显式署名，不要求用户先配 git 身份。
+        const args = ['-c', `user.name=${machine}`, '-c', `user.email=${machine}@local`, 'commit-tree', tree, '-m', message || `state: ${machine}`];
         if (parent) args.push('-p', parent);
         const commit = git(args, instance).trim();
         git(['push', '-q', 'origin', `${commit}:refs/heads/${branch}`], instance);
@@ -116,7 +126,10 @@ export function writeMachine(instance, machine, stateObj, { branch = 'sync-state
       }
     } catch (e) {
       lastError = String(e.message || e).split('\n').filter(Boolean).slice(-3).join(' | ');
-      // 并发 push 撞非快进 ⇒ 下一轮重新 fetch 后再试
+      // **只为"非快进"重试**（并发 push 的语义问题）。权限不足 / 离线 / 超时这类失败**立刻返回**：
+      // 2026-09-17 TR6 实测，原先对所有错误重试 3 次 × 60s 超时，把整轮 tick 拖到 3 分钟
+      // （而实例仓不可写是很容易发生的：克隆自只读来源、令牌过期…）。失败会被记成 statePush.ok=false 的 WARN。
+      if (!/non-fast-forward|fetch first|rejected|cannot lock/i.test(lastError)) break;
     }
   }
   return { ok: false, error: lastError || '未知错误' };

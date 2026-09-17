@@ -1,0 +1,15 @@
+{
+  "_comment": "机器配置模板：复制成 <实例根>/sync/machines/<本机id>.json 后改路径。**绝对路径只允许出现在这里**（不进共享文件）。",
+  "mu1": [
+    { "id": "notes", "repo": true, "path": "~/notes", "branch": "main",
+      "_comment": "你要同步的 git 仓：id 随便起（vault / notes / config…），path 用 ~ 或绝对路径，repo=true 表示它是 git 仓。" }
+  ],
+  "mu2": {
+    "_comment": "云盘镜像（可选，整段删掉 = 不参与镜像）。dest 必须是网盘客户端配的那个同步根；sets 里 source=你的权威目录、target=镜像内的相对子目录。属主可写、他人只读。",
+    "dest": "~/BaiduSyncdisk",
+    "autoSeed": true,
+    "sets": [
+      { "id": "docs", "source": "~/Documents/papers", "target": "papers" }
+    ]
+  }
+}

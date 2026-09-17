@@ -140,7 +140,8 @@ async function main() {
 
   const git = (cwd, args) => {
     try {
-      return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', windowsHide: true, maxBuffer: 32 * 1024 * 1024 }).trim();
+      // timeout：网络类操作（fetch/pull/push）在远端不可达时不能把整轮 tick 挂住（TR6 实测过 5 分钟挂死）。
+      return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', windowsHide: true, maxBuffer: 32 * 1024 * 1024, timeout: 120000 }).trim();
     } catch (e) {
       return { error: String(e.message || e).split('\n')[0] };
     }
@@ -161,7 +162,9 @@ async function main() {
     const dirty = git(path, ['status', '--porcelain']);
     if (typeof dirty === 'string' && dirty) {
       git(path, ['add', '-A']);
-      const c = git(path, ['commit', '-q', '-m', `sync: ${machine} ${stamp()}`]);
+      // 显式带身份：新机器上常常没配 user.name/user.email ⇒ 默认提交会以
+      // `fatal: unable to auto-detect email address` 失败（2026-09-17 TR6 实测：机器生成的提交不该依赖用户先配 git 身份）。
+      const c = git(path, ['-c', `user.name=${machine}`, '-c', `user.email=${machine}@local`, 'commit', '-q', '-m', `sync: ${machine} ${stamp()}`]);
       if (typeof c === 'object') {
         issues.push(`${r.id}: commit 失败`);
         say(`[FAIL] ${r.id}: commit 失败`);

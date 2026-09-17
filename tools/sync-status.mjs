@@ -154,7 +154,11 @@ function tickFacts() {
 
 function convergeFacts() {
   const f = join(INSTANCE, 'sync', 'state', `local-${machine}.json`);
-  if (!existsSync(f)) return { present: false, file: f };
+  // 2026-09-17 TR6 抓到：全新实例上（还没跑过 converge）此文件不存在，返回的对象**只有 present/file**，
+  // 下面任何 conv.actions / conv.failures 都会 TypeError 崩掉——而这是新用户跑的第一条命令。
+  // ⇒ 统一补默认值，让"还没跑过"变成一条 WARN 而不是崩溃。
+  const emptyConv = { present: false, file: f, at: null, targets: 0, changed: 0, requested: 0, failures: [], skipped: [], actions: [], classify: [], statePush: null };
+  if (!existsSync(f)) return emptyConv;
   try {
     const j = JSON.parse(readFileSync(f, 'utf8'));
     return {
@@ -171,7 +175,7 @@ function convergeFacts() {
       statePush: j.statePush || null,
     };
   } catch (e) {
-    return { present: false, file: f, error: e.message };
+    return { ...emptyConv, error: e.message };
   }
 }
 

@@ -41,7 +41,7 @@ cd ~/.ai-sync/instance
 
 ```bash
 cp ~/.ai-sync/engine/instance.example.json sync/instance.json     # 若实例仓里还没有
-cp sync/machines/<最接近的一台>.json sync/machines/<本机id>.json   # 然后改里面的路径
+cp <引擎根>/machines.example.json sync/machines/<本机id>.json   # 从模板开始（下面表格逐个字段说明）
 echo "<本机id>" > sync/local.machine                              # 机器标识（不入 git）
 ```
 
@@ -56,27 +56,35 @@ echo "<本机id>" > sync/local.machine                              # 机器标�
 
 ### A4. 装调度（让它在后台跑）
 
-Windows（在**实例根**跑，脚本在那里）：
-
-```powershell
-pwsh -File <实例根>/sync/sync-lite.ps1 -InstallTask            # 默认 5 分钟
-pwsh -File <实例根>/sync/sync-lite.ps1 -InstallTask -IntervalMinutes 2
-```
-
-**期望**：`[OK] 已注册计划任务 ai-sync-tick（每 5 分钟；pwsh=…）`。
-核对：`Get-ScheduledTaskInfo -TaskName ai-sync-tick | Select LastRunTime,LastTaskResult`（`0` = 正常）。
-
-macOS：
+**两个平台同一条命令**（引擎自带的安装器，是调度的唯一实现）：
 
 ```bash
-cp <引擎根>/sync/mac/ai-sync.tick.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai-sync.tick.plist
-launchctl print gui/$(id -u)/ai-sync.tick | head -20
+node <引擎根>/install/install.mjs --instance <实例根> --register            # 用 instance.json 里的 tick.intervalMinutes
+node <引擎根>/install/install.mjs --instance <实例根> --register --interval 2
 ```
 
-**期望**：`state = running` 或 `not running`（`StartInterval 300` 到点会自己起来）。
+| 平台 | 它会做什么 | 核对 |
+|---|---|---|
+| Windows | 建/更新计划任务 `tick.taskName`（默认 `ai-sync-tick`），动作 = `node <引擎根>/tools/sync-tick.mjs --instance <实例根>` | `Get-ScheduledTaskInfo -TaskName ai-sync-tick \| Select LastRunTime,LastTaskResult`（`0` = 正常） |
+| macOS | 写 `~/Library/LaunchAgents/<tick.launchdLabel>.plist` 并 `launchctl bootstrap` | `launchctl print gui/$(id -u)/ai-sync.tick \| head -20` |
 
-> 间隔改完不用重装：`sync-schedule.mjs --reconcile` 会在下一轮 tick 自动把配置落到调度上（Windows 重写任务、macOS 重写 plist）。
+**期望**：`[OK] register 成功（ai-sync-tick）`。
+
+> 只报告不安装：`node <引擎根>/install/install.mjs --instance <实例根>`（退出码 `2` = 未安装或间隔不一致）。
+> 卸载：`--unregister`。
+> 间隔改完**不用重装**：每轮 tick 开头会做一次对账（`sync-schedule.mjs --reconcile`），不一致就自动重排。
+
+macOS / Linux 若不想用安装器，也可以手写 plist / cron 直接调：
+
+```bash
+# launchd（等价于安装器做的事）
+# ProgramArguments: [<node 路径>, <引擎根>/tools/sync-tick.mjs, --instance, <实例根>]
+# StartInterval: 300        RunAtLoad: true
+# cron
+*/5 * * * * /usr/bin/env node <引擎根>/tools/sync-tick.mjs --instance <实例根>
+```
+
+
 
 ### A5. 首次同步
 

@@ -62,6 +62,12 @@ if (targetsJson) {
   process.exit(0);
 }
 
+// 2026-09-17 TR6 实测：源不存在时直接崩。**未配置 = 无事可做** ⇒ 显式 [--] 后正常退出。
+if (!existsSync(SRC)) {
+  if (targetsJson) { console.log(JSON.stringify({ renderer: 'conventions', targets: [] })); process.exit(0); }
+  console.log(`[--] 无 ${SRC}（实例还没写约定文本）→ 跳过渲染`);
+  process.exit(0);
+}
 const src = readFileSync(SRC, 'utf8');
 
 /** 取 `## §N` 小节正文：**去掉标题行**与末尾的「**派生副本**」清单块（那是元信息，含他机路径） */

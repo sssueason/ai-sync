@@ -56,18 +56,36 @@ const machine = (() => {
   return hostname().toLowerCase();
 })();
 
-/* ---- vault 路径：取该机 machines/<machine>.json 里 id=vault 的 path ---- */
+/* ---- vault 路径：取该机 machines/<machine>.json 里 id=vault 的 path ----
+ * 2026-09-17 TR6（照文档在全新机器上走）实测：把"没有 vault 条目"当硬错误，会让**不用 vault 的用户**
+ * 在第一条命令就失败。vault 只是第四个**可选**目标 ⇒ 没配置就显式跳过（打印 [--]），
+ * 而"配了却解析不了"仍是硬错误（exit 2）。两者必须区分，否则不是假绿就是假红。 */
 const machineCfg = join(AI, 'sync', 'machines', `${machine}.json`);
 let vaultPath = null;
+let vaultNote = '';
 if (existsSync(machineCfg)) {
-  const s = JSON.parse(readFileSync(machineCfg, 'utf8')).mu1?.find((x) => x.id === 'vault');
-  if (s?.path) vaultPath = s.path.startsWith('~/') ? join(HOME, s.path.slice(2)) : s.path;
-}
-if (!vaultPath) {
-  console.error(`[FAIL] 无法确定本机（${machine}）的 vault 路径：${machineCfg} 缺 mu1[id=vault].path`);
-  process.exit(2);
+  try {
+    const s = JSON.parse(readFileSync(machineCfg, 'utf8')).mu1?.find((x) => x.id === 'vault');
+    if (s?.path) vaultPath = s.path.startsWith('~/') ? join(HOME, s.path.slice(2)) : s.path;
+    else vaultNote = `${machineCfg} 无 mu1[id=vault] → 跳过 vault 目标（vault 是可选项）`;
+  } catch (e) {
+    console.error(`[FAIL] 机器配置解析失败 ${machineCfg}: ${e.message}`);
+    process.exit(2);
+  }
+} else {
+  vaultNote = `缺机器配置 ${machineCfg} → 跳过 vault 目标（新机/单机模式的正常情形）`;
 }
 
+// 契约（2026-09-17 TR6 实测）：源不存在时原先 exit 1 且无输出 ⇒ tick 变 rc=2、converge 报"输出不是 JSON"。
+// ⇒ `--targets-json` 必须**任何时候**都输出合法 JSON（缺源 = 空清单），渲染路径打印 [--] 后正常退出。
+if (!existsSync(SRC)) {
+  if (targetsJson) {
+    console.log(JSON.stringify({ renderer: 'agentFiles', targets: [] }));
+    process.exit(0);
+  }
+  console.log(`[--] 无 ${SRC}（实例还没写注入块源）→ 跳过渲染`);
+  process.exit(0);
+}
 const block = readFileSync(SRC, 'utf8').trimEnd() + '\n';
 
 /* 两种渲染模式：
@@ -99,8 +117,10 @@ const TARGETS = [
   { name: 'dsh AGENTS.md', path: join(HOME, '.dsh', 'AGENTS.md'), owner: 'dsh', family: 'agentFiles' },
   { name: 'opencode MEMORY-POINTER.md', path: join(HOME, '.config', 'opencode', 'MEMORY-POINTER.md'), owner: 'opencode', family: 'agentFiles' },
   { name: 'WorkBuddy USER.md', path: join(HOME, '.workbuddy', 'USER.md'), owner: 'workbuddy', family: 'agentFiles' },
-  { name: 'vault AGENTS.md', path: join(vaultPath, 'AGENTS.md'), neutral: true, owner: 'vault', family: 'agentFiles' },
+  // vault 目标只在真的配了 vault 时才存在（见上面 vaultNote）
+  ...(vaultPath ? [{ name: 'vault AGENTS.md', path: join(vaultPath, 'AGENTS.md'), neutral: true, owner: 'vault', family: 'agentFiles' }] : []),
 ];
+if (!vaultPath) console.log(`[--] ${vaultNote}`);
 
 if (targetsJson) {
   console.log(JSON.stringify({

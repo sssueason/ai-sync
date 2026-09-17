@@ -52,6 +52,14 @@ if (extraIdx !== -1 && process.argv[extraIdx + 1]) {
   extra = JSON.parse(process.argv[extraIdx + 1]);
 }
 
+// 2026-09-17 TR6（全新机器照文档走）实测：源文件不存在时 readFileSync 直接抛 ENOENT，
+// 新用户第一条命令就看到崩溃。**没配置源 = 无事可做** ⇒ 显式说一声、正常退出（打印了 [--]，不是静默跳过）。
+if (!existsSync(SRC)) {
+  // 契约：`--targets-json` **任何时候**都必须输出合法 JSON（缺源 = 空清单），否则 converge 会判"输出不是 JSON"。
+  if (targetsJson) { console.log(JSON.stringify({ renderer: 'mcp', targets: [] })); process.exit(0); }
+  console.log(`[--] 无 ${SRC}（实例还没配置 MCP 源）→ 跳过渲染`);
+  process.exit(0);
+}
 const src = JSON.parse(readFileSync(SRC, 'utf8')).mcpServers;
 for (const [k, v] of Object.entries(extra)) src[k] = { ...src[k], ...v };
 

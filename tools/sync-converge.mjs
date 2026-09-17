@@ -448,6 +448,9 @@ const state = {
 if (!DRY) {
   try {
     mkdirSync(stateDir, { recursive: true });
+    // 2026-09-17 TR6 实测：本工具写的是**整份**状态文件（自己的 schema），会把 sync-status 追加进去的
+    // `statePush` 字段抹掉 ⇒ "跨端状态推送失败"这条 WARN 永远看不到。这里把它带过去，保持两个写入方互不破坏。
+    if (prev?.statePush) state.statePush = prev.statePush;
     writeFileSync(stateFile, JSON.stringify(state, null, 2) + '\n', 'utf8');
   } catch (e) {
     failures.push(`状态写盘失败 ${stateFile}: ${e.message}`);
