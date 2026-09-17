@@ -292,7 +292,24 @@ async function main() {
     stats.schedNote = String(r.stdout || '').trim();
   }
 
-  /* 5. 日志（格式与既有 tick 一致：一行摘要 + 渲染器末行 + 可选 conv 摘要） */
+  /* 5. 保留策略：日志与报告不无限堆积（每轮跑一次，代价只是一次目录列举） */
+  let pruned = null;
+  const pruneTool = join(ENGINE, 'tools', 'sync-prune.mjs');
+  if (!DRY) {
+    if (existsSync(pruneTool)) {
+      const r = spawnSync(process.execPath, [pruneTool, '--instance', INSTANCE, '--quiet', '--json'], { encoding: 'utf8', windowsHide: true, timeout: 60 * 1000 });
+      try {
+        pruned = JSON.parse(String(r.stdout || '').trim());
+      } catch {
+        pruned = { broken: true }; // 工具在但拿不到结果 ⇒ 也要留痕，不能当成"无需清理"
+      }
+    } else {
+      // 缺工具 = 必须看得见的降级：否则新装机器上报告会悄悄堆起来（假绿防线 §3）
+      pruned = { missing: true };
+    }
+  }
+
+  /* 6. 日志（格式与既有 tick 一致：一行摘要 + 渲染器末行 + 可选 conv 摘要） */
   const elapsed = Math.round((Date.now() - t0) / 1000);
   // 日志行可读性（2026-09-17 用户反馈"日志可读性太差"）：三个渲染器各吐一句 `render done: 0 target(s) written`
   // 纯属噪声 ⇒ 全部成功时压缩成一句；**只要有失败就保留原样**（诊断不能被压缩掉）。
@@ -311,6 +328,16 @@ async function main() {
   // 「只读机器」的跳过必须进**日志行**（2026-09-17 实测发现：它原先只打印在 stdout，而 stdout 是瞬时的、日志才是持久证据）
   if (stats.readOnly) line += ' | read-only（本机标记为只读：已本地提交，未推送）';
   if (stats.convNote) line += ` | 收敛：${String(stats.convNote).replace(/^converge done: /, '')}`;
+  // 清理动作也要进日志行：删文件是"动作"，只在 stdout 说一句就没了（stdout 是瞬时的）。
+  // 缺工具/工具坏了同样要写进来 —— 否则"没清理"和"无需清理"在日志里长得一模一样。
+  if (pruned?.missing) line += ' | 清理：缺少 tools/sync-prune.mjs（本轮未清理）';
+  else if (pruned?.broken) line += ' | 清理：prune 未返回结果（本轮未清理）';
+  else if (pruned && ((pruned.deleted || []).length || pruned.truncated)) {
+    const bits = [];
+    if ((pruned.deleted || []).length) bits.push(`旧报告 ${pruned.deleted.length}`);
+    if (pruned.truncated) bits.push(`日志截断 ${pruned.truncated}`);
+    line += ` | 清理：${bits.join(' + ')}（-${pruned.freed || pruned.freedKB + ' KB'}）`;
+  }
   if (!DRY) {
     try {
       const dir = join(INSTANCE, 'sync', 'logs');

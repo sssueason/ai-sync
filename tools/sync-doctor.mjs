@@ -200,6 +200,29 @@ if (isMain) {
   }
 
   // 6. 调度（复用 install.mjs，唯一实现）
+  /* ---------------------------------------------------------------- 日志与报告体量
+   * 保留策略在 tools/sync-prune.mjs（tick 每轮自动跑一次）。这里断言它**确实在生效**：
+   * 报告是"每次运行新增一个"的文件，策略失效时唯一的表现就是数量悄悄涨回去。 */
+  const reportsDir = join(INSTANCE, 'sync', 'reports');
+  if (existsSync(reportsDir)) {
+    const md = readdirSync(reportsDir).filter((f) => f.endsWith('.md') && /-\d{8}-\d{4}\.md$/.test(f));
+    const byGroup = {};
+    for (const f of md) {
+      const g = f.replace(/-\d{8}-\d{4}\.md$/, '');
+      byGroup[g] = (byGroup[g] || 0) + 1;
+    }
+    const worst = Object.entries(byGroup).sort((a, b) => b[1] - a[1])[0];
+    const over = md.length > 200 || (worst && worst[1] > 25);
+    add('报告目录体量', over ? 'WARN' : 'PASS', '每组 ≤ 25 个（保留策略：最新 5 ∪ 7 天，硬上限 20）', `${md.length} 个 / ${Object.keys(byGroup).length} 组${worst ? `（最多 ${worst[0]} ${worst[1]} 个）` : ''}${over ? ' —— 清理可能没跑：node tools/sync-prune.mjs' : ''}`);
+  }
+  const logsDir = join(INSTANCE, 'sync', 'logs');
+  if (existsSync(logsDir)) {
+    const logs = readdirSync(logsDir).filter((f) => f.endsWith('.log'));
+    const bytes = logs.reduce((a, f) => a + statSync(join(logsDir, f)).size, 0);
+    const mb = bytes / 1048576;
+    add('日志目录体量', mb > 20 ? 'WARN' : 'PASS', '≤ 20 MB（tick 日志超 2 MB 自动截断、每日日志留 14 天）', `${logs.length} 个 / ${mb.toFixed(1)} MB`);
+  }
+
   const installPath = [join(ENGINE, 'install', 'install.mjs'), join(ENGINE, 'engine', 'install', 'install.mjs')].find((p) => existsSync(p));
   if (installPath) {
     const mod = await import(pathToFileURL(installPath).href);

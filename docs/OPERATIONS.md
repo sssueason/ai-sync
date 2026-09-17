@@ -158,3 +158,33 @@ Windows 仍会给该子进程分配一个**隐藏的** conhost（`可见=False`�
 
 tick 的 git 调用固定带 `GIT_TERMINAL_PROMPT=0` 与 `GCM_INTERACTIVE=Never`：隐藏窗口里没人看得见
 凭据提示，一旦弹出就是挂到超时为止。宁可快速失败（错误进 stderr / 日志行），也不要隐形等待。
+
+## 9. 日志与报告：保留策略（不无限堆积）
+
+同步很频繁（默认每 5 分钟一轮），所以"每次都写一个文件"的东西必须有上限，否则仓库和磁盘都会悄悄涨。
+
+| 产出 | 位置 | 保留 | 谁在管 |
+|---|---|---|---|
+| tick 日志 | `sync/logs/tick-<机器>.log`（每轮一行） | 超过 **2 MB** 自动截断为最近 **5000** 行 | `tools/sync-prune.mjs`（tick 每轮调用） |
+| 每晚重活日志 | `sync/logs/daily-<日期>.log` | 只留最新 **14** 个 | 同上 |
+| 诊断报告 | `sync/reports/<前缀>-<YYYYMMDD-HHMM>.md` | 每个前缀组保留「最新 **5** 个 ∪ **7** 天内」，且整组硬上限 **20** 个 | 同上 |
+
+手工预览与调整：
+
+```bash
+node tools/sync-prune.mjs --dry-run          # 只报告会删什么（默认就会真删，所以先看再删）
+node tools/sync-prune.mjs                    # 执行
+node tools/sync-prune.mjs --keep-reports 10 --keep-days 30 --max-keep 50   # 想留更多
+```
+
+清理动作会写进 tick 日志行（`| 清理：旧报告 15（-61KB）`）——**删了什么必须看得见**，否则它就是一种隐形的数据丢失。
+`sync-doctor` 另有两条体量断言（报告每组 > 25 个、日志 > 20 MB 即 WARN），负责在策略失效时报警。
+
+**报告不进 git**（`.gitignore` 里有 `sync/reports/`）。为什么：
+
+- 它每次运行新增一个带时间戳的文件 ⇒ 一天几十个 ⇒ 仓库无限膨胀，而且每台机器都要拉一遍；
+- 更糟的是它和状态文件一样会**反复冲突**（2026-09-17 一台机器的积压就是这么来的：旧 tick 每 5 分钟提交
+  `.last-state-*.json`，远端已把它移出跟踪集 ⇒ 每次 rebase 撞 modify/delete ⇒ integrate 永久失败）。
+
+跨机器需要的不是这些原始报告，而是**状态与结论**：`sync-state` 分支的 `state/<机器>.json`（心跳 / rc / 待办）
+与控制台的「总览 / 运行记录」两页已经覆盖。要看某台机器的镜像细节时，去那台机器上翻本机报告即可。
