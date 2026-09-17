@@ -203,6 +203,14 @@ async function main() {
       say(`[--] ${r.id}: 无待推`);
       continue;
     }
+    // 「只读机器」策略（2026-09-17）：instance.json 的 machines.<id>.write === false ⇒ 允许提交到本地，
+    // 但**不推送**（用于只读客户端/临时机）。跳过必须留痕：写进日志行与 notes，不静默。
+    if (cfg.machines && cfg.machines[machine] && cfg.machines[machine].write === false) {
+      stats.readOnly = true;
+      notes.push(`${r.id}: 本机被标记为只读（machines.${machine}.write=false）→ 已本地提交但不推送`);
+      say(`[SKIP] ${r.id}: 只读机器 → 不推送（本地提交保留）`);
+      continue;
+    }
     const push = git(path, ['push', '-q']);
     if (typeof push === 'object') {
       issues.push(`${r.id}: push 失败`);
@@ -280,6 +288,8 @@ async function main() {
   const elapsed = Math.round((Date.now() - t0) / 1000);
   const notes3 = stats.rendered.length ? stats.rendered.join(' | ') : '(未渲染)';
   let line = `tick ${machine} ${stamp()} pull=${stats.pulled} commit=${stats.committed} push=${stats.pushed} skip=${stats.skipped} elapsed=${elapsed}s rc=${issues.length} | ${notes3}`;
+  // 「只读机器」的跳过必须进**日志行**（2026-09-17 实测发现：它原先只打印在 stdout，而 stdout 是瞬时的、日志才是持久证据）
+  if (stats.readOnly) line += ' | read-only（本机标记为只读：已本地提交，未推送）';
   if (stats.convNote) line += ` | conv: ${stats.convNote}`;
   if (!DRY) {
     try {
