@@ -122,20 +122,75 @@ function taskExists(name) {
 }
 
 /** 检测平台调度现状。返回 {platform,task,installed,want,actual,unit,inSync,detail} */
+/* ---------------------------------------------------------------- 调度动作是否真的可用
+ * 2026-09-18（某台机器指出，结构性假绿）：原先只比 `<Interval>` / `StartInterval`，
+ * 完全**不看动作指向什么** ⇒ 分不出"注册正确"和"动作指向一个不存在的脚本"。
+ * 两种形态都真出现过：① 原地布局下引擎根算错，注册出 `<实例>/engine/tools/…`（不存在）；
+ * ② 引擎被移到新路径 / 旧 clone 被删 / 任务被手改。此时 interval 依然"一致"，巡检却全绿。
+ * 这里把"动作 → 运行器 → 命令文件 → 真正的脚本"这条链逐段验存在性，任一环缺失就算不一致。 */
+function winActionProblems(taskXml) {
+  const problems = [];
+  const args = (/<Arguments>([\s\S]*?)<\/Arguments>/.exec(taskXml) || [])[1] || '';
+  const quoted = [...args.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+  const runner = quoted.find((f) => /run-hidden\.vbs$/i.test(f));
+  const cmdFile = quoted.find((f) => /-cmd\.txt$/i.test(f));
+  if (!runner) problems.push('动作里没有 run-hidden.vbs（隐藏运行器）');
+  else if (!existsSync(runner)) problems.push(`隐藏运行器不存在：${runner}`);
+  if (!cmdFile) problems.push('动作里没有命令文件（*-cmd.txt）');
+  else if (!existsSync(cmdFile)) problems.push(`命令文件不存在：${cmdFile}`);
+  else {
+    // 命令文件 = UTF-16LE(带 BOM) 的一整行；里面第一个 .mjs 就是要跑的脚本
+    try {
+      const line = readFileSync(cmdFile, 'utf16le').replace(/^\uFEFF/, '');
+      const inner = [...line.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+      const script = inner.find((f) => /\.(mjs|ps1)$/i.test(f));
+      if (!script) problems.push(`命令文件里没有脚本路径：${line.trim().slice(0, 80)}`);
+      else if (!existsSync(script)) problems.push(`命令文件指向不存在的脚本：${script}`);
+    } catch (e) {
+      problems.push(`命令文件读不出来：${e.message}`);
+    }
+  }
+  return problems;
+}
+
+/** 读计划任务 XML。
+ *  ⚠️ `schtasks /xml` 用的是**控制台代码页**（中文机 = GBK），按 UTF-8 读会把中文用户名变成 `??????` ⇒
+ *  路径存在性检查必然假失败（2026-09-18 实测：用户名含中文时，路径里的中文会被解成一串 `?`）。
+ *  所以按字节读，再依次试 UTF-16LE(BOM) → UTF-8(严格) → GBK。 */
+function readTaskXml(name) {
+  const r = spawnSync('schtasks', ['/query', '/tn', name, '/xml', 'ONE'], { windowsHide: true, maxBuffer: 8 << 20 });
+  if (r.status !== 0 || !r.stdout || !r.stdout.length) return null;
+  const buf = r.stdout;
+  if (buf.length > 1 && buf[0] === 0xff && buf[1] === 0xfe) return buf.toString('utf16le').replace(/^\uFEFF/, '');
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buf);
+  } catch {
+    try {
+      return new TextDecoder('gbk').decode(buf);
+    } catch {
+      return buf.toString('latin1');
+    }
+  }
+}
+
 export function detectSchedule(instance, cfg = loadInstance(instance)) {
   const want = cfg?.tick?.intervalMinutes ?? 5;
   const out = { platform: process.platform, want, installed: false, actual: null, unit: 'min', inSync: null, detail: '' };
   if (process.platform === 'win32') {
     out.task = tickTaskName(cfg);
-    const q = spawnSync('schtasks', ['/query', '/tn', out.task, '/xml', 'ONE'], { encoding: 'utf8', windowsHide: true });
-    if (q.status !== 0) {
-      out.detail = '计划任务不存在';
+    const xml = readTaskXml(out.task);
+    if (xml === null) {
+      out.detail = '计划任务不存在（或查询失败）';
       return out;
     }
     out.installed = true;
-    const m = /<Interval>PT(\d+)M<\/Interval>/.exec(q.stdout || '');
+    const m = /<Interval>PT(\d+)M<\/Interval>/.exec(xml);
     out.actual = m ? Number(m[1]) : null;
-    out.inSync = out.actual === want;
+    const probs = winActionProblems(xml);
+    out.actionOk = probs.length === 0;
+    if (probs.length) out.actionProblems = probs;
+    out.inSync = out.actual === want && out.actionOk;
+    out.detail = probs.length ? probs.join('；') : '';
     return out;
   }
   if (process.platform === 'darwin') {
@@ -147,11 +202,21 @@ export function detectSchedule(instance, cfg = loadInstance(instance)) {
       out.detail = 'LaunchAgent 不存在';
       return out;
     }
-    const m = /<key>StartInterval<\/key>\s*<integer>(\d+)<\/integer>/.exec(readFileSync(plist, 'utf8'));
+    const xml = readFileSync(plist, 'utf8');
+    const m = /<key>StartInterval<\/key>\s*<integer>(\d+)<\/integer>/.exec(xml);
     out.actual = m ? Number(m[1]) : null;
     out.unit = 'sec';
     const wantSec = want * 60;
-    out.inSync = out.actual === wantSec;
+    // 同样验动作：ProgramArguments 里那个 .mjs 必须真的存在（引擎被移动/删掉后 interval 仍会"一致"）
+    const pargs = [...((/<key>ProgramArguments<\/key>[\s\S]*?<\/array>/.exec(xml) || [''])[0]).matchAll(/<string>([^<]+)<\/string>/g)].map((x) => x[1]);
+    const script = pargs.find((a) => /\.(mjs|ps1)$/i.test(a));
+    const probs = [];
+    if (!script) probs.push('plist 里没有脚本路径');
+    else if (!existsSync(script)) probs.push(`plist 指向不存在的脚本：${script}`);
+    out.actionOk = probs.length === 0;
+    if (probs.length) out.actionProblems = probs;
+    out.inSync = out.actual === wantSec && out.actionOk;
+    out.detail = probs.length ? probs.join('；') : '';
     out.wantSec = wantSec;
     return out;
   }

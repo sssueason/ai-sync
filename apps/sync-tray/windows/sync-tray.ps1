@@ -43,7 +43,41 @@ Add-Type -Namespace AiSync -Name Native -MemberDefinition '[System.Runtime.Inter
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $engineRoot = if ($Engine) { $Engine } elseif ($env:AI_SYNC_ENGINE) { $env:AI_SYNC_ENGINE } else { Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $here)) }
-$instanceRoot = if ($Instance) { $Instance } elseif ($env:AI_SYNC_INSTANCE) { $env:AI_SYNC_INSTANCE } else { $engineRoot }
+<#
+  实例根解析（2026-09-18 修，某台机器实测缺陷）：原先只有 `-Instance` → `$env:AI_SYNC_INSTANCE` → 引擎根，
+  而自启入口 sync-tray.vbs 当时不传 `-Instance` ⇒ 拆分布局下退化成**引擎根**（那里没有 sync/instance.json）
+  ⇒ 托盘 state=fail、interval 显示默认 5（配置是 20）、tip 报 4 个假问题 —— **机器好好的，图标红着骗人**。
+  现在按可信度依次找：
+    1) -Instance 参数（vbs 现在会传：它由托盘自己创建的自启快捷方式带进来）
+    2) $env:AI_SYNC_INSTANCE（官方读取顺序第二档）
+    3) ~/.ai-sync/instance（约定的独立实例位置；要有 sync/instance.json 才认）
+    4) **计划任务命令文件**里的 --instance（= 调度器实际在用的那个，最可信）
+    5) 引擎根（原地布局时它就是正确值）
+#>
+$instanceRoot = ''
+$instanceSource = ''
+if ($Instance) { $instanceRoot = $Instance; $instanceSource = '-Instance 参数' }
+elseif ($env:AI_SYNC_INSTANCE) { $instanceRoot = $env:AI_SYNC_INSTANCE; $instanceSource = 'AI_SYNC_INSTANCE 环境变量' }
+else {
+  $conv = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.ai-sync/instance'
+  if (Test-Path (Join-Path $conv 'sync/instance.json')) { $instanceRoot = $conv; $instanceSource = '~/.ai-sync/instance' }
+}
+if (-not $instanceRoot) {
+  foreach ($t in (Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like 'ai-sync-*' })) {
+    $arg = [string](($t.Actions | Select-Object -First 1).Arguments)
+    $m = [regex]::Match($arg, '([A-Za-z]:\\[^"]*-cmd\.txt)')
+    if (-not $m.Success -or -not (Test-Path $m.Groups[1].Value)) { continue }
+    $line = [string](Get-Content -Raw -Encoding Unicode $m.Groups[1].Value -ErrorAction SilentlyContinue)
+    $mi = [regex]::Match($line, '--instance\s+"?([^"]+?)"?(?:\s|$)')
+    if ($mi.Success -and (Test-Path (Join-Path $mi.Groups[1].Value.Trim() 'sync/instance.json'))) {
+      $instanceRoot = $mi.Groups[1].Value.Trim()
+      $instanceSource = "计划任务 $($t.TaskName) 的命令文件"
+      break
+    }
+  }
+}
+if (-not $instanceRoot) { $instanceRoot = $engineRoot; $instanceSource = '引擎根（原地布局）' }
+$instanceHasCfg = Test-Path (Join-Path $instanceRoot 'sync/instance.json')
 # 优先用**已安装的引擎**（拆分部署）跑状态查询、tick 与控制台：
 # 原地布局下实例里那份只是副本，用它去查「引擎是否落后」永远得到"不适用"（2026-09-17 实测盲点）；
 # 顺带这也是 P5 收尾的方向（托盘最终只从引擎目录起，实例只提供配置）。
@@ -220,7 +254,7 @@ function Set-Autostart([bool]$on) {
   $sh = New-Object -ComObject WScript.Shell
   $s = $sh.CreateShortcut($lnk)
   $s.TargetPath = 'wscript.exe'
-  $s.Arguments = "`"$vbs`""
+  $s.Arguments = "`"$vbs`" `"$instanceRoot`""   # 显式把实例根交给 vbs（拆分布局下它自己找不到）
   $s.WorkingDirectory = $here
   $s.WindowStyle = 7
   $s.Description = 'ai-sync 同步状态托盘'
@@ -236,6 +270,10 @@ if ($Action -eq 'promote-icon') { Set-IconPromoted; exit 0 }
 if ($Action -eq 'open-console') { Open-Console $ConsolePage -DryRun:$DryRun; exit 0 }
 
 if ($Action -eq 'probe') {
+  # 先把路径解析摊开（诊断托盘"红着骗人"的第一步：实例根找对了没有）
+  Write-Output ("engineRoot={0}" -f $engineRoot)
+  Write-Output ("engineForRun={0}" -f $engineForRun)
+  Write-Output ("instanceRoot={0}  （来源：{1}{2}）" -f $instanceRoot, $instanceSource, $(if ($instanceHasCfg) { '' } else { '；**缺 sync/instance.json**' }))
   $b = Get-Brief
   Write-Output ("state={0}  ok={1}" -f $b.state, $b.ok)
   Write-Output ("lastSyncAt={0}  agoMin={1}  interval={2}" -f $b.lastSyncAt, $b.agoMin, $b.interval)
