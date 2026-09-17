@@ -123,8 +123,9 @@ node <引擎根>/apps/sync-console/server.mjs --stop
 |---|---|---|
 | tick 间隔 | `tick.intervalMinutes`（默认 5） | 保存后立即重排平台调度；就算当时没生效，下一轮 tick 开头也会自愈 |
 | 跨端状态推送间隔 | `tick.statePushMinutes`（默认 15） | 同上 |
-| 云盘镜像时刻 | `cloudMirror.schedule.times`（默认 `["22:00"]`，可写多个）/ `{mode:"interval",intervalMinutes:N}` | 保存后立即重排 `ai-sync-mirror` 任务 |
-| 关掉镜像 | `cloudMirror.enabled=false` | 保存时**主动卸下**镜像任务（不留一个不会触发的空任务） |
+| 云盘镜像时刻 | `cloudMirror.schedule.times`（默认 `["22:00"]`，可写多个）/ `{mode:"interval",intervalMinutes:N}` | 保存后立即重排：Windows 的 `ai-sync-mirror` 计划任务 / macOS 的 `ai-sync.mirror` LaunchAgent |
+| 关掉镜像 | `cloudMirror.enabled=false` | 保存时**主动卸下**镜像调度（Windows 删任务 / macOS `bootout` + 删 plist），不留一个不会触发的空壳 |
+| 镜像跑哪个脚本 | `cloudMirror.script`（默认 `<实例根>/sync/daily.ps1`） | 想只跑 tree-sync+seed、不跑整套 daily 时改这里 |
 
 **适配器（producers/owners）没有各自的节拍**：它们每轮 tick 各跑一次，`tick.intervalMinutes` 就是它们唯一的节拍源。
 （"每个适配器单独定时"是另一个特性，目前不存在 —— 别去 descriptor 里找 `interval`，找不到。）

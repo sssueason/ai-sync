@@ -51,6 +51,11 @@ node ~/.ai-sync/engine/install/install.mjs --instance <实例根> --register
 | Windows | `schtasks /change /tn <旧任务名> /disable` |
 | macOS | `launchctl bootout gui/$(id -u)/<旧 label>`（plist 留着不删） |
 
+> **镜像调度也算调度**：迁移前手工挂的镜像 LaunchAgent（label 随你，例如 `cn.<你的实例名>.macsync`）同样要 `bootout`，
+> 否则它和引擎接管后的 `ai-sync.mirror` **一天各跑一遍**（没人会知道跑了两遍）。
+> `sync-status` / `sync-schedule` 的镜像那行会**列出发现的旧 label**提醒你收编；确认引擎那条已经在跑之后，
+> 再 `launchctl bootout gui/$(id -u)/<旧 label>` + 删掉对应 plist。
+
 ## 4. 验证（三条都要看）
 
 ```bash

@@ -21,7 +21,7 @@
  *   不带动作 = 只报告（等于 --status）
  * 退出码：0 正常；2 = 报告模式下"未安装或间隔不一致"；3 = 动作失败
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, readdirSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
@@ -53,6 +53,15 @@ export function loadInstance(instance) {
 export const tickTaskName = (cfg) => cfg?.tick?.taskName || 'ai-sync-tick';
 export const tickLabel = (cfg) => cfg?.tick?.launchdLabel || 'ai-sync.tick';
 export const mirrorTaskName = (cfg) => cfg?.cloudMirror?.taskName || 'ai-sync-mirror';
+/** macOS 的镜像调度 label（默认与 tick 的 `ai-sync.tick` 对称；想跟本机 tick 的命名风格一致就在
+ *  instance.json 里设 `cloudMirror.launchdLabel`） */
+export const mirrorLabel = (cfg) => cfg?.cloudMirror?.launchdLabel || 'ai-sync.mirror';
+/** 镜像重活实际跑哪个脚本：默认实例的 daily.ps1（与 Windows 的 ai-sync-mirror 同一份），可配置覆盖 */
+const mirrorScript = (instance) => {
+  const cfg = loadInstance(instance);
+  const custom = cfg?.cloudMirror?.script;
+  return custom ? resolve(instance, custom) : join(instance, 'sync', 'daily.ps1');
+};
 
 /* ---------------------------------------------------------------- 隐藏执行（Windows）
  * 计划任务的动作**不能**直接写 node.exe/pwsh.exe：交互式身份下每次运行都会创建控制台窗口，
@@ -66,8 +75,17 @@ const q = (s) => String(s).replace(/'/g, "''");
 export const runnerPath = () => join(ENGINE, 'install', 'run-hidden.vbs');
 const wscriptPath = () => join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'wscript.exe');
 
-/** 优先用固定安装路径的 pwsh7（`where pwsh` 可能撞上 WindowsApps 的 0 字节别名，非交互下跑不起来） */
+/** PowerShell 可执行文件。
+ *  Windows：优先固定路径的 pwsh7（`where pwsh` 可能撞上 WindowsApps 的 0 字节别名，非交互下跑不起来）。
+ *  macOS：launchd 的 PATH 极小，ProgramArguments[0] 必须是**绝对路径** ⇒ 先看 homebrew 两个常见前缀，
+ *  再退回 `which pwsh` 的结果（Apple Silicon = /opt/homebrew，Intel = /usr/local）。 */
 function pwshPath() {
+  if (process.platform === 'darwin') {
+    for (const p of ['/opt/homebrew/bin/pwsh', '/usr/local/bin/pwsh']) if (existsSync(p)) return p;
+    const r = spawnSync('/usr/bin/which', ['pwsh'], { encoding: 'utf8' });
+    const first = (r.stdout || '').split('\n').map((s) => s.trim()).filter(Boolean)[0];
+    return first || '/usr/local/bin/pwsh';
+  }
   const fixed = join(process.env.ProgramFiles || 'C:\\Program Files', 'PowerShell', '7', 'pwsh.exe');
   if (existsSync(fixed)) return fixed;
   const r = spawnSync('where', ['pwsh'], { encoding: 'utf8', windowsHide: true });
@@ -189,9 +207,33 @@ function readMirrorSpec(instance) {
 /** 检测镜像调度现状。返回 {platform,task,enabled,installed,want,inSync,detail} */
 export function detectMirror(instance, cfg = loadInstance(instance)) {
   const spec = mirrorSpecOf(cfg);
-  const out = { platform: process.platform, task: mirrorTaskName(cfg), enabled: spec.enabled, want: spec.enabled ? spec : null, installed: false, inSync: null, detail: '' };
+  const out = { platform: process.platform, task: process.platform === 'darwin' ? mirrorLabel(cfg) : mirrorTaskName(cfg), enabled: spec.enabled, want: spec.enabled ? spec : null, installed: false, inSync: null, detail: '' };
+  if (process.platform === 'darwin') {
+    const plist = join(homedir(), 'Library', 'LaunchAgents', `${out.task}.plist`);
+    out.installed = existsSync(plist);
+    out.plist = plist;
+    // 手工挂过的旧 label 也要看见：引擎接管后如果它还留着，会一天跑两趟（且没人知道）
+    const legacy = readdirSync(join(homedir(), 'Library', 'LaunchAgents'))
+      .filter((f) => f.startsWith('cn.ai-') && f.endsWith('.plist') && f !== `${out.task}.plist`)
+      .map((f) => f.replace(/\.plist$/, ''));
+    if (legacy.length) out.legacy = legacy;
+    if (!spec.enabled) {
+      out.inSync = !out.installed;
+      out.detail = out.installed ? 'cloudMirror.enabled=false 但 LaunchAgent 还在（应卸下）' : '已按配置关闭（无 LaunchAgent）';
+    } else if (!out.installed) {
+      out.inSync = false;
+      out.detail = 'LaunchAgent 不存在';
+    } else {
+      const recorded = readMirrorSpec(instance);
+      const same = !!recorded && JSON.stringify(recorded) === JSON.stringify(spec);
+      out.inSync = same;
+      out.detail = same ? '与配置一致' : recorded ? `配置已变（上次装的是 ${JSON.stringify(recorded)}）` : '缺少 mirror-spec.json（多半是手工挂的，应收编）';
+    }
+    if (legacy.length) out.detail += `；发现旧 LaunchAgent：${legacy.join('、')}（引擎接管后应 bootout，否则会重复跑）`;
+    return out;
+  }
   if (process.platform !== 'win32') {
-    out.detail = '未提供该平台的镜像调度（macOS 用 launchd 或 mac-sync.sh，需另行接）';
+    out.detail = '该平台没有安装器（Linux 请自行接 systemd/cron 调 sync/daily.ps1 或等价脚本）';
     return out;
   }
   out.installed = taskExists(out.task);
@@ -213,27 +255,92 @@ export function detectMirror(instance, cfg = loadInstance(instance)) {
 }
 
 export function unregisterMirror(instance, cfg = loadInstance(instance)) {
+  if (process.platform === 'darwin') {
+    const label = mirrorLabel(cfg);
+    const plist = join(homedir(), 'Library', 'LaunchAgents', `${label}.plist`);
+    const uid = process.getuid ? process.getuid() : 501;
+    spawnSync('launchctl', ['bootout', `gui/${uid}/${label}`], { encoding: 'utf8' });
+    try {
+      rmSync(plist, { force: true });
+    } catch (e) {
+      return { ok: false, task: label, error: e.message };
+    }
+    return { ok: true, task: label };
+  }
   const name = mirrorTaskName(cfg);
-  if (process.platform !== 'win32') return { ok: true, skipped: true, task: name, detail: '该平台未实现镜像调度（非失败）' };
+  if (process.platform !== 'win32') return { ok: true, skipped: true, task: name, detail: '该平台没有安装器（非失败）' };
   const r = spawnSync('schtasks', ['/delete', '/tn', name, '/f'], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
   const gone = r.status === 0 || /cannot find|找不到/i.test(`${r.stderr}${r.stdout}`);
   return gone ? { ok: true, task: name } : { ok: false, error: (r.stderr || r.stdout || '').split('\n')[0] || `exit ${r.status}` };
 }
 
 export function registerMirror(instance, cfg = loadInstance(instance)) {
-  const name = mirrorTaskName(cfg);
+  const name = process.platform === 'darwin' ? mirrorLabel(cfg) : mirrorTaskName(cfg);
   const spec = mirrorSpecOf(cfg);
-  if (process.platform !== 'win32') return { ok: true, skipped: true, task: name, detail: '该平台未实现镜像调度（macOS 请用 launchd / mac-sync.sh，非失败）' };
   const specFile = join(instance, 'sync', 'state', 'mirror-spec.json');
+  if (process.platform === 'darwin') {
+    const plist = join(homedir(), 'Library', 'LaunchAgents', `${name}.plist`);
+    if (!spec.enabled) {
+      const del = unregisterMirror(instance, cfg);
+      mkdirSync(dirname(specFile), { recursive: true });
+      writeFileSync(specFile, JSON.stringify(spec, null, 2) + '\n', 'utf8');
+      return { ok: del.ok, task: name, disabled: true, detail: 'cloudMirror.enabled=false → 已卸下镜像 LaunchAgent', error: del.error };
+    }
+    const script = mirrorScript(instance);
+    if (!existsSync(script)) return { ok: false, error: `找不到镜像脚本 ${script}` };
+    mkdirSync(dirname(plist), { recursive: true });
+    // 触发条件：dailyAt → 每个时刻一条 StartCalendarInterval；interval → StartInterval（秒）
+    let trigger;
+    if (spec.mode === 'interval') {
+      trigger = `  <key>StartInterval</key><integer>${(Number(spec.intervalMinutes) || 60) * 60}</integer>`;
+    } else {
+      const items = spec.times
+        .map((t) => {
+          const m = /^(\d{1,2}):(\d{2})$/.exec(String(t).trim());
+          if (!m) return null;
+          return `    <dict><key>Hour</key><integer>${Number(m[1])}</integer><key>Minute</key><integer>${Number(m[2])}</integer></dict>`;
+        })
+        .filter(Boolean);
+      if (!items.length) return { ok: false, error: `cloudMirror.schedule.times 解析不出时刻：${JSON.stringify(spec.times)}` };
+      trigger = `  <key>StartCalendarInterval</key><array>\n${items.join('\n')}\n  </array>`;
+    }
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${name}</string>
+  <key>ProgramArguments</key><array>
+    <string>${pwshPath()}</string>
+    <string>-NoProfile</string>
+    <string>-File</string>
+    <string>${script}</string>
+  </array>
+${trigger}
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>${(process.env.PATH || '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin').replace(/&/g, '&amp;').replace(/</g, '&lt;')}</string>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>/tmp/ai-sync-mirror.out.log</string>
+  <key>StandardErrorPath</key><string>/tmp/ai-sync-mirror.err.log</string>
+</dict></plist>
+`;
+    writeFileSync(plist, xml, 'utf8');
+    const uid = process.getuid ? process.getuid() : 501;
+    spawnSync('launchctl', ['bootout', `gui/${uid}/${name}`], { encoding: 'utf8' }); // 先卸旧的（不存在也无妨）
+    const b = spawnSync('launchctl', ['bootstrap', `gui/${uid}`, plist], { encoding: 'utf8' });
+    if (b.status !== 0) return { ok: false, error: (b.stderr || '').split('\n')[0] || `bootstrap exit ${b.status}` };
+    writeFileSync(specFile, JSON.stringify(spec, null, 2) + '\n', 'utf8');
+    return { ok: true, task: name, via: 'launchd', plist, spec };
+  }
+  if (process.platform !== 'win32') return { ok: true, skipped: true, task: name, detail: '该平台没有安装器（非失败）' };
   if (!spec.enabled) {
     const del = unregisterMirror(instance, cfg);
     mkdirSync(dirname(specFile), { recursive: true });
     writeFileSync(specFile, JSON.stringify(spec, null, 2) + '\n', 'utf8');
     return { ok: del.ok, task: name, disabled: true, detail: 'cloudMirror.enabled=false → 已卸下镜像任务', error: del.error };
   }
-  const daily = join(instance, 'sync', 'daily.ps1');
-  if (!existsSync(daily)) return { ok: false, error: `找不到镜像脚本 ${daily}` };
-  const cmdFile = writeCmdFile(instance, 'mirror-cmd.txt', `"${pwshPath()}" -NoProfile -File "${daily}"`);
+  const script = mirrorScript(instance);
+  if (!existsSync(script)) return { ok: false, error: `找不到镜像脚本 ${script}` };
+  const cmdFile = writeCmdFile(instance, 'mirror-cmd.txt', `"${pwshPath()}" -NoProfile -File "${script}"`);
   const trigger =
     spec.mode === 'interval'
       ? `New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes ${Number(spec.intervalMinutes) || 60})`
