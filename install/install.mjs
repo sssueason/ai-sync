@@ -28,7 +28,20 @@ import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-export const ENGINE = resolve(process.env.AI_SYNC_ENGINE || join(HERE, '..'));
+
+/** 引擎根 = **真正含有 tools/sync-tick.mjs 的那一层**。
+ *  两种布局要同时认：
+ *    · 拆分：`<引擎根>/install/` 与 `<引擎根>/tools/` 同级 ⇒ `join(HERE,'..')`
+ *    · 原地：`<实例根>/engine/install/`，而工具在 `<实例根>/tools/` ⇒ `join(HERE,'..','..')`
+ *  2026-09-17 实测踩到：只看 `join(HERE,'..')` 时，原地布局会算出 `<实例根>/engine` —— 那里**没有 tools/**，
+ *  于是注册出来的计划任务指向一个不存在的脚本（MODULE_NOT_FOUND，任务结果 1，而且死得太早连日志行都没有）；
+ *  更糟的是 tick 每轮的 `--reconcile` 会用这个错根**反复重写**命令文件，把手工修好的注册又改坏。
+ *  这里按"哪层有 tick 脚本"来定，两种布局都能自愈。 */
+function resolveEngine() {
+  const cands = [join(HERE, '..'), join(HERE, '..', '..')];
+  return resolve(cands.find((p) => existsSync(join(p, 'tools', 'sync-tick.mjs'))) || cands[0]);
+}
+export const ENGINE = resolve(process.env.AI_SYNC_ENGINE || resolveEngine());
 
 export function loadInstance(instance) {
   try {
