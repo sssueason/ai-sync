@@ -19,7 +19,7 @@
  *   node tools/sync-doctor.mjs [--instance <dir>] [--machine <id>] [--json] [--quiet]
  * 退出码：0 = 只有 PASS/WARN；2 = 有 FAIL。
  */
-import { readFileSync, existsSync, statSync, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, statSync, readdirSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { join, dirname, resolve, basename } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { homedir, hostname } from 'node:os';
@@ -209,6 +209,37 @@ if (isMain) {
     else add('调度已安装', 'PASS', d.task, `间隔 ${d.want} 分钟一致`);
   } else {
     add('安装器存在', 'FAIL', 'install/install.mjs', '找不到');
+  }
+
+  /* ---------------------------------------------------------------- 隐藏执行（Windows）
+   * 计划任务的动作应该是 `wscript run-hidden.vbs <命令文件>`；若直接写 node.exe，交互式身份下
+   * 每轮都会闪一个控制台窗口（2026-09-17 用户反馈）。这里两条断言：
+   *   1) run-hidden.vbs 必须**纯 ASCII** —— wscript 按 ANSI 代码页读 .vbs，中文注释的字节会被
+   *      误解码并吞掉换行，把下面的代码整段注释掉（实测退出码从 7 变成 3，静默失效）。
+   *   2) 真跑一次探测（`cmd /c exit 0` 期望 0）。只看字节不算数：假绿防线要求它能失败也能真跑通。 */
+  if (process.platform === 'win32') {
+    // 两种布局都要认：拆分时 <引擎根>/install/run-hidden.vbs；原地时 <仓根>/engine/install/run-hidden.vbs
+    const runner = [join(ENGINE, 'install', 'run-hidden.vbs'), join(ENGINE, 'engine', 'install', 'run-hidden.vbs')].find((p) => existsSync(p)) || join(ENGINE, 'install', 'run-hidden.vbs');
+    if (!existsSync(runner)) add('隐藏运行器存在', 'FAIL', 'install/run-hidden.vbs', '找不到（计划任务会闪窗）');
+    else {
+      const buf = readFileSync(runner);
+      const at = buf.findIndex((b) => b > 127);
+      add('隐藏运行器为纯 ASCII', at === -1 ? 'PASS' : 'FAIL', '没有非 ASCII 字节（wscript 按 ANSI 读脚本）', at === -1 ? '0 个' : `第 ${at} 字节 = 0x${buf[at].toString(16)}，中文注释会吞掉换行并注释掉代码`);
+      const stateDir = join(INSTANCE, 'sync', 'state');
+      const probe = join(stateDir, '.doctor-runner-probe.txt');
+      try {
+        mkdirSync(stateDir, { recursive: true });
+        writeFileSync(probe, '\uFEFF' + 'cmd /c exit 0\r\n', 'utf16le'); // UTF-16LE **带 BOM**：缺 BOM 会被读成空
+        const r = spawnSync(join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'wscript.exe'), [runner, probe], { windowsHide: true, timeout: 30000 });
+        add('隐藏运行器可跑通', r.status === 0 ? 'PASS' : 'FAIL', '探测命令退出码 0', `实际 ${r.status}`);
+      } catch (e) {
+        add('隐藏运行器可跑通', 'FAIL', '探测命令退出码 0', e.message);
+      } finally {
+        try {
+          rmSync(probe, { force: true });
+        } catch {}
+      }
+    }
   }
 
   const fails = checks.filter((c) => c.level === 'FAIL');

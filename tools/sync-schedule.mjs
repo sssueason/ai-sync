@@ -36,6 +36,9 @@ const installPath = [join(HERE, '..', 'install', 'install.mjs'), join(HERE, '..'
 const installMod = installPath ? await import(pathToFileURL(installPath).href) : null;
 const detectSchedule = installMod?.detectSchedule ?? ((_i, c) => ({ platform: process.platform, want: c?.tick?.intervalMinutes ?? 5, installed: false, inSync: null, detail: '找不到 install/install.mjs' }));
 const registerTick = installMod?.registerTick ?? (() => ({ ok: false, error: '找不到 install/install.mjs' }));
+// 镜像（µ2）调度走同一个安装器：cloudMirror.schedule 原先没有任何消费者（死旋钮，2026-09-17 发现）
+const detectMirror = installMod?.detectMirror ?? ((_i, c) => ({ platform: process.platform, task: 'ai-sync-mirror', enabled: c?.cloudMirror?.enabled !== false, installed: false, inSync: null, detail: '找不到 install/install.mjs' }));
+const registerMirror = installMod?.registerMirror ?? (() => ({ ok: false, error: '找不到 install/install.mjs' }));
 const RECONCILE = has('--reconcile');
 const JSON_OUT = has('--json');
 const QUIET = has('--quiet');
@@ -45,9 +48,11 @@ const say = (m) => {
 
 const cfgFile = join(INSTANCE, 'sync', 'instance.json');
 let want = 5;
+let cfg = {};
 if (existsSync(cfgFile)) {
   try {
-    want = JSON.parse(readFileSync(cfgFile, 'utf8')).tick?.intervalMinutes ?? 5;
+    cfg = JSON.parse(readFileSync(cfgFile, 'utf8'));
+    want = cfg.tick?.intervalMinutes ?? 5;
   } catch {}
 }
 
@@ -61,12 +66,35 @@ if (RECONCILE && (!result.installed || result.inSync === false)) {
 } else if (!RECONCILE && result.installed && result.inSync === false) {
   result.action = 'would-re-register';
 }
+
+/* 镜像调度对账：装上 / 按 enabled=false 卸下 / 时间改了重排，全在 registerMirror 一处收敛。
+   未实现的平台返回 skipped ⇒ 不算失败，但 detail 会带到输出里（跳过必须看得见，别静默）。 */
+const mDetected = detectMirror(INSTANCE, cfg);
+const mirror = { ...mDetected, action: 'none' };
+const mirrorStale = mDetected.inSync === false;
+if (RECONCILE && mirrorStale) {
+  const r = registerMirror(INSTANCE, cfg);
+  if (r.skipped) {
+    mirror.action = 'skipped';
+    mirror.detail = r.detail;
+  } else {
+    mirror.action = r.ok ? (r.disabled ? 'unregistered' : 're-registered') : 'error';
+    mirror.detail = r.ok ? r.detail || (r.disabled ? '已按配置卸下' : `已排为 ${r.spec?.mode === 'interval' ? `每 ${r.spec.intervalMinutes} 分钟` : (r.spec?.times || []).join(' / ')}`) : r.error || '重排失败';
+    if (r.ok) mirror.inSync = true;
+  }
+} else if (!RECONCILE && mirrorStale) {
+  mirror.action = 'would-re-register';
+}
+result.mirror = mirror;
+
 if (JSON_OUT) console.log(JSON.stringify(result, null, 2));
 else {
   const state = result.inSync === true ? (result.action === 're-registered' ? '已重排' : 'OK') : result.inSync === false ? '不一致' : '未安装';
   const actual = result.actualMinutes ? ` / 实际 ${result.actualMinutes} 分钟` : result.actualSeconds ? ` / 实际 ${result.actualSeconds}s` : '';
   say(`调度：${result.task} → ${state}（配置 ${want} 分钟${result.inSync === true && result.action === 're-registered' ? '' : actual}）${result.action !== 'none' ? ` · ${result.action}` : ''}${result.detail ? ` · ${result.detail}` : ''}`);
+  const mState = mirror.skipped || mirror.enabled === false ? (mirror.enabled === false ? '已关闭' : '未实现') : mirror.inSync === true ? (mirror.action === 're-registered' ? '已重排' : 'OK') : mirror.inSync === false ? '不一致' : '未安装';
+  say(`镜像：${mirror.task} → ${mState}${mirror.action !== 'none' ? ` · ${mirror.action}` : ''}${mirror.detail ? ` · ${mirror.detail}` : ''}`);
 }
 
 // 报告模式下"不一致"退出码 2（可进巡检）；--reconcile 模式下只有真错误才非零
-process.exitCode = result.action === 'error' ? 3 : result.inSync === false && !RECONCILE ? 2 : 0;
+process.exitCode = mirror.action === 'error' || result.action === 'error' ? 3 : (mirrorStale || result.inSync === false) && !RECONCILE ? 2 : 0;

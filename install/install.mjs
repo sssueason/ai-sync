@@ -34,6 +34,56 @@ export function loadInstance(instance) {
 }
 export const tickTaskName = (cfg) => cfg?.tick?.taskName || 'ai-sync-tick';
 export const tickLabel = (cfg) => cfg?.tick?.launchdLabel || 'ai-sync.tick';
+export const mirrorTaskName = (cfg) => cfg?.cloudMirror?.taskName || 'ai-sync-mirror';
+
+/* ---------------------------------------------------------------- 隐藏执行（Windows）
+ * 计划任务的动作**不能**直接写 node.exe/pwsh.exe：交互式身份下每次运行都会创建控制台窗口，
+ * 屏幕上每 N 分钟闪一次黑框（2026-09-17 用户反馈）。统一改成
+ *   wscript.exe run-hidden.vbs "<命令文件>"
+ * —— wscript 没有控制台，run-hidden.vbs 再用 SW_HIDE 拉真正的子进程，全程无窗口。
+ * 退出码由 run-hidden.vbs 原样交回计划任务 ⇒「上次运行结果」仍是真信号（恒 0 就是假绿）。 */
+
+/** PowerShell 单引号字符串转义（路径里出现撇号时不会把生成的脚本撕开） */
+const q = (s) => String(s).replace(/'/g, "''");
+export const runnerPath = () => join(ENGINE, 'install', 'run-hidden.vbs');
+const wscriptPath = () => join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'wscript.exe');
+
+/** 优先用固定安装路径的 pwsh7（`where pwsh` 可能撞上 WindowsApps 的 0 字节别名，非交互下跑不起来） */
+function pwshPath() {
+  const fixed = join(process.env.ProgramFiles || 'C:\\Program Files', 'PowerShell', '7', 'pwsh.exe');
+  if (existsSync(fixed)) return fixed;
+  const r = spawnSync('where', ['pwsh'], { encoding: 'utf8', windowsHide: true });
+  const first = (r.stdout || '').split('\n').map((s) => s.trim()).filter(Boolean).find((p) => !/WindowsApps/i.test(p));
+  return first || 'powershell';
+}
+
+/** 把"要跑的一整行命令"写成 UTF-16LE(**带 BOM**)命令文件，返回路径。
+ *  为什么用文件：计划任务参数是原始字符串，里面再嵌引号会被 WSH 的命令行解析合并掉（相邻引号会丢）。
+ *  为什么 UTF-16LE：run-hidden.vbs 用 TristateTrue 读它；按 ANSI 读会把非 ASCII 路径
+ *  （用户名含中文的机器就是这种）变成问号，子进程根本起不来。**BOM 必需**，缺了会读成空。 */
+export function writeCmdFile(instance, base, cmdline) {
+  const dir = join(instance, 'sync', 'state');
+  mkdirSync(dir, { recursive: true });
+  const f = join(dir, base);
+  writeFileSync(f, '\uFEFF' + cmdline + '\r\n', 'utf16le');
+  return f;
+}
+
+/** 跑一段 PowerShell（pwsh 优先，退回 Windows PowerShell 5.1 —— ScheduledTasks 模块两边都有） */
+function runPs(ps) {
+  const r = spawnSync('pwsh', ['-NoProfile', '-Command', ps], { encoding: 'utf8', windowsHide: true, timeout: 120000 });
+  if (r.status === 0) return { ok: true };
+  const r2 = spawnSync('powershell', ['-NoProfile', '-Command', ps], { encoding: 'utf8', windowsHide: true, timeout: 120000 });
+  if (r2.status === 0) return { ok: true };
+  const err = [r2.stderr, r.stderr].filter(Boolean).join('\n').split('\n').map((s) => s.trim()).filter(Boolean)[0];
+  return { ok: false, error: err || `exit ${r2.status}` };
+}
+
+/** 任务是否存在（schtasks 查询约 30ms，比启 pwsh 快得多） */
+function taskExists(name) {
+  const r = spawnSync('schtasks', ['/query', '/tn', name], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
+  return r.status === 0;
+}
 
 /** 检测平台调度现状。返回 {platform,task,installed,want,actual,unit,inSync,detail} */
 export function detectSchedule(instance, cfg = loadInstance(instance)) {
@@ -82,21 +132,106 @@ function nodeExe() {
 function registerWindows(instance, interval) {
   const name = tickTaskName(loadInstance(instance));
   const tick = join(ENGINE, 'tools', 'sync-tick.mjs');
+  const cmdFile = writeCmdFile(instance, 'tick-cmd.txt', `"${nodeExe()}" "${tick}" --instance "${instance}"`);
   const ps = `
 $ErrorActionPreference='Stop'
-$action = New-ScheduledTaskAction -Execute '${nodeExe().replace(/'/g, "''")}' -Argument '${`"${tick}" --instance "${instance}"`.replace(/'/g, "''")}' -WorkingDirectory '${ENGINE.replace(/'/g, "''")}'
+$action = New-ScheduledTaskAction -Execute '${q(wscriptPath())}' -Argument '"${q(runnerPath())}" "${q(cmdFile)}"' -WorkingDirectory '${q(ENGINE)}'
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes ${interval})
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 20)
-Register-ScheduledTask -TaskName '${name}' -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
+Register-ScheduledTask -TaskName '${q(name)}' -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
 Write-Output 'registered'
 `;
-  const r = spawnSync('pwsh', ['-NoProfile', '-Command', ps], { encoding: 'utf8', windowsHide: true, timeout: 120000 });
-  if (r.status !== 0) {
-    // 退一步用 Windows PowerShell 5.1（ScheduledTasks 模块在 5.1 也有）
-    const r2 = spawnSync('powershell', ['-NoProfile', '-Command', ps], { encoding: 'utf8', windowsHide: true, timeout: 120000 });
-    if (r2.status !== 0) return { ok: false, error: (r2.stderr || r.stderr || '').split('\n')[0] || `exit ${r2.status}` };
+  const r = runPs(ps);
+  if (!r.ok) return { ok: false, error: r.error };
+  return { ok: true, task: name, via: 'run-hidden.vbs', cmdFile };
+}
+
+/* ---------------------------------------------------------------- 镜像（µ2）调度
+ * `cloudMirror.schedule` 以前是**死旋钮**：没有任何东西把它落到平台调度上，实际跑的是手搓的
+ * DSH-Sync-Evening 任务 ⇒ 控制台里改时间只改了 JSON、任务不动（2026-09-17 发现）。
+ * 现在由这里统一注册，并用 mirror-spec.json 记录"上次按什么配置装的"，便于对账。 */
+
+function mirrorSpecOf(cfg) {
+  const cm = cfg?.cloudMirror || {};
+  return {
+    enabled: cm.enabled !== false,
+    mode: cm.schedule?.mode || 'dailyAt',
+    times: cm.schedule?.times || ['22:00'],
+    intervalMinutes: cm.schedule?.intervalMinutes ?? 60,
+  };
+}
+function readMirrorSpec(instance) {
+  try {
+    return JSON.parse(readFileSync(join(instance, 'sync', 'state', 'mirror-spec.json'), 'utf8'));
+  } catch {
+    return null;
   }
-  return { ok: true, task: name };
+}
+
+/** 检测镜像调度现状。返回 {platform,task,enabled,installed,want,inSync,detail} */
+export function detectMirror(instance, cfg = loadInstance(instance)) {
+  const spec = mirrorSpecOf(cfg);
+  const out = { platform: process.platform, task: mirrorTaskName(cfg), enabled: spec.enabled, want: spec.enabled ? spec : null, installed: false, inSync: null, detail: '' };
+  if (process.platform !== 'win32') {
+    out.detail = '未提供该平台的镜像调度（macOS 用 launchd 或 mac-sync.sh，需另行接）';
+    return out;
+  }
+  out.installed = taskExists(out.task);
+  if (!spec.enabled) {
+    out.inSync = !out.installed;
+    out.detail = out.installed ? 'cloudMirror.enabled=false 但任务还在（应卸下）' : '已按配置关闭（无任务）';
+    return out;
+  }
+  if (!out.installed) {
+    out.inSync = false;
+    out.detail = '任务不存在';
+    return out;
+  }
+  const recorded = readMirrorSpec(instance);
+  const same = !!recorded && JSON.stringify(recorded) === JSON.stringify(spec);
+  out.inSync = same;
+  out.detail = same ? '与配置一致' : recorded ? `配置已变（上次装的是 ${JSON.stringify(recorded)}）` : '缺少 mirror-spec.json（多半是手工任务，应收编）';
+  return out;
+}
+
+export function unregisterMirror(instance, cfg = loadInstance(instance)) {
+  const name = mirrorTaskName(cfg);
+  if (process.platform !== 'win32') return { ok: true, skipped: true, task: name, detail: '该平台未实现镜像调度（非失败）' };
+  const r = spawnSync('schtasks', ['/delete', '/tn', name, '/f'], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
+  const gone = r.status === 0 || /cannot find|找不到/i.test(`${r.stderr}${r.stdout}`);
+  return gone ? { ok: true, task: name } : { ok: false, error: (r.stderr || r.stdout || '').split('\n')[0] || `exit ${r.status}` };
+}
+
+export function registerMirror(instance, cfg = loadInstance(instance)) {
+  const name = mirrorTaskName(cfg);
+  const spec = mirrorSpecOf(cfg);
+  if (process.platform !== 'win32') return { ok: true, skipped: true, task: name, detail: '该平台未实现镜像调度（macOS 请用 launchd / mac-sync.sh，非失败）' };
+  const specFile = join(instance, 'sync', 'state', 'mirror-spec.json');
+  if (!spec.enabled) {
+    const del = unregisterMirror(instance, cfg);
+    mkdirSync(dirname(specFile), { recursive: true });
+    writeFileSync(specFile, JSON.stringify(spec, null, 2) + '\n', 'utf8');
+    return { ok: del.ok, task: name, disabled: true, detail: 'cloudMirror.enabled=false → 已卸下镜像任务', error: del.error };
+  }
+  const daily = join(instance, 'sync', 'daily.ps1');
+  if (!existsSync(daily)) return { ok: false, error: `找不到镜像脚本 ${daily}` };
+  const cmdFile = writeCmdFile(instance, 'mirror-cmd.txt', `"${pwshPath()}" -NoProfile -File "${daily}"`);
+  const trigger =
+    spec.mode === 'interval'
+      ? `New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes ${Number(spec.intervalMinutes) || 60})`
+      : `@(${spec.times.map((t) => `New-ScheduledTaskTrigger -Daily -At '${q(t)}'`).join(', ')})`;
+  const ps = `
+$ErrorActionPreference='Stop'
+$action = New-ScheduledTaskAction -Execute '${q(wscriptPath())}' -Argument '"${q(runnerPath())}" "${q(cmdFile)}"' -WorkingDirectory '${q(ENGINE)}'
+$triggers = ${trigger}
+$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 3)
+Register-ScheduledTask -TaskName '${q(name)}' -Action $action -Trigger $triggers -Settings $settings -Force | Out-Null
+Write-Output 'registered'
+`;
+  const r = runPs(ps);
+  if (!r.ok) return { ok: false, error: r.error };
+  writeFileSync(specFile, JSON.stringify(spec, null, 2) + '\n', 'utf8');
+  return { ok: true, task: name, via: 'run-hidden.vbs', cmdFile, spec };
 }
 
 function registerMac(instance, interval) {
@@ -170,21 +305,46 @@ if (isMain) {
   const json = argv.includes('--json');
 
   let result;
-  if (argv.includes('--unregister')) result = { action: 'unregister', ...unregisterTick(INSTANCE) };
-  else if (argv.includes('--register')) {
+  if (argv.includes('--unregister')) {
+    const t = unregisterTick(INSTANCE);
+    const m = unregisterMirror(INSTANCE, cfg);
+    result = { action: 'unregister', ...t, mirror: m };
+  } else if (argv.includes('--register')) {
     const r = process.platform === 'win32' ? registerWindows(INSTANCE, interval) : process.platform === 'darwin' ? registerMac(INSTANCE, interval) : { ok: false, error: '该平台未提供安装器' };
-    result = { action: 'register', interval, ...r };
+    // 镜像调度：enabled=false 时 registerMirror 会主动卸下 —— 装上/卸下都由它一处收敛。
+    // macOS 返回 skipped（未实现），不算失败，但 detail 会一路带到 status 里（跳过必须看得见）。
+    const m = registerMirror(INSTANCE, cfg);
+    result = { action: 'register', interval, ...r, ok: r.ok !== false && (m.ok !== false || m.skipped === true), mirror: m };
   } else {
     const d = detectSchedule(INSTANCE, cfg);
-    result = { action: 'status', ...d };
+    result = { action: 'status', ...d, mirror: detectMirror(INSTANCE, cfg) };
   }
 
   if (json) console.log(JSON.stringify(result, null, 2));
   else {
+    const mirrorLine = (m, mode) => {
+      if (!m) return null;
+      if (m.skipped) return `   [--] 镜像调度：${m.detail || '该平台未实现'}`;
+      if (mode === 'register') {
+        if (m.disabled) return `   [--] 镜像调度：${m.detail}`;
+        if (m.ok) return `   [OK] 镜像调度：${m.task}（${m.spec ? (m.spec.mode === 'interval' ? `每 ${m.spec.intervalMinutes} 分钟` : m.spec.times.join(' / ')) : ''}）`;
+        return `   [FAIL] 镜像调度：${m.error || m.detail}`;
+      }
+      const st = m.enabled === false ? '已关闭' : m.inSync === true ? 'OK' : m.inSync === false ? '不一致' : '未实现';
+      return `   镜像：${m.task} → ${st}${m.detail ? ` · ${m.detail}` : ''}`;
+    };
     if (result.action === 'status') {
       console.log(`   调度：${result.task ?? '(无)'} → ${result.installed ? (result.inSync ? 'OK' : '间隔不一致') : '未安装'}（配置 ${result.want} 分钟${result.installed ? ` / 实际 ${result.actual}${result.unit === 'sec' ? 's' : ' 分钟'}` : ''}）${result.detail ? ` · ${result.detail}` : ''}`);
-    } else if (result.ok) console.log(`   [OK] ${result.action} 成功${result.task ? `（${result.task}）` : ''}`);
-    else console.log(`   [FAIL] ${result.action} 失败：${result.error || result.detail}`);
+      const ml = mirrorLine(result.mirror, 'status');
+      if (ml) console.log(ml);
+    } else {
+      if (result.ok) console.log(`   [OK] ${result.action} 成功${result.task ? `（${result.task}）` : ''}`);
+      else console.log(`   [FAIL] ${result.action} 失败：${result.error || result.detail}`);
+      const ml = mirrorLine(result.mirror, 'register');
+      if (ml) console.log(ml);
+    }
   }
-  process.exitCode = result.action === 'status' ? (!result.installed || result.inSync === false ? 2 : 0) : result.ok ? 0 : 3;
+  // 报告模式：调度不一致 → 2；动作模式：真失败 → 3。镜像只有**启用且明确不一致**才算不一致（未实现的平台不冤枉报错）。
+  const mirrorBad = result.mirror && result.mirror.enabled !== false && result.mirror.inSync === false;
+  process.exitCode = result.action === 'status' ? (!result.installed || result.inSync === false || mirrorBad ? 2 : 0) : result.ok ? 0 : 3;
 }

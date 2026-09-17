@@ -47,6 +47,8 @@ $instanceRoot = if ($Instance) { $Instance } elseif ($env:AI_SYNC_INSTANCE) { $e
 $statusTool = Join-Path $engineRoot 'tools/sync-status.mjs'
 $logDir = Join-Path $instanceRoot 'sync/logs'
 $stateFile = Join-Path $logDir '.tray-last-state.json'
+# 气泡提醒默认**关**（用户 2026-09-17：「保持静默」）：只有这个文件存在才弹，菜单里可勾选开关。
+$balloonFlag = Join-Path $logDir '.tray-balloon'
 
 function Get-Brief {
   if (-not (Test-Path $statusTool)) { return [pscustomobject]@{ ok = $false; error = "缺 $statusTool" } }
@@ -241,7 +243,7 @@ if ($Action -eq 'probe') {
   Write-Output ("actions={0}" -f $b.actions.Count)
   Write-Output "tip:"
   Get-Tooltip $b | ForEach-Object { "  |$_" }
-  Write-Output "menu: 简报 / 立即同步 / 打开日志 / 随登录自启(勾选) / 退出"
+  Write-Output "menu: 简报… / 打开控制台（调度台） / 适配器设置… / 立即同步 / 日志（可视） / 原始日志文件… / 随登录自启(勾选) / 状态变化时气泡提醒(勾选，默认关) / 退出"
   foreach ($st in @('ok', 'warn', 'fail')) {
     $i = New-SyncIcon $st
     Write-Output ("icon[{0}] = {1}x{2} ({3} bytes)" -f $st, $i.Width, $i.Height, ($i.ToBitmap().GetPixel(26, 26).ToArgb()))
@@ -264,6 +266,9 @@ $miLog = $menu.Items.Add('原始日志文件…')
 $miAuto = $menu.Items.Add('随登录自启')
 $miAuto.CheckOnClick = $true
 $miAuto.Checked = Test-Path (Join-Path ([Environment]::GetFolderPath('Startup')) 'ai-sync tray.lnk')
+$miBalloon = $menu.Items.Add('状态变化时气泡提醒')
+$miBalloon.CheckOnClick = $true
+$miBalloon.Checked = Test-Path $balloonFlag
 $menu.Items.Add('-') | Out-Null
 $miExit = $menu.Items.Add('退出')
 
@@ -278,10 +283,10 @@ function Update-Tray([switch]$AllowBalloon) {
   $notify.Icon = $newIcon
   $notify.Text = Get-Tooltip $b
   $notify.ContextMenuStrip = $menu
-  # 气泡只在**状态跳变**时弹一次（否则每轮刷新都弹 = 骚扰）
+  # 气泡只在**开关打开**且状态跳变时弹一次（默认关：用户要求静默；否则每轮刷新都弹 = 骚扰）
   $prev = ''
   if (Test-Path $stateFile) { $prev = (Get-Content -Raw $stateFile -ErrorAction SilentlyContinue) }
-  if ($AllowBalloon -and $st -ne 'ok' -and $st -ne $prev) {
+  if ($AllowBalloon -and (Test-Path $balloonFlag) -and $st -ne 'ok' -and $st -ne $prev) {
     $notify.BalloonTipTitle = 'ai-sync 同步'
     $notify.BalloonTipText = (Get-Tooltip $b)
     $notify.BalloonTipIcon = if ($st -eq 'fail') { [System.Windows.Forms.ToolTipIcon]::Error } else { [System.Windows.Forms.ToolTipIcon]::Warning }
@@ -302,6 +307,10 @@ $miLog.add_Click({
     if ($f -and (Test-Path $f)) { Start-Process notepad.exe $f } else { Start-Process explorer.exe $logDir }
   })
 $miAuto.add_Click({ Set-Autostart $miAuto.Checked })
+$miBalloon.add_Click({
+    if ($miBalloon.Checked) { Set-Content -Path $balloonFlag -Value 'on' -Encoding UTF8 -NoNewline }
+    else { Remove-Item -LiteralPath $balloonFlag -Force -ErrorAction SilentlyContinue }
+  })
 $miExit.add_Click({ $notify.Visible = $false; [System.Windows.Forms.Application]::Exit() })
 
 Update-Tray          # 先设 Icon/Text，再让图标可见：这样 Explorer 记录的 InitialTooltip 才是真 tooltip

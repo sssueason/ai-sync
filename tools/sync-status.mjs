@@ -282,9 +282,10 @@ async function guardFacts() {
 function scheduleFacts() {
   if (installMod?.detectSchedule) {
     const d = installMod.detectSchedule(INSTANCE, cfg);
-    return { ...d, want: d.want ?? cfg.tick.intervalMinutes, actualMin: d.unit === 'min' ? d.actual : null, actualSec: d.unit === 'sec' ? d.actual : null };
+    const mirror = installMod.detectMirror ? installMod.detectMirror(INSTANCE, cfg) : null;
+    return { ...d, mirror, want: d.want ?? cfg.tick.intervalMinutes, actualMin: d.unit === 'min' ? d.actual : null, actualSec: d.unit === 'sec' ? d.actual : null };
   }
-  return { platform: process.platform, task: '(未找到 install/install.mjs)', installed: false, want: cfg.tick.intervalMinutes, inSync: null, detail: '缺安装器' };
+  return { platform: process.platform, task: '(未找到 install/install.mjs)', installed: false, want: cfg.tick.intervalMinutes, inSync: null, mirror: null, detail: '缺安装器' };
 }
 /* ---------------------------------------------------------------- 渲染产物对账 */
 
@@ -371,6 +372,15 @@ if (guard.configured) {
 if (!schedule.installed) add('tick 调度已安装', 'FAIL', '有平台任务', `${schedule.task} 不存在`);
 else if (schedule.inSync === false) add('tick 间隔与配置一致', 'FAIL', `配置 ${schedule.want} 分钟`, `实际 ${schedule.actualMin ?? schedule.actualSec}${schedule.actualMin ? ' 分钟' : ' 秒'}`);
 else add('tick 间隔与配置一致', 'PASS', `配置 ${schedule.want} 分钟`, '一致');
+
+// 镜像调度：这条断言的存在意义就是不让 cloudMirror.schedule 重新变成死旋钮
+if (schedule.mirror) {
+  const m = schedule.mirror;
+  if (m.enabled === false) add('镜像调度按配置关闭', m.installed ? 'FAIL' : 'PASS', 'enabled=false ⇒ 无任务', m.installed ? `${m.task} 仍存在（应卸下）` : '已关闭（无任务）');
+  else if (m.skipped || m.inSync === null) add('镜像调度', 'WARN', '该平台应有镜像调度', m.detail || '未实现/未知');
+  else if (m.installed && m.inSync === true) add('镜像调度与配置一致', 'PASS', `${m.task} 已按配置注册`, m.detail || '一致');
+  else add('镜像调度与配置一致', 'FAIL', `${m.task} 与 cloudMirror.schedule 一致`, m.installed ? m.detail || '时间/模式不一致' : `${m.task} 不存在`);
+}
 
 if (conv.statePush && conv.statePush.ok === false) add('跨端状态已推送', 'WARN', '推送成功', conv.statePush.error || '上轮推送失败');
 

@@ -141,7 +141,15 @@ async function main() {
   const git = (cwd, args) => {
     try {
       // timeout：网络类操作（fetch/pull/push）在远端不可达时不能把整轮 tick 挂住（TR6 实测过 5 分钟挂死）。
-      return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', windowsHide: true, maxBuffer: 32 * 1024 * 1024, timeout: 120000 }).trim();
+      // GIT_TERMINAL_PROMPT=0 + GCM_INTERACTIVE=Never：tick 现在由**隐藏窗口**跑（install/run-hidden.vbs），
+      // 万一 git 或凭据管理器想弹交互提示，那个框永远不会有人看见 ⇒ 隐形挂死到超时。必须让它快速失败。
+      return execFileSync('git', ['-C', cwd, ...args], {
+        encoding: 'utf8',
+        windowsHide: true,
+        maxBuffer: 32 * 1024 * 1024,
+        timeout: 120000,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'Never' },
+      }).trim();
     } catch (e) {
       return { error: String(e.message || e).split('\n')[0] };
     }
