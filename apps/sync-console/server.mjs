@@ -169,11 +169,14 @@ const server = createServer(async (req, res) => {
     }
 
     if (p === '/api/instance') {
-      if (req.method === 'GET') return sendJson(res, 200, { instance: INSTANCE, config: cfg });
+      // GET 每次重新读盘：POST 保存后如果返回启动时缓存的 cfg，用户看到的就是**过期预览**
+      // （2026-09-17 实测：切了适配器开关，提示成功但页面配置没变 ⇒ 以为没生效）。
+      if (req.method === 'GET') return sendJson(res, 200, { instance: INSTANCE, config: loadCfg() });
       if (req.method === 'POST') {
         const body = JSON.parse((await readBody(req)) || '{}');
         const next = { ...cfg, ...body, tick: { ...(cfg.tick || {}), ...(body.tick || {}) }, console: { ...(cfg.console || {}), ...(body.console || {}) }, owners: { ...(cfg.owners || {}), ...(body.owners || {}) }, producers: { ...(cfg.producers || {}), ...(body.producers || {}) } };
         writeFileSync(cfgFile, JSON.stringify(next, null, 2) + '\n', 'utf8');
+        Object.assign(cfg, next); // 内存里的也要跟上：/api/machine、/api/adapters 等读的是 cfg
         const sched = await node('sync-schedule.mjs', ['--reconcile', '--json']);
         return sendJson(res, 200, { ok: true, saved: cfgFile, schedule: safeJson(sched.stdout) });
       }
