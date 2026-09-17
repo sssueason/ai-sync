@@ -311,21 +311,44 @@ function engineFacts() {
     out.detail = '游离 HEAD（不在分支上），无法比对远端';
     return out;
   }
-  if (has('--no-fetch')) {
-    out.detail = '本轮 --no-fetch：没有与远端比对';
+  const ref = `origin/${out.branch}`;
+  if (git(['rev-parse', '--verify', '--quiet', ref], ENGINE) === '') {
+    out.detail = `本地还没有 ${ref} 引用（clone 未完成？），无法比对`;
     return out;
   }
-  try {
-    execFileSync('git', ['-C', ENGINE, 'fetch', '-q', 'origin', out.branch], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
-  } catch (e) {
-    out.detail = `fetch 失败，未比对（${String(e.message || e).split('\n')[0]}）`;
-    return out;
+  /* 远端信息刷新是**节流**的：状态每次 tick（5 分钟）都要算，但没必要每次都打网络
+     （2026-09-17 实测：并发 fetch 还会撞 git 的锁，报出一个没意义的"fetch 失败，未比对"）。
+     策略 = 到点才 fetch（默认 30 分钟，cfg.engine.fetchMinutes 可调），没到点就**用已有引用比对** ——
+     宁可给出"可能略滞后"的落后数，也不要返回"未知"（未知就等于这条检查白设）。 */
+  const stampFile = join(INSTANCE, 'sync', 'state', '.engine-fetch-stamp');
+  const fetchMinutes = Number(cfg?.engine?.fetchMinutes ?? 30);
+  const lastFetch = existsSync(stampFile) ? Number(String(readFileSync(stampFile, 'utf8')).trim()) || 0 : 0;
+  const due = Date.now() - lastFetch > fetchMinutes * 60000;
+  out.fetched = false;
+  if (!has('--no-fetch') && due) {
+    try {
+      execFileSync('git', ['-C', ENGINE, 'fetch', '-q', 'origin', out.branch], {
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 60000,
+        // 与 tick 的 git 调用同一套：绝不弹交互提示（后台跑，没人看得见 = 隐形挂死）
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'Never' },
+      });
+      mkdirSync(dirname(stampFile), { recursive: true });
+      writeFileSync(stampFile, String(Date.now()), 'utf8');
+      out.fetched = true;
+    } catch (e) {
+      out.fetchError = String(e.message || e).split('\n')[0];
+    }
   }
   // 注意方向：`HEAD..origin/<branch>` 才是"远端有、本地没有"= 落后。
   // （2026-09-17 故障注入抓到：写成 `origin/<branch>..HEAD` 数的是领先，落后永远算成 0 ⇒ 假绿。）
-  const n = git(['rev-list', '--count', `HEAD..origin/${out.branch}`], ENGINE);
+  const n = git(['rev-list', '--count', `HEAD..${ref}`], ENGINE);
   out.behind = n === '' ? null : Number(n);
-  out.detail = out.behind === 0 ? `与 origin/${out.branch} 一致` : `落后 origin/${out.branch} ${out.behind} 个提交`;
+  const ageMin = lastFetch ? Math.round((Date.now() - lastFetch) / 60000) : null;
+  const howFresh = out.fetched ? '刚刚刷新' : ageMin === null ? '尚未刷新过' : `${ageMin} 分钟前刷新的远端信息`;
+  const head = out.behind === 0 ? `与 ${ref} 一致` : `落后 ${ref} ${out.behind} 个提交`;
+  out.detail = `${head}（${howFresh}${out.fetchError ? `；上次刷新失败：${out.fetchError}` : ''}）`;
   return out;
 }
 
