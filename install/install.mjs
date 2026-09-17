@@ -257,6 +257,9 @@ function registerMac(instance, interval) {
   </array>
   <key>StartInterval</key><integer>${interval * 60}</integer>
   <key>RunAtLoad</key><true/>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>${(process.env.PATH || '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin').replace(/&/g, '&amp;').replace(/</g, '&lt;')}</string>
+  </dict>
   <key>StandardOutPath</key><string>/tmp/ai-sync-tick.out.log</string>
   <key>StandardErrorPath</key><string>/tmp/ai-sync-tick.err.log</string>
 </dict></plist>
