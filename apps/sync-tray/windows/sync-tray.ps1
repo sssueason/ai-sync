@@ -303,6 +303,14 @@ function Invoke-Git([string[]]$GitArgs, [string]$Repo, [int]$TimeoutSec = 45) {
 → 按"改了哪一片"决定要不要重注册调度/重启托盘，一次做完，并把结果原样告诉用户（失败照实说，不装成功）。
 
 安全边界：只用 `--ff-only`（本地有分叉或未提交改动就失败并如实报告，绝不 --force、绝不丢弃本地改动）。 #>
+# 「检查并更新引擎」菜单项的文案规则（**单一来源**：托盘刷新与 -Probe 都调它，免得两处漂）
+function Get-UpdateMenuText($b) {
+  $behindNow = [int]($b.raw.engineBehind ?? 0)
+  if ($behindNow -gt 0) { return "更新引擎（落后 $behindNow 个提交）" }
+  if ($b.raw.engineRev) { return "检查并更新引擎（当前 $($b.raw.engineRev)）" }
+  return '检查并更新引擎'
+}
+
 function Update-Engine([switch]$DryRun) {
   $eng = $engineForRun
   $r = [ordered]@{ ok = $false; dryRun = [bool]$DryRun; engine = $eng; branch = ''; before = ''; after = ''; pulled = 0; steps = @(); changed = @(); restartTray = $false; error = '' }
@@ -409,8 +417,7 @@ if ($Action -eq 'probe') {
   Write-Output ("actions={0}" -f $b.actions.Count)
   Write-Output "tip:"
   Get-Tooltip $b | ForEach-Object { "  |$_" }
-  $miTxt = if ($miUpdate) { $miUpdate.Text } else { '(未构建)' }
-    Write-Output ("menuUpdate={0}" -f $miTxt)
+      Write-Output ("menuUpdate={0}" -f (Get-UpdateMenuText $b))
     Write-Output "menu: 打开控制台 / 立即同步一次 / 检查并更新引擎（落后时显示落后几提交）/ — / 随登录自启(勾选) / 状态变化时气泡提醒(勾选，默认关) / — / 退出（双击图标 = 打开控制台）"
   foreach ($st in @('ok', 'warn', 'fail')) {
     $i = New-SyncIcon $st
@@ -450,8 +457,7 @@ function Update-Tray([switch]$AllowBalloon) {
   $notify.Icon = $newIcon
   $notify.Text = Get-Tooltip $b
   # 动态标签：落后就直说落后几个提交（与 tooltip 同一判据），没落后就显示当前版本
-  $behindNow = [int]($b.raw.engineBehind ?? 0)
-  $miUpdate.Text = if ($behindNow -gt 0) { "更新引擎（落后 $behindNow 个提交）" } elseif ($b.raw.engineRev) { "检查并更新引擎（当前 $($b.raw.engineRev)）" } else { '检查并更新引擎' }
+  $miUpdate.Text = Get-UpdateMenuText $b
   $notify.ContextMenuStrip = $menu
   # 气泡只在**开关打开**且状态跳变时弹一次（默认关：用户要求静默；否则每轮刷新都弹 = 骚扰）
   $prev = ''
