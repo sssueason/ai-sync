@@ -1,0 +1,10 @@
+# 跨平台换行：脚本必须 LF（Windows 克隆若被 autocrlf 转成 CRLF，macOS/Linux 上 bash 会直接失败）
+*.sh   text eol=lf
+*.mjs  text eol=lf
+*.js   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.swift text eol=lf
+*.ps1  text eol=crlf
+*.cmd  text eol=crlf
+*.vbs  text eol=crlf
