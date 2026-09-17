@@ -73,8 +73,6 @@ async function loadInstance() {
   $('#interval').value = c.tick?.intervalMinutes ?? 5;
   $('#statePush').value = c.tick?.statePushMinutes ?? 15;
   $('#mirrorAt').value = (c.cloudMirror?.schedule?.times || ['22:00'])[0];
-  $('#dshAuto').checked = !!c.apps?.dsh?.autostart;
-  $('#consoleAuto').checked = c.console?.autostart !== false;
   $('#cfgJson').textContent = JSON.stringify(c, null, 2);
   return c;
 }
@@ -83,11 +81,17 @@ $('#saveCfg').onclick = async () => {
   const body = {
     tick: { intervalMinutes: Number($('#interval').value) || 5, statePushMinutes: Number($('#statePush').value) || 15 },
     cloudMirror: { schedule: { mode: 'dailyAt', times: [$('#mirrorAt').value || '22:00'] } },
-    apps: { dsh: { autostart: $('#dshAuto').checked } },
-    console: { autostart: $('#consoleAuto').checked },
   };
   const r = await api('/api/instance', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-  $('#saveMsg').innerHTML = r.ok ? '<span class="ok-t">已保存；调度自愈结果：' + JSON.stringify(r.schedule) + '</span>' : '<span class="fail-t">保存失败</span>';
+  if (r.ok) {
+    const s = r.schedule || {};
+    const parts = [];
+    if (s.task) parts.push(`定时任务 ${s.task}：${s.inSync === false ? '已按新间隔重排' : '与配置一致'}`);
+    if (s.mirror?.task) parts.push(`镜像任务 ${s.mirror.task}：${s.mirror.skipped ? '本平台暂不支持' : s.mirror.inSync === false ? '已按新时间重排' : '与配置一致'}`);
+    $('#saveMsg').innerHTML = `<span class="ok-t">已保存并生效</span>${parts.length ? ' · ' + parts.join(' · ') : ''}`;
+  } else {
+    $('#saveMsg').innerHTML = '<span class="fail-t">保存失败：' + (r.error || '服务端未接受，请看下方原始配置') + '</span>';
+  }
   loadInstance();
 };
 
@@ -156,33 +160,116 @@ $('#saveMachine').onclick = async () => {
   }
 };
 
-// ---------- 适配器 ----------
+// ---------- 适配器（可单独开关；关掉 = 该目标不再被同步系统改动）----------
+const OWNER_RELOAD = { hot: '改动后自动生效', http: '改动后自动重启生效', command: '改动后用命令重载', manual: '改动后需要你手动重启那个程序', none: '改动后无需重载' };
 async function loadAdapters() {
   const r = await api('/api/adapters');
   const rows = [];
+  const row = (id, kind, on, desc, detail) => `<tr>
+      <td><label class="chk"><input type="checkbox" class="adp" data-kind="${kind}" data-id="${id}" ${on ? 'checked' : ''}> <b>${id}</b></label></td>
+      <td class="hint">${kind === 'owners' ? '文件属主' : '渲染器'}</td>
+      <td class="hint">${desc || ''}</td>
+      <td class="hint">${detail || ''}</td></tr>`;
   for (const o of r.owners || []) {
     const on = (r.enabled.owners || {})[o.id] ?? o.enabled !== false;
-    rows.push(`<tr><td><b>${o.id}</b></td><td>owner</td><td>${o.reload?.mode || 'none'}</td><td class="hint">${o.reload?.hint || ''}</td><td>${on ? '启用' : '<span class="hint">关闭</span>'}</td></tr>`);
+    rows.push(row(o.id, 'owners', on, OWNER_RELOAD[o.reload?.mode] || '改动后无需重载', o.reload?.hint || ''));
   }
   for (const p of r.producers || []) {
     const on = (r.enabled.producers || {})[p.id] ?? p.enabled !== false;
-    rows.push(`<tr><td><b>${p.id}</b></td><td>producer</td><td class="hint" colspan="2">${(p.cmd || []).join(' ')}</td><td>${on ? '启用' : '<span class="hint">关闭</span>'}</td></tr>`);
+    rows.push(row(p.id, 'producers', on, '负责生成某一类配置文件', (p.cmd || []).join(' ')));
   }
-  $('#adapters tbody').innerHTML = rows.join('');
+  $('#adapters').innerHTML =
+    '<thead><tr><th>名称（勾选 = 启用）</th><th>类型</th><th>作用</th><th>细节</th></tr></thead><tbody>' +
+    (rows.join('') || '<tr><td colspan="4" class="hint">没有找到适配器（引擎目录下 adapters/ 为空？）</td></tr>') +
+    '</tbody>';
+  for (const cb of document.querySelectorAll('#adapters .adp')) {
+    cb.onchange = async () => {
+      const { kind, id } = cb.dataset;
+      $('#adapterMsg').textContent = `正在${cb.checked ? '启用' : '关闭'} ${id}…`;
+      const r2 = await api('/api/instance', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ [kind]: { [id]: cb.checked } }),
+      });
+      if (r2.ok) {
+        $('#adapterMsg').innerHTML = `<span class="ok-t">已${cb.checked ? '启用' : '关闭'}「${id}」—— 下一轮同步生效</span>`;
+        loadInstance();
+      } else {
+        $('#adapterMsg').innerHTML = `<span class="fail-t">没保存成功：${r2.error || '服务端未接受'}（已还原勾选）</span>`;
+        cb.checked = !cb.checked;
+      }
+    };
+  }
 }
 
-// ---------- 对齐 ----------
+// ---------- 首次对齐（三步：① 检查 → ② 结论 → ③ 执行）----------
+// 「先看后做」由**界面**强制：没跑过检查，执行按钮一直禁用（只写在说明里等于没写）。
+let alignChecked = false;
+const chip = (sel, kind, text) => {
+  const el = $(sel);
+  el.className = 'chip' + (kind ? ' ' + kind : '');
+  el.textContent = text;
+};
+
+/** 把结构化结果翻译成人话（不直接倒 stdout —— 那是给排查用的） */
+function alignSummaryLines(p) {
+  if (!p) return ['· 没拿到结构化结果，请看页面最下面的「原始输出」。'];
+  const lines = [];
+  const repos = p.repos || [];
+  const bad = repos.filter((r) => !r.exists || r.ahead || r.behind || r.dirty);
+  if (!bad.length) lines.push('· 云端仓库：与云端一致，不用拉也不用推。');
+  for (const r of bad) {
+    const bits = [];
+    if (!r.exists) bits.push('本机还没有这个仓库');
+    if (r.behind) bits.push(`云端有 ${r.behind} 个提交要先拉下来`);
+    if (r.ahead) bits.push(`本机有 ${r.ahead} 个提交要推上去`);
+    if (r.dirty) bits.push(`有 ${r.dirty} 个文件改了还没提交`);
+    lines.push(`· 仓库 ${r.id}：${bits.join('；')}。`);
+  }
+  const m = p.mirror;
+  if (!m) {
+    lines.push('· 同步空间：本机没启用云盘镜像，跳过。');
+  } else {
+    const b = [];
+    if (m.push) b.push(`本地有 ${m.push} 个文件还没进同步空间（由每晚的镜像任务逐步补齐，不用手工做）`);
+    if (m.pull) b.push(`同步空间有 ${m.pull} 个文件要拉回本地`);
+    if (m.conflict) b.push(`${m.conflict} 处两边都改过 —— 会各留一份、不覆盖`);
+    lines.push(`· 同步空间：${b.length ? b.join('；') : '与本地一致'}。`);
+  }
+  for (const n of p.notes || []) lines.push(`· 说明：${n}`);
+  for (const f of p.failures || []) lines.push(`· ⚠ 有失败项：${f}`);
+  const need = (p.pending || 0) > 0 || !!(m && m.conflict) || bad.length > 0;
+  lines.push(need ? '→ 有要处理的项目，可以执行第 ③ 步。' : '→ 已经对齐，第 ③ 步不用做。');
+  return lines;
+}
+
 async function runAlign(apply) {
   const btn = apply ? $('#alignApply') : $('#alignPlan');
+  const outSel = apply ? '#alignApplyOut' : '#alignPlanOut';
   btn.disabled = true;
-  $('#alignOut').textContent = apply ? '执行中…（可能几分钟）' : '读取计划…';
-  const r = await api('/api/align' + (apply ? '?apply=1' : ''));
-  $('#alignOut').textContent = (r.stdout || '') + (r.stderr ? '\n[stderr]\n' + r.stderr : '') + `\n[exit ${r.code}]`;
+  chip(apply ? '#alignApplyState' : '#alignPlanState', 'run', apply ? '执行中…（可能要几分钟）' : '检查中…');
+  const r = await api('/api/align?json=1' + (apply ? '&apply=1' : ''));
+  const raw = (r.stdout || '') + (r.stderr ? '\n[stderr]\n' + r.stderr : '');
+  $(outSel).textContent = raw.trim() || '（无输出）';
+  $(outSel).classList.remove('hidden');
+  $('#alignOut').textContent = raw + `\n[exit ${r.code}]`;
+  if (apply) {
+    chip('#alignApplyState', r.code === 0 ? 'ok' : 'fail', r.code === 0 ? '已完成' : `有失败（exit ${r.code}）`);
+  } else {
+    alignChecked = true;
+    chip('#alignPlanState', r.code === 0 ? 'ok' : 'warn', r.code === 0 ? '检查完成' : `检查完成 · 有待处理（exit ${r.code}）`);
+    $('#alignSummary').innerHTML = alignSummaryLines(r.plan).map((l) => `<div>${l}</div>`).join('');
+    $('#alignApply').disabled = false;
+    chip('#alignApplyState', 'warn', '可以执行');
+  }
   btn.disabled = false;
   loadStatus();
 }
 $('#alignPlan').onclick = () => runAlign(false);
-$('#alignApply').onclick = () => { if (confirm('执行对齐会改动本地文件（镜像侧冲突不丢数据，败者会另存侧车）。继续？')) runAlign(true); };
+$('#alignApply').onclick = () => {
+  if (!alignChecked) { alert('先点「开始检查」看清要做什么，再执行。'); return; }
+  if (confirm('执行对齐会改动本地文件（两边都改过的冲突不会覆盖，会另存一份）。继续？')) runAlign(true);
+};
 
 // ---------- 日志 / 立即同步 ----------
 // ---------- 日志（解析成可读表格，而不是倒原文） ----------

@@ -41,3 +41,14 @@ label.chk{gap:4px}
 .browser div:hover{background:var(--line)}
 .ok-t{color:var(--ok)}.warn-t{color:var(--warn)}.fail-t{color:var(--fail)}
 code{background:var(--line);padding:1px 5px;border-radius:4px;font-size:12px}
+
+/* 步骤状态标签（首次对齐 / 保存结果）：颜色 + 文字双编码，不靠颜色单独表意 */
+.chip{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;border:1px solid var(--line);color:var(--dim);background:var(--bg)}
+.chip.ok{color:var(--ok);border-color:var(--ok)}
+.chip.warn{color:var(--warn);border-color:var(--warn)}
+.chip.fail{color:var(--fail);border-color:var(--fail)}
+.chip.run{color:var(--accent);border-color:var(--accent)}
+.summary{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px;line-height:1.75;color:var(--fg);font-size:13px}
+.summary div{margin:2px 0}
+.steps>li>b{display:block;margin-bottom:6px;font-size:13px;color:var(--fg)}
+.brand .hint{margin-left:6px;font-weight:400}

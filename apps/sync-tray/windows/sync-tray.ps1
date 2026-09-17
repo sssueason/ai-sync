@@ -143,16 +143,6 @@ function New-SyncIcon([string]$state) {
   return $final
 }
 
-function Show-Brief([object]$b) {
-  if (-not $b.ok) { [System.Windows.Forms.MessageBox]::Show($b.error, '同步状态') | Out-Null; return }
-  $lines = @()
-  $lines += "判定：$($b.state.ToUpper())    最后同步：$($b.lastSyncAt)（$($b.agoMin) 分钟前）    间隔：$($b.interval) 分钟"
-  $lines += ''
-  foreach ($c in $b.raw.checks) { $lines += ("[{0}] {1}  ← 期望 {2} / 实际 {3}" -f $c.level, $c.name, $c.expected, $c.actual) }
-  if ($b.machines.Count) { $lines += ''; $lines += '--- 全队 ---'; foreach ($m in $b.machines) { $lines += ("{0}  {1}  {2} 分钟前  rc={3}  待办={4}" -f $m.machine, $m.at, $m.ageMin, $m.rc, @($m.actions).Count) } }
-  if ($b.actions.Count) { $lines += ''; $lines += '--- 待办 ---'; foreach ($a in $b.actions) { $lines += ("· [{0}] {1}" -f $a.source, $a.text) } }
-  [System.Windows.Forms.MessageBox]::Show(($lines -join "`n"), '同步简报') | Out-Null
-}
 
 function Invoke-Tick {
   # 2026-09-17（P5 后修正）：优先调**引擎的** node tick（跨平台单实现）。
@@ -243,7 +233,7 @@ if ($Action -eq 'probe') {
   Write-Output ("actions={0}" -f $b.actions.Count)
   Write-Output "tip:"
   Get-Tooltip $b | ForEach-Object { "  |$_" }
-  Write-Output "menu: 简报… / 打开控制台（调度台） / 适配器设置… / 立即同步 / 日志（可视） / 原始日志文件… / 随登录自启(勾选) / 状态变化时气泡提醒(勾选，默认关) / 退出"
+  Write-Output "menu: 打开控制台 / 立即同步一次 / — / 随登录自启(勾选) / 状态变化时气泡提醒(勾选，默认关) / — / 退出（双击图标 = 打开控制台）"
   foreach ($st in @('ok', 'warn', 'fail')) {
     $i = New-SyncIcon $st
     Write-Output ("icon[{0}] = {1}x{2} ({3} bytes)" -f $st, $i.Width, $i.Height, ($i.ToBitmap().GetPixel(26, 26).ToArgb()))
@@ -257,12 +247,10 @@ if ($Action -eq 'probe') {
 $notify = New-Object System.Windows.Forms.NotifyIcon
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
-$miBrief = $menu.Items.Add('简报…')
-$miConsole = $menu.Items.Add('打开控制台（调度台）')
-$miAdapters = $menu.Items.Add('适配器设置…')
-$miSync = $menu.Items.Add('立即同步')
-$miLogView = $menu.Items.Add('日志（可视）')
-$miLog = $menu.Items.Add('原始日志文件…')
+# 菜单刻意保持短：简报 / 适配器 / 日志 都是控制台里的页，不再各占一项（用户 2026-09-17 反馈"都调用拉起控制台就没有必要单列"）。
+$miConsole = $menu.Items.Add('打开控制台')
+$miSync = $menu.Items.Add('立即同步一次')
+$menu.Items.Add('-') | Out-Null
 $miAuto = $menu.Items.Add('随登录自启')
 $miAuto.CheckOnClick = $true
 $miAuto.Checked = Test-Path (Join-Path ([Environment]::GetFolderPath('Startup')) 'ai-sync tray.lnk')
@@ -297,21 +285,16 @@ function Update-Tray([switch]$AllowBalloon) {
   $script:lastState = $st
 }
 
-$miBrief.add_Click({ Show-Brief (Get-Brief) })
 $miConsole.add_Click({ Open-Console '' })
-$miAdapters.add_Click({ Open-Console '#settings' })
-$miLogView.add_Click({ Open-Console '#logs' })
 $miSync.add_Click({ Invoke-Tick; Start-Sleep -Seconds 8; Update-Tray })
-$miLog.add_Click({
-    $f = (Get-ChildItem -Path $logDir -Filter 'tick-*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1).FullName
-    if ($f -and (Test-Path $f)) { Start-Process notepad.exe $f } else { Start-Process explorer.exe $logDir }
-  })
 $miAuto.add_Click({ Set-Autostart $miAuto.Checked })
 $miBalloon.add_Click({
     if ($miBalloon.Checked) { Set-Content -Path $balloonFlag -Value 'on' -Encoding UTF8 -NoNewline }
     else { Remove-Item -LiteralPath $balloonFlag -Force -ErrorAction SilentlyContinue }
   })
 $miExit.add_Click({ $notify.Visible = $false; [System.Windows.Forms.Application]::Exit() })
+# 双击图标也开控制台（一般人右键才看菜单；双击是"打开"的通用手势）
+$notify.add_DoubleClick({ Open-Console '' })
 
 Update-Tray          # 先设 Icon/Text，再让图标可见：这样 Explorer 记录的 InitialTooltip 才是真 tooltip
 $notify.Visible = $true

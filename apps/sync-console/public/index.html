@@ -4,101 +4,129 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ai-sync 控制台</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <header>
-  <div class="brand"><span class="glyph" id="glyph">⟳</span> ai-sync 控制台</div>
+  <div class="brand"><span class="glyph" id="glyph">⟳</span> ai-sync 控制台
+    <span class="hint">本机文件的自动同步：状态、设置、对齐、记录都在这一页</span></div>
   <div class="head-right">
     <span id="verdict" class="pill">…</span>
-    <button id="btnTick" class="ghost">立即同步</button>
+    <button id="btnTick" class="ghost">立即同步一次</button>
   </div>
 </header>
 
 <nav>
-  <button class="tab active" data-tab="status">状态</button>
-  <button class="tab" data-tab="wizard">首次向导</button>
-  <button class="tab" data-tab="settings">设置</button>
-  <button class="tab" data-tab="align">初始化对齐</button>
-  <button class="tab" data-tab="logs">日志</button>
+  <button class="tab active" data-tab="status">总览</button>
+  <button class="tab" data-tab="wizard">设置</button>
+  <button class="tab" data-tab="settings">适配器</button>
+  <button class="tab" data-tab="align">首次对齐</button>
+  <button class="tab" data-tab="logs">运行记录</button>
 </nav>
 
 <main>
-  <!-- 状态 -->
+  <!-- 总览 -->
   <section id="tab-status" class="panel active">
     <div class="cards" id="cards"></div>
-    <h3>断言表</h3>
+    <h3>逐项检查</h3>
+    <p class="hint">每一行是一项自动检查：<b>PASS</b> 没问题 · <b>WARN</b> 提醒（不影响同步）· <b>FAIL</b> 要处理。出现 FAIL 时先看「实际」那列写的原因。</p>
     <table id="checks"><tbody></tbody></table>
-    <h3>全队</h3>
+    <h3>其他机器</h3>
+    <p class="hint">每台机器同步完都会把自己的状态推上来，这里能看出谁掉队了（「几分钟前」太久没动 = 那台机器没在跑）。</p>
     <table id="fleet"><tbody></tbody></table>
-    <h3>待办</h3>
+    <h3>需要你做的事</h3>
+    <p class="hint">自动同步做不了、必须人工处理的（例如某个程序要重启才能读到新配置）。做完就会消失。</p>
     <ul id="actions" class="actions"></ul>
   </section>
 
-  <!-- 向导 -->
+  <!-- 设置 -->
   <section id="tab-wizard" class="panel">
+    <p class="hint">这里决定「同步什么」和「多久同步一次」。改完点最下面的<b>保存并应用</b>即可，不需要命令行。
+      第一次装机按 ①②③④ 顺序走一遍就行。</p>
     <ol class="steps">
       <li><b>① 同步空间（可选）</b>
-        <p class="hint">网盘客户端的"同步文件夹"根目录。**不要**在这个目录里直接编辑文件（会被下次 seed 覆盖，且不回流权威源）。留空 = 只做 git 同步（µ1）。</p>
-        <div class="row"><input id="mirrorPath" placeholder="例如 D:\SyncDocs\BaiduSyncdisk 或 ~/BaiduSyncdisk">
+        <p class="hint">如果你另外用百度网盘/OneDrive 这类客户端备份文档，这里填<b>客户端的同步文件夹根目录</b>（它自己在管的那个目录，不是子目录）；不打算用云盘镜像就留空，跳过这步。</p>
+        <p class="hint warn-t">⚠ 不要在这个目录里直接编辑文件：它由本机单向刷入，改动不会回流，还会被下次覆盖。</p>
+        <div class="row"><input id="mirrorPath" placeholder="例如 D:\SyncDocs\BaiduSyncdisk 或 ~/BaiduSyncdisk" size="46">
           <button id="browseMirror" class="ghost">浏览…</button><button id="checkMirror" class="ghost">校验</button></div>
         <div id="mirrorCheck" class="check-line"></div>
         <div id="browser" class="browser hidden"></div>
       </li>
-      <li><b>② 同步空间 &amp; 文件夹范围</b>
-        <p class="hint">镜像（µ2）是**可选**的：留空/关掉就是纯 git 同步。填空时请选网盘客户端配的那个**同步文件夹根**（不是子目录）。
-          **属主模型**：每个 <code>source</code> 只由一台机器写；两个集合写同一个 <code>target</code> 必然冲突（会被拦下）。</p>
+      <li><b>② 要同步哪些文件夹</b>
+        <p class="hint">每一行是一个「集合」：<code>来源</code> = 你本机上要同步的目录（权威版本在这里）；<code>镜像里叫</code> = 它在同步空间里的子目录名。不填同步空间也可以只配 git 仓库（默认已经配好了）。</p>
+        <p class="hint">一个来源目录只让一台机器写。两台机器写同一个镜像目录会冲突，保存时会被拦下。</p>
         <div class="row"><label class="chk"><input id="mu2Enabled" type="checkbox"> 启用云盘镜像</label>
           <label>同步空间根<input id="mu2Dest" placeholder="例如 ~/BaiduSyncdisk" size="42"></label>
           <button id="browseDest" class="ghost">浏览…</button></div>
         <div id="destCheck" class="check-line"></div>
-        <table id="setsTable"><thead><tr><th>id</th><th>source（你的权威目录，机器本地可写）</th><th>target（镜像内子目录）</th><th>预估</th><th></th></tr></thead><tbody></tbody></table>
-        <div class="row"><button id="addSet" class="ghost">+ 加一个集合</button><button id="saveMachine">保存机器配置</button><span id="machineMsg" class="hint"></span></div>
-        <div id="browseTargetHint" class="hint">（「浏览…」会填到最近点选的那个输入框：同步空间根，或某个集合的 source）</div>
+        <table id="setsTable"><thead><tr><th>id</th><th>来源（本机目录，可编辑）</th><th>镜像里叫</th><th>预估大小</th><th></th></tr></thead><tbody></tbody></table>
+        <div class="row"><button id="addSet" class="ghost">+ 加一个</button><button id="saveMachine">保存范围</button><span id="machineMsg" class="hint"></span></div>
+        <div id="browseTargetHint" class="hint">（「浏览…」会填到最近点选的那个框：同步空间根，或某一行的来源）</div>
       </li>
-      <li><b>③ 节拍与自启</b>
-        <div class="row"><label>tick 间隔（分钟）<input id="interval" type="number" min="1" max="120"></label>
-          <label>状态推送（分钟）<input id="statePush" type="number" min="1" max="240"></label></div>
-        <div class="row"><label>镜像时间<input id="mirrorAt" placeholder="22:00"></label>
-          <label class="chk"><input id="dshAuto" type="checkbox"> 随登录启动 dsh 服务 <span class="hint">（写入配置；自启项的创建/移除由 P4 安装器落地）</span></label>
-          <label class="chk"><input id="consoleAuto" type="checkbox"> 随登录启动控制台 <span class="hint">（同上）</span></label></div>
-        <p class="hint">tick 间隔保存后**下一轮 tick 自动重排平台调度**（Windows 任务 / launchd plist），不需要命令行。</p>
+      <li><b>③ 多久同步一次</b>
+        <p class="hint"><b>同步间隔</b>：每隔多少分钟自动跑一次（默认 5 分钟，改动很小可以调大）。<b>状态上传间隔</b>：多久把自己的状态推给其他机器看一次。</p>
+        <p class="hint"><b>镜像时间</b>：每天几点把文档刷进同步空间（默认 22:00，避开你在用电脑的时段）。</p>
+        <div class="row"><label>同步间隔（分钟）<input id="interval" type="number" min="1" max="120" size="5"></label>
+          <label>状态上传（分钟）<input id="statePush" type="number" min="1" max="240" size="5"></label>
+          <label>镜像时间<input id="mirrorAt" placeholder="22:00" size="7"></label></div>
+        <p class="hint">保存后系统里的定时任务会立刻按新间隔重排，不用手动改计划任务。</p>
       </li>
       <li><b>④ 保存并应用</b>
-        <button id="saveCfg">保存设置</button> <span id="saveMsg" class="hint"></span>
+        <div class="row"><button id="saveCfg">保存并应用</button><span id="saveMsg" class="hint"></span></div>
+        <p class="hint">保存时会顺便检查定时任务是否与配置一致，不一致会自动重排（结果见上面那行提示）。</p>
       </li>
     </ol>
   </section>
 
-  <!-- 设置 -->
+  <!-- 适配器 -->
   <section id="tab-settings" class="panel">
-    <h3>适配器（producers / owners）</h3>
-    <p class="hint">关掉某个 = 它的目标不再进入收敛。新增一个 agent = 加一个 <code>adapters/owners/&lt;id&gt;.json</code>。</p>
+    <p class="hint">「适配器」= 让哪些程序的配置跟着同步自动更新。每一项都可以单独关掉：关掉之后它的目标文件不再被同步系统改动（你已经手工调过的就保持原样）。</p>
     <table id="adapters"><tbody></tbody></table>
-    <h3>原始配置（只读预览）</h3>
+    <div class="row"><span id="adapterMsg" class="hint"></span></div>
+    <h3>当前配置文件（只读）</h3>
+    <p class="hint">这是本机同步设置的原样内容，只给你核对用，改请用上面的界面。</p>
     <pre id="cfgJson"></pre>
   </section>
 
-  <!-- 对齐 -->
+  <!-- 首次对齐 -->
   <section id="tab-align" class="panel">
-    <p class="hint">**先看后做**：先跑"计划"（只报告，不改任何文件），确认后再"执行"。镜像侧冲突不会丢数据：败者另存为 <code>&lt;名&gt;.local-&lt;机器&gt;-&lt;日期&gt;</code>。</p>
-    <div class="row"><button id="alignPlan">计划（只报告）</button><button id="alignApply" class="danger">执行对齐</button></div>
-    <pre id="alignOut" class="out"></pre>
+    <p class="hint"><b>什么时候用</b>：刚在新机器上装完跑一次，把本机和云端仓库、同步空间对上一次。之后自动同步会自己维持，平时不用管这页。</p>
+    <p class="hint">顺序是「先看后做」：<b>① 检查</b>只读取现状、不改任何文件 → <b>② 看结论</b>知道要做什么 → <b>③ 执行</b>才真正动手。</p>
+    <ol class="steps">
+      <li><b>① 检查（不改任何文件）</b>
+        <p class="hint">只报告"差多少、要不要动手"。可以放心点。</p>
+        <div class="row"><button id="alignPlan">开始检查</button><span id="alignPlanState" class="chip">未检查</span></div>
+        <div id="alignPlanOut" class="check-line hidden"></div>
+      </li>
+      <li><b>② 结论（要做什么）</b>
+        <p class="hint">检查结果会翻译成大白话列在这里。如果显示「已经对齐」，第 ③ 步就不用做了。</p>
+        <div id="alignSummary" class="summary hint">还没有检查结果 —— 先点上面的「开始检查」。</div>
+      </li>
+      <li><b>③ 执行（会改动文件）</b>
+        <p class="hint">按上面的结论把缺的补上、把新的推上去。同一份文件两边都改过时<b>不会覆盖</b>：保留一份，另一份另存为 <code>名字.local-机器-日期</code>，事后你自己挑要哪个。</p>
+        <div class="row"><button id="alignApply" class="danger" disabled>执行对齐</button><span id="alignApplyState" class="chip">需先检查</span></div>
+        <div id="alignApplyOut" class="check-line hidden"></div>
+      </li>
+    </ol>
+    <h3>原始输出（排查用）</h3>
+    <pre id="alignOut" class="out">（还没运行）</pre>
   </section>
 
-  <!-- 日志 -->
+  <!-- 运行记录 -->
   <section id="tab-logs" class="panel">
+    <p class="hint">每轮自动同步都会留一行记录：<b>时间 / 结果 / 这轮实际发生了什么 / 备注</b>。失败行的备注里有原因。</p>
     <div class="row">
-      <select id="logName"><option value="tick">同步 tick</option><option value="daily">每日重活</option><option value="tick-<machine>">本机 tick 原始</option></select>
+      <select id="logName"><option value="tick">自动同步（tick）</option><option value="daily">每晚重活（镜像）</option></select>
       <button id="loadLog" class="ghost">刷新</button>
       <label class="chk"><input id="logRawToggle" type="checkbox"> 显示原始行</label>
-      <span class="hint">表格 = 每轮一行摘要（时间/结果/实际发生的变更/耗时/备注）；失败行的备注里有诊断</span>
+      <span class="hint">想复现别人的问题，把原始行整段发过去最快。</span>
     </div>
     <div id="logOut"></div>
     <pre id="logRaw" class="out hidden"></pre>
   </section>
 </main>
-<footer class="hint">ai-sync · 默认只绑 127.0.0.1 · 本页所有动作都通过引擎的 CLI 执行（不额外发明接口）</footer>
+<footer class="hint">ai-sync · 只在本机 127.0.0.1 上提供，不对外网开放 · 页面上的每个动作都调用引擎自带的命令行工具执行</footer>
 <script src="/app.js"></script>
 </body>
 </html>

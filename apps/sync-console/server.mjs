@@ -308,15 +308,32 @@ const server = createServer(async (req, res) => {
 
     if (p === '/api/align') {
       const apply = url.searchParams.get('apply') === '1';
-      const r = await node('sync-align.mjs', apply ? ['--apply'] : []);
-      return sendJson(res, 200, { apply, code: r.code, stdout: r.stdout, stderr: r.stderr });
+      const wantJson = url.searchParams.get('json') === '1';
+      const args = apply ? ['--apply'] : [];
+      if (wantJson) args.push('--json');
+      const r = await node('sync-align.mjs', args);
+      // --json 时 stdout 就是一份完整 JSON（已实测可整体 parse）；解析失败不算错误，前端会退回看原始输出
+      let plan = null;
+      if (wantJson) {
+        try {
+          plan = JSON.parse(r.stdout.trim());
+        } catch {}
+      }
+      return sendJson(res, 200, { apply, code: r.code, stdout: r.stdout, stderr: r.stderr, plan });
     }
 
     if (p === '/api/tick') {
+      // 引擎的 node tick 优先：与托盘「立即同步」走同一条实现（跨平台单实现）。
+      // 旧实例里的 sync-lite.ps1 只作回退 —— 同一动作两套实现会各自漂。
+      const nodeTick = join(ENGINE, 'tools', 'sync-tick.mjs');
+      if (existsSync(nodeTick)) {
+        const r = await node('sync-tick.mjs', ['--no-jitter'], { timeout: 15 * 60 * 1000 });
+        return sendJson(res, 200, { code: r.code, stdout: r.stdout, stderr: r.stderr, via: 'tools/sync-tick.mjs' });
+      }
       const tick = join(INSTANCE, 'sync', 'sync-lite.ps1');
-      if (!existsSync(tick)) return sendJson(res, 500, { error: `缺 ${tick}` });
+      if (!existsSync(tick)) return sendJson(res, 500, { error: `找不到 tick：${nodeTick} 与 ${tick} 都不存在` });
       const r = await run(pwshExe, ['-NoProfile', '-File', tick, '-NoJitter'], { timeout: 15 * 60 * 1000 });
-      return sendJson(res, 200, { code: r.code, stdout: r.stdout, stderr: r.stderr });
+      return sendJson(res, 200, { code: r.code, stdout: r.stdout, stderr: r.stderr, via: 'sync/sync-lite.ps1（回退）' });
     }
 
     if (p === '/api/logs') {
