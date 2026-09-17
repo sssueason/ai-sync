@@ -1,0 +1,6 @@
+{
+  "id": "vault",
+  "_comment": "vault 内的 AGENTS.md 由各 agent 在会话中自行读取（dsh 逐请求 reconcile）⇒ 不需要任何动作，只记录。",
+  "probe": { "any": ["~"] },
+  "reload": { "mode": "none", "hint": "vault 指令文件由 agent 会话内读取，无需重启" }
+}

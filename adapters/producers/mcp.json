@@ -1,0 +1,1 @@
+{ "id": "mcp", "enabled": true, "cmd": ["node", "{engine}/mcp/render/render_mcp.mjs", "--targets-json"], "renderCmd": ["node", "{engine}/mcp/render/render_mcp.mjs"] }

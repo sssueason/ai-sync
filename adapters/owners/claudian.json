@@ -1,0 +1,7 @@
+{
+  "id": "claudian",
+  "_comment": "跑在 Obsidian 内的 agent：没有对外重载接口，且 Obsidian 重启代价大 ⇒ 默认关闭接入；要用就改成 true 并接受「只通知」。",
+  "enabled": false,
+  "probe": { "any": ["~/.config/opencode/MEMORY-POINTER.md"] },
+  "reload": { "mode": "manual", "hint": "在 Obsidian 里重载/重启生效" }
+}

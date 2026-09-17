@@ -1,0 +1,1 @@
+{ "id": "agentFiles", "enabled": true, "cmd": ["node", "{engine}/tools/render_agent_files.mjs", "--targets-json"], "renderCmd": ["node", "{engine}/tools/render_agent_files.mjs"] }

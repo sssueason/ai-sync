@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ai-sync 控制台</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span class="glyph" id="glyph">⟳</span> ai-sync 控制台</div>
+  <div class="head-right">
+    <span id="verdict" class="pill">…</span>
+    <button id="btnTick" class="ghost">立即同步</button>
+  </div>
+</header>
+
+<nav>
+  <button class="tab active" data-tab="status">状态</button>
+  <button class="tab" data-tab="wizard">首次向导</button>
+  <button class="tab" data-tab="settings">设置</button>
+  <button class="tab" data-tab="align">初始化对齐</button>
+  <button class="tab" data-tab="logs">日志</button>
+</nav>
+
+<main>
+  <!-- 状态 -->
+  <section id="tab-status" class="panel active">
+    <div class="cards" id="cards"></div>
+    <h3>断言表</h3>
+    <table id="checks"><tbody></tbody></table>
+    <h3>全队</h3>
+    <table id="fleet"><tbody></tbody></table>
+    <h3>待办</h3>
+    <ul id="actions" class="actions"></ul>
+  </section>
+
+  <!-- 向导 -->
+  <section id="tab-wizard" class="panel">
+    <ol class="steps">
+      <li><b>① 同步空间（可选）</b>
+        <p class="hint">网盘客户端的"同步文件夹"根目录。**不要**在这个目录里直接编辑文件（会被下次 seed 覆盖，且不回流权威源）。留空 = 只做 git 同步（µ1）。</p>
+        <div class="row"><input id="mirrorPath" placeholder="例如 D:\SyncDocs\BaiduSyncdisk 或 ~/BaiduSyncdisk">
+          <button id="browseMirror" class="ghost">浏览…</button><button id="checkMirror" class="ghost">校验</button></div>
+        <div id="mirrorCheck" class="check-line"></div>
+        <div id="browser" class="browser hidden"></div>
+      </li>
+      <li><b>② 各端参与 &amp; 文件夹范围</b>
+        <p class="hint">这两项由**数据**决定，不是本页的自由开关：参与端 = 已 <code>enroll</code> 的机器（列表见「状态」页的全队表）；文件夹范围 = 各机 <code>machines/&lt;machine&gt;.json</code> 里声明的 <code>mu2.sets</code>（属主可写、他人只读）。可视化编辑随 P4 的 enroll 流程一起落地 —— 在此之前请**不要**期待这里能点选（本页不提供假开关）。</p>
+      </li>
+      <li><b>③ 节拍与自启</b>
+        <div class="row"><label>tick 间隔（分钟）<input id="interval" type="number" min="1" max="120"></label>
+          <label>状态推送（分钟）<input id="statePush" type="number" min="1" max="240"></label></div>
+        <div class="row"><label>镜像时间<input id="mirrorAt" placeholder="22:00"></label>
+          <label class="chk"><input id="dshAuto" type="checkbox"> 随登录启动 dsh 服务 <span class="hint">（写入配置；自启项的创建/移除由 P4 安装器落地）</span></label>
+          <label class="chk"><input id="consoleAuto" type="checkbox"> 随登录启动控制台 <span class="hint">（同上）</span></label></div>
+        <p class="hint">tick 间隔保存后**下一轮 tick 自动重排平台调度**（Windows 任务 / launchd plist），不需要命令行。</p>
+      </li>
+      <li><b>④ 保存并应用</b>
+        <button id="saveCfg">保存设置</button> <span id="saveMsg" class="hint"></span>
+      </li>
+    </ol>
+  </section>
+
+  <!-- 设置 -->
+  <section id="tab-settings" class="panel">
+    <h3>适配器（producers / owners）</h3>
+    <p class="hint">关掉某个 = 它的目标不再进入收敛。新增一个 agent = 加一个 <code>adapters/owners/&lt;id&gt;.json</code>。</p>
+    <table id="adapters"><tbody></tbody></table>
+    <h3>原始配置（只读预览）</h3>
+    <pre id="cfgJson"></pre>
+  </section>
+
+  <!-- 对齐 -->
+  <section id="tab-align" class="panel">
+    <p class="hint">**先看后做**：先跑"计划"（只报告，不改任何文件），确认后再"执行"。镜像侧冲突不会丢数据：败者另存为 <code>&lt;名&gt;.local-&lt;机器&gt;-&lt;日期&gt;</code>。</p>
+    <div class="row"><button id="alignPlan">计划（只报告）</button><button id="alignApply" class="danger">执行对齐</button></div>
+    <pre id="alignOut" class="out"></pre>
+  </section>
+
+  <!-- 日志 -->
+  <section id="tab-logs" class="panel">
+    <div class="row">
+      <select id="logName"><option value="tick">tick</option><option value="daily">daily</option><option value="converge">converge</option></select>
+      <button id="loadLog" class="ghost">刷新日志</button>
+    </div>
+    <pre id="logOut" class="out"></pre>
+  </section>
+</main>
+<footer class="hint">ai-sync · 默认只绑 127.0.0.1 · 本页所有动作都通过引擎的 CLI 执行（不额外发明接口）</footer>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+{
+  "id": "workbuddy",
+  "_comment": "交互式应用（含插件生态）：配置在启动时读取 ⇒ 只通知、不自动重启。",
+  "probe": { "any": ["~/.workbuddy/mcp.json", "~/.workbuddy"] },
+  "reload": { "mode": "manual", "hint": "重启 WorkBuddy 生效" }
+}

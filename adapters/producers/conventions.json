@@ -1,0 +1,1 @@
+{ "id": "conventions", "enabled": true, "cmd": ["node", "{engine}/tools/render_conventions.mjs", "--targets-json"], "renderCmd": ["node", "{engine}/tools/render_conventions.mjs"] }
