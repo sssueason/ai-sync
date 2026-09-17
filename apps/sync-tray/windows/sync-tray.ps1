@@ -16,7 +16,7 @@
 # 设计取舍：刷新只跑 `sync-status.mjs --json --no-fetch`（本地为主，不为了刷新去联网）；
 # 气泡只在**状态跳变**时弹一次（否则每 2 分钟骚扰一次，人会直接关掉通知）。
 param(
-  [ValidateSet('run', 'probe', 'install-autostart', 'uninstall-autostart', 'promote-icon', 'open-console')][string]$Action = 'run',
+  [ValidateSet('run', 'probe', 'install-autostart', 'uninstall-autostart', 'promote-icon', 'open-console', 'update-engine')][string]$Action = 'run',
   [switch]$PromoteIcon,
   [switch]$OpenConsole,
   [string]$ConsolePage = '',
@@ -25,6 +25,7 @@ param(
   [switch]$Probe,
   [switch]$InstallAutostart,
   [switch]$UninstallAutostart,
+  [switch]$UpdateEngine,
   [int]$RefreshSeconds = 120,
   [string]$Engine = '',
   [string]$Instance = ''
@@ -34,6 +35,7 @@ if ($InstallAutostart) { $Action = 'install-autostart' }
 if ($UninstallAutostart) { $Action = 'uninstall-autostart' }
 if ($PromoteIcon) { $Action = 'promote-icon' }
 if ($OpenConsole) { $Action = 'open-console' }
+if ($UpdateEngine) { $Action = 'update-engine' }
 $ErrorActionPreference = 'Continue'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -82,7 +84,9 @@ $instanceHasCfg = Test-Path (Join-Path $instanceRoot 'sync/instance.json')
 # 原地布局下实例里那份只是副本，用它去查「引擎是否落后」永远得到"不适用"（2026-09-17 实测盲点）；
 # 顺带这也是 P5 收尾的方向（托盘最终只从引擎目录起，实例只提供配置）。
 $installedEngine = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.ai-sync/engine'
-$engineForRun = if (Test-Path (Join-Path $installedEngine 'tools/sync-tick.mjs')) { $installedEngine } else { $engineRoot }
+# 显式 -Engine 优先（测试与多布局场景必须能指定）；否则优先**已安装引擎**；再否则引擎根。
+# 2026-09-18 实测：不判 -Engine 会让 "-Engine <临时 clone>" 被静默忽略，测试全打到真实引擎上。
+$engineForRun = if ($Engine) { $Engine } elseif (Test-Path (Join-Path $installedEngine 'tools/sync-tick.mjs')) { $installedEngine } else { $engineRoot }
 $statusTool = Join-Path $engineForRun 'tools/sync-status.mjs'
 $logDir = Join-Path $instanceRoot 'sync/logs'
 $stateFile = Join-Path $logDir '.tray-last-state.json'
@@ -262,12 +266,137 @@ function Set-Autostart([bool]$on) {
   Write-Host "  [OK] 已设置随登录自启：$lnk"
 }
 
+<# 有界的 git 调用（**只用于网络类操作**：fetch / pull）。
+为什么必须有超时：这是菜单里点一下就跑的代码，而托盘跑在 UI 线程上 —— 没有超时的话，
+远端不可达时整个托盘会冻住（2026-09-18 实测：无超时那版卡到 600s 都没返回）。
+本地操作（rev-parse / rev-list / diff）不联网、毫秒级，仍用 `& git` 直调。 #>
+function Invoke-Git([string[]]$GitArgs, [string]$Repo, [int]$TimeoutSec = 45) {
+  # 临时文件放**实例的 state 目录**而不是 $env:TEMP：这台机器上 $env:TEMP 可能是 8.3 别名
+  # （实测 Start-Process 的重定向会失败 ⇒ $p.ExitCode 为 null），state 目录一定是真实可写路径。
+  $dir = Join-Path $instanceRoot 'sync/state'
+  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+  $tmp = Join-Path $dir ('.git-run-' + [guid]::NewGuid().ToString('N') + '.out')
+  $env:GIT_TERMINAL_PROMPT = '0'      # 绝不弹凭据提示（UI 线程下没人能应答）
+  $env:GCM_INTERACTIVE = 'Never'
+  try {
+    $p = Start-Process -FilePath 'git' -ArgumentList (@('-C', $Repo) + $GitArgs) -NoNewWindow -PassThru -RedirectStandardOutput $tmp -RedirectStandardError "$tmp.err"
+    if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+      try { $p.Kill() } catch { }
+      return [pscustomobject]@{ ok = $false; code = 124; out = ''; err = "超时（${TimeoutSec}s 未返回，已终止）" }
+    }
+    $p.Refresh()
+    $out = if (Test-Path $tmp) { [IO.File]::ReadAllText($tmp) } else { '' }
+    $err = if (Test-Path "$tmp.err") { [IO.File]::ReadAllText("$tmp.err") } else { '' }
+    $code = if ($null -ne $p.ExitCode) { [int]$p.ExitCode } else { -1 }
+    return [pscustomobject]@{ ok = ($code -eq 0); code = $code; out = $out.Trim(); err = $err.Trim() }
+  } catch {
+    return [pscustomobject]@{ ok = $false; code = -1; out = ''; err = $_.Exception.Message }
+  } finally {
+    Remove-Item $tmp, "$tmp.err" -Force -ErrorAction SilentlyContinue
+  }
+}
+
+<# 一键更新引擎（右键菜单 / `-UpdateEngine` 共用这一段）。
+
+为什么要有它：引擎装在每台机器**各自的 clone** 里，且**刻意不自动更新** —— 自动更新会在计划任务/launchd
+运行途中替换正在执行的代码。但"手动"不该等于"记得住那条命令"：这里把 fetch → 判定落后 → pull --ff-only
+→ 按"改了哪一片"决定要不要重注册调度/重启托盘，一次做完，并把结果原样告诉用户（失败照实说，不装成功）。
+
+安全边界：只用 `--ff-only`（本地有分叉或未提交改动就失败并如实报告，绝不 --force、绝不丢弃本地改动）。 #>
+function Update-Engine([switch]$DryRun) {
+  $eng = $engineForRun
+  $r = [ordered]@{ ok = $false; dryRun = [bool]$DryRun; engine = $eng; branch = ''; before = ''; after = ''; pulled = 0; steps = @(); changed = @(); restartTray = $false; error = '' }
+  if (-not (Test-Path (Join-Path $eng '.git'))) { $r.error = "引擎目录不是 git 仓：$eng"; return [pscustomobject]$r }
+  $r.branch = (& git -C $eng rev-parse --abbrev-ref HEAD 2>$null | Out-String).Trim()
+  if (-not $r.branch -or $r.branch -eq 'HEAD') { $r.error = '引擎处于游离 HEAD（不在分支上），不自动更新'; return [pscustomobject]$r }
+  $r.before = (& git -C $eng rev-parse --short HEAD 2>$null | Out-String).Trim()
+  $f = Invoke-Git @('-c', 'http.lowSpeedLimit=1000', '-c', 'http.lowSpeedTime=20', 'fetch', '--quiet', 'origin', $r.branch) $eng 45
+  if (-not $f.ok) { $r.error = "git fetch 失败（exit $($f.code)）：$(if ($f.err) { $f.err } else { $f.out })"; return [pscustomobject]$r }
+  $behind = (& git -C $eng rev-list --count "HEAD..origin/$($r.branch)" 2>$null | Out-String).Trim()
+  if ($behind -and $behind -ne '0') {
+    if ($DryRun) {
+      $r.pulled = [int]$behind
+      $r.steps += "（dry-run）将拉取 $behind 个提交"
+      $r.changed = @((& git -C $eng diff --name-only 'HEAD' "origin/$($r.branch)" 2>$null) -split "`r?`n" | Where-Object { $_ })
+    } else {
+      $pl = Invoke-Git @('-c', 'http.lowSpeedLimit=1000', '-c', 'http.lowSpeedTime=20', 'pull', '--ff-only') $eng 90
+      if (-not $pl.ok) { $r.error = "git pull --ff-only 失败（本地有分叉或未提交改动？）：$(if ($pl.err) { $pl.err } else { $pl.out })"; return [pscustomobject]$r }
+      $r.pulled = [int]$behind
+      $r.steps += "拉取 $behind 个提交"
+      $r.changed = @((& git -C $eng diff --name-only "$($r.before)" HEAD 2>$null) -split "`r?`n" | Where-Object { $_ })
+    }
+  } else {
+    $r.steps += '已是最新，无需拉取'
+  }
+  $r.after = (& git -C $eng rev-parse --short HEAD 2>$null | Out-String).Trim()
+  $hit = { param($re) [bool](@($r.changed) | Where-Object { $_ -match $re }) }
+  # 后续动作与 OPERATIONS §10 的表逐条对应
+  if (& $hit '^install/') {
+    if ($DryRun) { $r.steps += '（dry-run）安装器有变 → 将重注册调度' }
+    else {
+      $inst = Join-Path $eng 'install/install.mjs'
+      if (Test-Path $inst) {
+        $out = (& node $inst --instance $instanceRoot --register 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0) { $r.error = "重注册失败：$out"; return [pscustomobject]$r }
+        $r.steps += '安装器有变 → 已重注册调度'
+      } else { $r.steps += '安装器有变但找不到 install/install.mjs（跳过重注册）' }
+    }
+  }
+  if (& $hit '^apps/sync-tray/') {
+    $r.restartTray = $true
+    $r.steps += $(if ($DryRun) { '（dry-run）托盘自身有更新 → 将重启托盘' } else { '托盘自身有更新 → 已重启托盘' })
+  }
+  if ($r.pulled -gt 0 -and -not (& $hit '^install/') -and -not (& $hit '^apps/sync-tray/')) {
+    $r.steps += '工具/适配器/文档有更新 → 下一轮 tick 自动生效'
+  }
+  $r.ok = $true
+  return [pscustomobject]$r
+}
+
+function Show-EngineUpdate([switch]$DryRun) {
+  $r = Update-Engine -DryRun:$DryRun
+  $lines = @()
+  if (-not $r.ok) {
+    $lines += '更新失败（未做任何改动）'
+    $lines += ''
+    $lines += $r.error
+  } else {
+    $lines += $(if ($r.pulled -gt 0) { "引擎已更新：$($r.before) → $($r.after)" } else { "引擎已是最新：$($r.after)" })
+    $lines += "分支：$($r.branch)    目录：$($r.engine)"
+    $lines += ''
+    foreach ($s in $r.steps) { $lines += "· $s" }
+    if ($r.pulled -gt 0 -and @($r.changed).Count) { $lines += ''; $lines += "本次涉及（前 5）：$((@($r.changed) | Select-Object -First 5) -join '、')" }
+    if ($r.restartTray -and -not $DryRun) { $lines += ''; $lines += '托盘已用新代码重启（图标可能闪一下）。' }
+  }
+  [System.Windows.Forms.MessageBox]::Show(($lines -join "`n"), '更新引擎') | Out-Null
+  if ($r.ok -and $r.restartTray -and -not $DryRun) {
+    # 托盘自身更新：拉起新实例再退出自己（新实例接管图标）
+    Start-Process -FilePath 'wscript.exe' -ArgumentList ("`"$here\sync-tray.vbs`" `"$instanceRoot`"") | Out-Null
+    Start-Sleep -Seconds 2
+    $notify.Visible = $false
+    [System.Windows.Forms.Application]::Exit()
+  } else {
+    Update-Tray
+  }
+}
+
 # ---------------------------------------------------------------- 三种入口
 
 if ($Action -eq 'install-autostart') { Set-Autostart $true; exit 0 }
 if ($Action -eq 'uninstall-autostart') { Set-Autostart $false; exit 0 }
 if ($Action -eq 'promote-icon') { Set-IconPromoted; exit 0 }
 if ($Action -eq 'open-console') { Open-Console $ConsolePage -DryRun:$DryRun; exit 0 }
+
+if ($Action -eq 'update-engine') {
+  # 无 UI（可测）：打印结论，退出码 0=成功 / 1=失败
+  $r = Update-Engine -DryRun:$DryRun
+  Write-Output ("engine={0}  branch={1}" -f $r.engine, $r.branch)
+  Write-Output ("before={0}  after={1}  pulled={2}{3}" -f $r.before, $r.after, $r.pulled, $(if ($r.dryRun) { '  (dry-run)' } else { '' }))
+  foreach ($s in $r.steps) { Write-Output ("  · " + $s) }
+  if (@($r.changed).Count) { Write-Output ("  changed({0}): {1}" -f @($r.changed).Count, ((@($r.changed) | Select-Object -First 6) -join ', ')) }
+  if ($r.ok) { Write-Output 'RESULT: OK' } else { Write-Output ("RESULT: FAIL - " + $r.error) }
+  exit $(if ($r.ok) { 0 } else { 1 })
+}
 
 if ($Action -eq 'probe') {
   # 先把路径解析摊开（诊断托盘"红着骗人"的第一步：实例根找对了没有）
@@ -280,7 +409,7 @@ if ($Action -eq 'probe') {
   Write-Output ("actions={0}" -f $b.actions.Count)
   Write-Output "tip:"
   Get-Tooltip $b | ForEach-Object { "  |$_" }
-  Write-Output "menu: 打开控制台 / 立即同步一次 / — / 随登录自启(勾选) / 状态变化时气泡提醒(勾选，默认关) / — / 退出（双击图标 = 打开控制台）"
+  Write-Output "menu: 打开控制台 / 立即同步一次 / 检查并更新引擎（落后时显示落后几提交）/ — / 随登录自启(勾选) / 状态变化时气泡提醒(勾选，默认关) / — / 退出（双击图标 = 打开控制台）"
   foreach ($st in @('ok', 'warn', 'fail')) {
     $i = New-SyncIcon $st
     Write-Output ("icon[{0}] = {1}x{2} ({3} bytes)" -f $st, $i.Width, $i.Height, ($i.ToBitmap().GetPixel(26, 26).ToArgb()))
@@ -297,6 +426,7 @@ $menu = New-Object System.Windows.Forms.ContextMenuStrip
 # 菜单刻意保持短：简报 / 适配器 / 日志 都是控制台里的页，不再各占一项（用户 2026-09-17 反馈"都调用拉起控制台就没有必要单列"）。
 $miConsole = $menu.Items.Add('打开控制台')
 $miSync = $menu.Items.Add('立即同步一次')
+$miUpdate = $menu.Items.Add('检查并更新引擎')
 $menu.Items.Add('-') | Out-Null
 $miAuto = $menu.Items.Add('随登录自启')
 $miAuto.CheckOnClick = $true
@@ -317,6 +447,9 @@ function Update-Tray([switch]$AllowBalloon) {
   $script:curIcon = $newIcon
   $notify.Icon = $newIcon
   $notify.Text = Get-Tooltip $b
+  # 动态标签：落后就直说落后几个提交（与 tooltip 同一判据），没落后就显示当前版本
+  $behindNow = [int]($b.raw.engineBehind ?? 0)
+  $miUpdate.Text = if ($behindNow -gt 0) { "更新引擎（落后 $behindNow 个提交）" } elseif ($b.raw.engineRev) { "检查并更新引擎（当前 $($b.raw.engineRev)）" } else { '检查并更新引擎' }
   $notify.ContextMenuStrip = $menu
   # 气泡只在**开关打开**且状态跳变时弹一次（默认关：用户要求静默；否则每轮刷新都弹 = 骚扰）
   $prev = ''
@@ -334,6 +467,7 @@ function Update-Tray([switch]$AllowBalloon) {
 
 $miConsole.add_Click({ Open-Console '' })
 $miSync.add_Click({ Invoke-Tick; Start-Sleep -Seconds 8; Update-Tray })
+$miUpdate.add_Click({ Show-EngineUpdate })
 $miAuto.add_Click({ Set-Autostart $miAuto.Checked })
 $miBalloon.add_Click({
     if ($miBalloon.Checked) { Set-Content -Path $balloonFlag -Value 'on' -Encoding UTF8 -NoNewline }

@@ -8,6 +8,8 @@
 //       打开控制台 / 立即同步一次 / 引擎可更新(仅在落后时出现) / — /
 //       随登录自启(勾选) / 状态变化时气泡提醒(勾选，默认关) / — / 退出
 //     简报与日志都是控制台里的页，不再各占一项（Windows 侧 2026-09-17 同样精简）。
+//   · 「检查并更新引擎」= 一键 fetch → pull --ff-only → 按改动面重注册调度 / 提示重编托盘
+//     （落后时标题写「更新引擎（落后 N 个提交）」；网络调用带超时，绝不冻住菜单）
 //   · CLI：--probe 打印真实状态与文案后退出（可测性，对应 Windows 的 -Probe）
 //
 // ⚠️ **本文件本轮改动未在 macOS 上编译验证**（作者机器无 Swift 工具链）。
@@ -192,9 +194,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         menu.addItem(NSMenuItem(title: "打开控制台", action: #selector(openConsole), keyEquivalent: "o"))
         menu.addItem(NSMenuItem(title: "立即同步一次", action: #selector(runTick), keyEquivalent: "s"))
-        updateItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        updateItem.isEnabled = false
-        updateItem.isHidden = true
+        // 「引擎可更新（落后 N）」原先只是一条**只能看**的灰项；现在它本身就是一键更新入口
+        updateItem = NSMenuItem(title: "检查并更新引擎", action: #selector(updateEngine), keyEquivalent: "u")
         menu.addItem(updateItem)
         menu.addItem(.separator())
         autostartItem = NSMenuItem(title: "随登录自启", action: #selector(toggleAutostart), keyEquivalent: "")
@@ -224,13 +225,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let st = b.ok ? b.state : "fail"
         item.button?.image = makeIcon(state: st)
         item.button?.toolTip = tooltip(b)
-        // 引擎可更新：只在真落后时出现，并把命令写清楚（与 Windows 版同文案）
+        // 引擎更新入口：落后时标题直说落后几个提交，不落后就显示当前版本（与 Windows 托盘同款文案）
         let behind = b.engineBehind ?? 0
         if behind > 0 {
-            updateItem.title = "引擎可更新（落后 \(behind) 个提交）"
-            updateItem.isHidden = false
+            updateItem.title = "更新引擎（落后 \(behind) 个提交）"
+        } else if let rev = b.engineRev {
+            updateItem.title = "检查并更新引擎（当前 \(rev)）"
         } else {
-            updateItem.isHidden = true
+            updateItem.title = "检查并更新引擎"
         }
         let balloonOn = FileManager.default.fileExists(atPath: balloonFlag)
         if balloon && balloonOn && st != "ok" && st != lastState {
@@ -292,6 +294,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         p.arguments = ["-lc", "node '\(tick)' --instance '\(instanceRoot)' --no-jitter"]
         try? p.run()
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { self.refresh(balloon: false, fetch: false) }
+    }
+
+    /// 跑一条 git 命令（带**超时**：菜单一点就把 UI 冻住是不可接受的；实测 Windows 侧无超时那版卡到 600s）。
+    func gitRun(_ args: [String], _ seconds: Double) -> (Int32, String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        p.arguments = ["-lc", "git -C '\(engineRoot)' " + args.joined(separator: " ")]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do { try p.run() } catch { return (-1, "无法启动 git：\(error.localizedDescription)") }
+        let deadline = Date().addingTimeInterval(seconds)
+        while p.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.2) }
+        if p.isRunning {
+            p.terminate()
+            let s = Int(seconds)
+            return (124, "超时（\(s)s 未返回，已终止）")
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let text = (String(data: data, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return (p.terminationStatus, text)
+    }
+
+    /// 一键更新引擎（与 Windows 托盘同一套语义）：fetch → 落后判定 → pull --ff-only →
+    /// 安装器有变则重注册调度；托盘自身有变则提示重编（macOS 上不能自重建 App）。
+    @objc func updateEngine() {
+        var steps: [String] = []
+        let (brc, brRaw) = gitRun(["rev-parse", "--abbrev-ref", "HEAD"], 15)
+        let branch = brRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if brc != 0 || branch.isEmpty || branch == "HEAD" {
+            alert("更新失败（未做任何改动）\n\n引擎不在分支上：\n\(brRaw)")
+            return
+        }
+        let (_, beforeRaw) = gitRun(["rev-parse", "--short", "HEAD"], 15)
+        let before = beforeRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 低速阈值：防"连上了但永远不动"把菜单拖住
+        let (fc, fout) = gitRun(["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=20", "fetch", "--quiet", "origin", branch], 45)
+        if fc != 0 {
+            alert("更新失败（未做任何改动）\n\ngit fetch 失败：\n\(fout)")
+            return
+        }
+        let (_, behindRaw) = gitRun(["rev-list", "--count", "HEAD..origin/\(branch)"], 15)
+        let behind = Int(behindRaw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+        var changed = ""
+        if behind > 0 {
+            let (pc, pout) = gitRun(["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=20", "pull", "--ff-only"], 90)
+            if pc != 0 {
+                alert("更新失败（未做任何改动）\n\ngit pull --ff-only 失败（本地有分叉或未提交改动？）：\n\(pout)")
+                return
+            }
+            steps.append("拉取 \(behind) 个提交")
+            let (_, c) = gitRun(["diff", "--name-only", before, "HEAD"], 20)
+            changed = c
+            if c.contains("install/") {
+                let srv = (engineRoot as NSString).appendingPathComponent("install/install.mjs")
+                let rc2 = shell("/bin/zsh", ["-lc", "node '\(srv)' --instance '\(instanceRoot)' --register"])
+                if rc2 == 0 { steps.append("安装器有变 → 已重注册调度") }
+                else {
+                    let code = Int(rc2)
+                    steps.append("安装器有变，但重注册失败（exit \(code)）")
+                }
+            }
+            if c.contains("apps/sync-tray/") {
+                steps.append("托盘自身有更新 → 请重编：bash '\(engineRoot)/apps/sync-tray/macos/build.sh' --install")
+            }
+            if !c.contains("install/") && !c.contains("apps/sync-tray/") {
+                steps.append("工具/适配器/文档有更新 → 下一轮 tick 自动生效")
+            }
+        } else {
+            steps.append("已是最新，无需拉取")
+        }
+        let (_, afterRaw) = gitRun(["rev-parse", "--short", "HEAD"], 15)
+        let after = afterRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        var msg = behind > 0 ? "引擎已更新：\(before) → \(after)" : "引擎已是最新：\(after)"
+        msg += "\n分支：\(branch)    目录：\(engineRoot)\n\n"
+        msg += steps.map { "· " + $0 }.joined(separator: "\n")
+        alert(msg)
+        refresh(balloon: false, fetch: true)
     }
 
     @objc func toggleAutostart() {
