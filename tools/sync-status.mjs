@@ -426,10 +426,10 @@ if (schedule.mirror) {
 
 // 引擎更新提示：落后 ⇒ WARN（不是 FAIL —— 旧代码照样能跑，但不能装作没这回事）
 const eng = engineFacts();
-if (eng.behind === null) add('引擎代码为最新', 'INFO', '与远端一致', eng.detail || '未检查');
+if (eng.behind === null) add('引擎代码与远端一致', 'INFO', '与远端一致', eng.detail || '未检查');
 else if (eng.behind > 0)
-  add('引擎代码为最新', 'WARN', `与 origin/${eng.branch} 一致`, `落后 ${eng.behind} 个提交（当前 ${eng.rev}）—— 更新：git -C "${eng.path}" pull`);
-else add('引擎代码为最新', 'PASS', `与 origin/${eng.branch} 一致`, `0 落后（${eng.rev}）`);
+  add('引擎代码与远端一致', 'WARN', `与 origin/${eng.branch} 一致`, `落后 ${eng.behind} 个提交（当前 ${eng.rev}）—— 更新：git -C "${eng.path}" pull`);
+else add('引擎代码与远端一致', 'PASS', `与 origin/${eng.branch} 一致`, `0 落后（${eng.rev}）`);
 
 if (conv.statePush && conv.statePush.ok === false) add('跨端状态已推送', 'WARN', '推送成功', conv.statePush.error || '上轮推送失败');
 

@@ -52,3 +52,7 @@ code{background:var(--line);padding:1px 5px;border-radius:4px;font-size:12px}
 .summary div{margin:2px 0}
 .steps>li>b{display:block;margin-bottom:6px;font-size:13px;color:var(--fg)}
 .brand .hint{margin-left:6px;font-weight:400}
+/* 更新提示横幅：只有真落后才出现（不带颜色断言时不该占位） */
+.banner{background:var(--panel);border:1px solid var(--warn);border-left-width:4px;border-radius:10px;padding:10px 12px;margin-bottom:14px;font-size:13px;line-height:1.7}
+.banner code{word-break:break-all}
+.banner .hint{display:block;margin-top:2px}

@@ -44,7 +44,12 @@ Add-Type -Namespace AiSync -Name Native -MemberDefinition '[System.Runtime.Inter
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $engineRoot = if ($Engine) { $Engine } elseif ($env:AI_SYNC_ENGINE) { $env:AI_SYNC_ENGINE } else { Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $here)) }
 $instanceRoot = if ($Instance) { $Instance } elseif ($env:AI_SYNC_INSTANCE) { $env:AI_SYNC_INSTANCE } else { $engineRoot }
-$statusTool = Join-Path $engineRoot 'tools/sync-status.mjs'
+# 优先用**已安装的引擎**（拆分部署）跑状态查询、tick 与控制台：
+# 原地布局下实例里那份只是副本，用它去查「引擎是否落后」永远得到"不适用"（2026-09-17 实测盲点）；
+# 顺带这也是 P5 收尾的方向（托盘最终只从引擎目录起，实例只提供配置）。
+$installedEngine = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.ai-sync/engine'
+$engineForRun = if (Test-Path (Join-Path $installedEngine 'tools/sync-tick.mjs')) { $installedEngine } else { $engineRoot }
+$statusTool = Join-Path $engineForRun 'tools/sync-status.mjs'
 $logDir = Join-Path $instanceRoot 'sync/logs'
 $stateFile = Join-Path $logDir '.tray-last-state.json'
 # 气泡提醒默认**关**（用户 2026-09-17：「保持静默」）：只有这个文件存在才弹，菜单里可勾选开关。
@@ -57,7 +62,7 @@ function Get-Brief {
   # 并把 JSON 破坏成 `Bad JSON escape sequence`。
   # 写 UTF-8 文件再按 UTF-8 读，完全不经过控制台代码页 ⇒ 这类问题根治。
   $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("ai-sync-brief-{0}.json" -f $PID)
-  $env:AI_SYNC_INSTANCE = $instanceRoot; $env:AI_SYNC_ENGINE = $engineRoot
+  $env:AI_SYNC_INSTANCE = $instanceRoot; $env:AI_SYNC_ENGINE = $engineForRun
   & node $statusTool --instance $instanceRoot --out $tmp --no-fetch --quiet 2>$null | Out-Null
   if (-not (Test-Path $tmp)) { return [pscustomobject]@{ ok = $false; error = "sync-status 未产出 $tmp（退出码 $LASTEXITCODE）" } }
   $json = Get-Content -Raw -Encoding UTF8 $tmp
@@ -75,6 +80,7 @@ function Get-Tooltip([object]$b) {
     default { "同步有失败 · $($b.lastSyncAt)" }
   }
   $n = $b.actions.Count
+  $behind = [int]($b.raw.engineBehind ?? 0)
   $line2 = if ($n -gt 0) {
     # 待办可能来自**对端**（本机图标也会因此变琥珀色）⇒ 必须标出机器名，否则用户会去本机找一个不存在的配置
     $me = [string]$b.raw.machine
@@ -83,6 +89,9 @@ function Get-Tooltip([object]$b) {
         if ($src -and $src -ne $me) { "[$src] $($_.text)" } else { "$($_.text)" }
       }) -join '；'
     "待办 $n：$items"
+  } elseif ($behind -gt 0) {
+    # 引擎落后 ⇒ 说清楚"能更新"，并指出下一步（否则只看到"有提醒"却不知道提醒什么）
+    "引擎可更新（落后 $behind 个提交）→ 双击图标看更新命令"
   } elseif ($b.problems.Count -gt 0) {
     "问题 $($b.problems.Count)：$($b.problems[0])"
   } else {
@@ -147,7 +156,7 @@ function New-SyncIcon([string]$state) {
 function Invoke-Tick {
   # 2026-09-17（P5 后修正）：优先调**引擎的** node tick（跨平台单实现）。
   # 原先只认实例里的 sync/sync-lite.ps1 ⇒ 迁移到引擎后这里会调错东西，全新装机更是直接"找不到"。
-  $nodeTick = Join-Path $engineRoot 'tools/sync-tick.mjs'
+  $nodeTick = Join-Path $engineForRun 'tools/sync-tick.mjs'
   $pwsh = (Get-Process -Id $PID).Path
   if (Test-Path $nodeTick) {
     $node = (Get-Command node -ErrorAction SilentlyContinue).Source
@@ -195,7 +204,7 @@ function Open-Console([string]$hash = '', [switch]$DryRun) {
   Write-Host "  控制台：$url（服务$(if ($alive) { '已在跑' } else { '未在跑，将拉起' })）"
   if ($DryRun) { return }
   if (-not $alive) {
-    $srv = Join-Path $engineRoot 'apps/sync-console/server.mjs'
+    $srv = Join-Path $engineForRun 'apps/sync-console/server.mjs'
     $node = (Get-Command node -ErrorAction SilentlyContinue).Source
     if (-not $node -or -not (Test-Path $srv)) { [System.Windows.Forms.MessageBox]::Show("找不到控制台服务：$srv", '打开控制台') | Out-Null; return }
     Start-Process -FilePath $node -ArgumentList @($srv, '--instance', $instanceRoot, '--port', "$port") -WindowStyle Hidden

@@ -38,11 +38,27 @@ function renderStatus(s) {
     ['待办', String((s.actions || []).length), (s.problems || []).length ? '有 ' + s.problems.length + ' 个 FAIL' : '无 FAIL'],
   ];
   $('#cards').innerHTML = cards.map(([k, val, sub]) => `<div class="card"><div class="k">${k}</div><div class="v">${val}</div><div class="k">${sub}</div></div>`).join('');
+  // 引擎更新提示：落后就在最上面挂一条，命令可以直接抄
+  const behind = Number(s.engineBehind || 0);
+  const banner = $('#updateBanner');
+  if (behind > 0) {
+    banner.className = 'banner';
+    banner.innerHTML =
+      `本机引擎落后 <b>${behind}</b> 个提交（当前 <code>${s.engineRev || '?'}</code>）。更新命令：` +
+      `<code>git -C "${s.engine || ''}" pull</code>` +
+      `<span class="hint">（更新完无需重装；若提示里提到调度/安装器变化，再跑一次 <code>install.mjs --register</code>）</span>`;
+  } else {
+    banner.className = 'banner hidden';
+    banner.textContent = '';
+  }
   $('#checks tbody').innerHTML = (s.checks || []).map((c) =>
     `<tr><td class="lv ${c.level}">${c.level}</td><td>${c.name}</td><td class="hint">期望 ${c.expected}</td><td class="hint">实际 ${c.actual}</td></tr>`).join('');
-  $('#fleet tbody').innerHTML = (s.machines || []).map((m) =>
-    `<tr><td><b>${m.machine}</b></td><td>${m.at}</td><td class="hint">${m.ageMin != null ? m.ageMin + ' 分钟前' : ''}</td><td>rc=${m.rc}</td><td>待办 ${(m.actions || []).length}</td></tr>`).join('')
-    || '<tr><td class="hint">还没有其他机器的状态（首台推送到 sync-state 分支后出现）</td></tr>';
+  $('#fleet tbody').innerHTML = (s.machines || []).map((m) => {
+    const bd = Number(m.engineBehind || 0);
+    const rev = m.engineRev ? `<code>${m.engineRev}</code>` : '<span class="hint">未上报</span>';
+    const tag = bd > 0 ? ` <span class="pill warn">落后 ${bd}</span>` : '';
+    return `<tr><td><b>${m.machine}</b></td><td>${m.at}</td><td class="hint">${m.ageMin != null ? m.ageMin + ' 分钟前' : ''}</td><td>rc=${m.rc}</td><td>${rev}${tag}</td><td>待办 ${(m.actions || []).length}</td></tr>`;
+  }).join('') || '<tr><td class="hint" colspan="6">还没有其他机器的状态（首台推送到 sync-state 分支后出现）</td></tr>';
   $('#actions').innerHTML = (s.actions || []).map((a) => `<li><b>[${a.source}]</b> ${a.text}</li>`).join('') || '<li class="hint">无待办</li>';
 }
 

@@ -28,13 +28,14 @@
 <main>
   <!-- 总览 -->
   <section id="tab-status" class="panel active">
+    <div id="updateBanner" class="banner hidden"></div>
     <div class="cards" id="cards"></div>
     <h3>逐项检查</h3>
     <p class="hint">每一行是一项自动检查：<b>PASS</b> 没问题 · <b>WARN</b> 提醒（不影响同步）· <b>FAIL</b> 要处理。出现 FAIL 时先看「实际」那列写的原因。</p>
     <table id="checks"><tbody></tbody></table>
     <h3>其他机器</h3>
-    <p class="hint">每台机器同步完都会把自己的状态推上来，这里能看出谁掉队了（「几分钟前」太久没动 = 那台机器没在跑）。</p>
-    <table id="fleet"><tbody></tbody></table>
+    <p class="hint">每台机器同步完都会把自己的状态推上来：看「最后同步」判断谁掉队了，「引擎」列看谁还在跑旧版本（落后 = 那台机器该更新了）。</p>
+    <table id="fleet"><thead><tr><th>机器</th><th>最后同步</th><th>距今</th><th>结果</th><th>引擎版本</th><th>待办</th></tr></thead><tbody></tbody></table>
     <h3>需要你做的事</h3>
     <p class="hint">自动同步做不了、必须人工处理的（例如某个程序要重启才能读到新配置）。做完就会消失。</p>
     <ul id="actions" class="actions"></ul>
