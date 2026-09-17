@@ -49,7 +49,8 @@ function Get-Brief {
   # 并把 JSON 破坏成 `Bad JSON escape sequence`。
   # 写 UTF-8 文件再按 UTF-8 读，完全不经过控制台代码页 ⇒ 这类问题根治。
   $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("ai-sync-brief-{0}.json" -f $PID)
-  & node $statusTool --out $tmp --no-fetch --quiet 2>$null | Out-Null
+  $env:AI_SYNC_INSTANCE = $instanceRoot; $env:AI_SYNC_ENGINE = $engineRoot
+  & node $statusTool --instance $instanceRoot --out $tmp --no-fetch --quiet 2>$null | Out-Null
   if (-not (Test-Path $tmp)) { return [pscustomobject]@{ ok = $false; error = "sync-status 未产出 $tmp（退出码 $LASTEXITCODE）" } }
   $json = Get-Content -Raw -Encoding UTF8 $tmp
   Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue

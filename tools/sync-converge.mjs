@@ -154,7 +154,7 @@ for (const p of producers) {
     failures.push(`producer ${p.id} 缺 cmd`);
     continue;
   }
-  const r = spawnSync(cmd[0], cmd.slice(1), { encoding: 'utf8', timeout: PRODUCER_TIMEOUT_MS, windowsHide: true });
+  const r = spawnSync(cmd[0], cmd.slice(1), { encoding: 'utf8', timeout: PRODUCER_TIMEOUT_MS, windowsHide: true, env: { ...process.env, AI_SYNC_INSTANCE: INSTANCE, AI_SYNC_ENGINE: ENGINE } });
   if (r.error || r.status !== 0) {
     // node 不在 PATH / 渲染器崩了 —— 都必须可见（假绿防线）
     const why = r.error ? `${r.error.code || r.error.message}` : `退出码 ${r.status}`;
@@ -352,7 +352,7 @@ for (const [ownerId, list] of byOwner) {
     } else if (!APPLY_COMMANDS) {
       actions.push({ level: 'warn', owner: ownerId, text: `需手动执行重载命令（未加 --apply-commands）：${cmd.join(' ')}`, paths: list.map((c) => c.path) });
     } else {
-      const r = spawnSync(cmd[0], cmd.slice(1), { encoding: 'utf8', timeout: 60000, windowsHide: true });
+      const r = spawnSync(cmd[0], cmd.slice(1), { encoding: 'utf8', timeout: 60000, windowsHide: true, env: { ...process.env, AI_SYNC_INSTANCE: INSTANCE, AI_SYNC_ENGINE: ENGINE } });
       if (r.status !== 0) failures.push(`owner ${ownerId} 重载命令失败（退出码 ${r.status}）：${cmd.join(' ')}`);
       else note(`[OK] ${ownerId} 重载命令已执行`);
     }

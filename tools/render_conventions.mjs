@@ -37,7 +37,9 @@ const SRC = join(AI, 'docs', 'conventions.md');
 /** 展示用路径：本机绝对路径 → `~/...` 形式（指针句里写进 live 文件的是**真实位置**，不是占位符）。 */
 const tilde = (p) => (p.startsWith(HOME) ? '~' + p.slice(HOME.length).replace(/\\/g, '/') : p.replace(/\\/g, '/'));
 const SRC_DISPLAY = `${tilde(SRC)}`;
-const ENGINE_DISPLAY = tilde(join(ENGINE, 'tools', 'render_conventions.mjs'));
+/** 指针句里的"由谁渲染"用**引擎内相对路径**（理由见 render_mcp.mjs 的 ENGINE_DISPLAY 注释：
+ *  绝对路径会让原地布局与拆分布局产出不同文本 ⇒ 两边永远互报 drift）。 */
+const ENGINE_DISPLAY = 'tools/render_conventions.mjs';
 const OC = join(HOME, '.config', 'opencode');
 const DSH_AGENTS = join(HOME, '.dsh', 'AGENTS.md');
 const audit = process.argv.includes('--audit');

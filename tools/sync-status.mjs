@@ -304,7 +304,7 @@ function artifactFacts() {
     // 用同一个 producer 命令，把 --targets-json 换成 --audit
     const auditCmd = cmd.map((x) => (x === '--targets-json' ? '--audit' : x));
     if (auditCmd.length === 0) continue;
-    const r = spawnSync(auditCmd[0], auditCmd.slice(1), { encoding: 'utf8', windowsHide: true, timeout: 30000 });
+    const r = spawnSync(auditCmd[0], auditCmd.slice(1), { encoding: 'utf8', windowsHide: true, timeout: 30000, env: { ...process.env, AI_SYNC_INSTANCE: INSTANCE, AI_SYNC_ENGINE: ENGINE } });
     const last = String(r.stdout || '').trim().split(/\r?\n/).filter(Boolean).pop() || '';
     const drift = /(\d+) target\(s\) drifted/.exec(last);
     out.push({ id: d.id || f, ok: r.status === 0, rc: r.status, drifted: drift ? Number(drift[1]) : null, line: last });

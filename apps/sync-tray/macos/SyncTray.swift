@@ -46,7 +46,7 @@ func loadBrief() -> Brief {
     let tmp = NSTemporaryDirectory() + "ai-sync-brief-\(ProcessInfo.processInfo.processIdentifier).json"
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    p.arguments = ["node", statusTool, "--out", tmp, "--no-fetch", "--quiet"]
+    p.arguments = ["node", statusTool, "--instance", instanceRoot, "--out", tmp, "--no-fetch", "--quiet"]
     p.standardOutput = FileHandle.nullDevice
     p.standardError = FileHandle.nullDevice
     do { try p.run() } catch { b.error = "无法启动 node：\(error.localizedDescription)"; return b }

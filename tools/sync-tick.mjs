@@ -234,7 +234,7 @@ async function main() {
         say(`[DRY] render ${d.id}: ${cmd.join(' ')}`);
         continue;
       }
-      const r = spawnSync(cmd[0], cmd.slice(1), { encoding: 'utf8', windowsHide: true, timeout: 10 * 60 * 1000 });
+      const r = spawnSync(cmd[0], cmd.slice(1), { encoding: 'utf8', windowsHide: true, timeout: 10 * 60 * 1000, env: { ...process.env, AI_SYNC_INSTANCE: INSTANCE, AI_SYNC_ENGINE: ENGINE } });
       const last = String(r.stdout || '').trim().split(/\r?\n/).filter(Boolean).pop() || '';
       if (r.status !== 0) {
         issues.push(`render ${d.id} 退出码 ${r.status}`);

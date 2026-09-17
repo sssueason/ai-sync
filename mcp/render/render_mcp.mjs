@@ -75,11 +75,11 @@ for (const [k, v] of Object.entries(extra)) src[k] = { ...src[k], ...v };
  * 用法：node render_mcp.mjs --detect   # 只打印本机探测值（可粘进 machines/<machine>.json），不渲染
  * ------------------------------------------------------------------------- */
 const AI_SHARED = AI;   // 实例根（原地部署时 = 引擎根；见文件头的引擎/实例说明）
-/** 本渲染器路径的展示形式（写进受管块头部注释）：源码不留个人串，渲染期按本机位置算。 */
-const ENGINE_DISPLAY = (() => {
-  const p = join(ENGINE, 'mcp', 'render', 'render_mcp.mjs');
-  return p.startsWith(HOME) ? '~' + p.slice(HOME.length).replace(/\\/g, '/') : p.replace(/\\/g, '/');
-})();
+/** 写进受管块头部的"由谁生成"。**必须是引擎内的相对路径**（2026-09-17 实测）：
+ *  绝对路径会让渲染结果取决于"这次是哪个副本跑的"——原地布局（<实例根>/mcp/render/…）与
+ *  拆分布局（<引擎根>/mcp/render/…）会各自产出不同文本 ⇒ 两套布局永远互报 drift、来回翻转。
+ *  相对路径两边一致，也顺带不泄露任何本机路径。 */
+const ENGINE_DISPLAY = 'mcp/render/render_mcp.mjs';
 const MACHINE = (() => {
   if (process.env.DSH_MACHINE) return process.env.DSH_MACHINE;
   const lm = join(AI_SHARED, 'sync', 'local.machine');
