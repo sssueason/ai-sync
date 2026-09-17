@@ -286,11 +286,23 @@ async function main() {
 
   /* 5. 日志（格式与既有 tick 一致：一行摘要 + 渲染器末行 + 可选 conv 摘要） */
   const elapsed = Math.round((Date.now() - t0) / 1000);
-  const notes3 = stats.rendered.length ? stats.rendered.join(' | ') : '(未渲染)';
-  let line = `tick ${machine} ${stamp()} pull=${stats.pulled} commit=${stats.committed} push=${stats.pushed} skip=${stats.skipped} elapsed=${elapsed}s rc=${issues.length} | ${notes3}`;
+  // 日志行可读性（2026-09-17 用户反馈"日志可读性太差"）：三个渲染器各吐一句 `render done: 0 target(s) written`
+  // 纯属噪声 ⇒ 全部成功时压缩成一句；**只要有失败就保留原样**（诊断不能被压缩掉）。
+  const notes3 = (() => {
+    const parts = stats.rendered.map((x) => String(x).trim()).filter(Boolean);
+    if (!parts.length) return '(未渲染)';
+    if (parts.some((p) => /FAIL|错误|exit\s*[1-9]|退出码\s*[1-9]/i.test(p))) return parts.join(' | ');
+    const nums = parts.map((p) => /(\d+)\s*target\(s\)\s*(written|drifted)/.exec(p)).map((m) => (m ? Number(m[1]) : null));
+    if (nums.every((n) => n !== null)) {
+      const total = nums.reduce((a, n) => a + n, 0);
+      return total === 0 ? `渲染器 ${parts.length}/${parts.length} OK（无改动）` : `渲染器 ${parts.length}/${parts.length} OK（写入 ${total} 个目标）`;
+    }
+    return parts.join(' | ');
+  })();
+  let line = `tick ${machine} ${stamp()} 拉取=${stats.pulled} 提交=${stats.committed} 推送=${stats.pushed} 让路=${stats.skipped} 耗时=${elapsed}s ${issues.length ? `rc=${issues.length}` : 'rc=0'} | ${notes3}`;
   // 「只读机器」的跳过必须进**日志行**（2026-09-17 实测发现：它原先只打印在 stdout，而 stdout 是瞬时的、日志才是持久证据）
   if (stats.readOnly) line += ' | read-only（本机标记为只读：已本地提交，未推送）';
-  if (stats.convNote) line += ` | conv: ${stats.convNote}`;
+  if (stats.convNote) line += ` | 收敛：${String(stats.convNote).replace(/^converge done: /, '')}`;
   if (!DRY) {
     try {
       const dir = join(INSTANCE, 'sync', 'logs');

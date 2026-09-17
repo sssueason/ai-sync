@@ -16,8 +16,11 @@
 # 设计取舍：刷新只跑 `sync-status.mjs --json --no-fetch`（本地为主，不为了刷新去联网）；
 # 气泡只在**状态跳变**时弹一次（否则每 2 分钟骚扰一次，人会直接关掉通知）。
 param(
-  [ValidateSet('run', 'probe', 'install-autostart', 'uninstall-autostart', 'promote-icon')][string]$Action = 'run',
+  [ValidateSet('run', 'probe', 'install-autostart', 'uninstall-autostart', 'promote-icon', 'open-console')][string]$Action = 'run',
   [switch]$PromoteIcon,
+  [switch]$OpenConsole,
+  [string]$ConsolePage = '',
+  [switch]$DryRun,
   # 常用动作也给开关形式（脚本/测试/文档里更顺手）：-Probe / -InstallAutostart / -UninstallAutostart
   [switch]$Probe,
   [switch]$InstallAutostart,
@@ -30,6 +33,7 @@ if ($Probe) { $Action = 'probe' }
 if ($InstallAutostart) { $Action = 'install-autostart' }
 if ($UninstallAutostart) { $Action = 'uninstall-autostart' }
 if ($PromoteIcon) { $Action = 'promote-icon' }
+if ($OpenConsole) { $Action = 'open-console' }
 $ErrorActionPreference = 'Continue'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -183,6 +187,25 @@ function Set-IconPromoted {
   else { Write-Host '  提示：该设置通常要重启一次 explorer.exe 才在任务栏生效（也可手动把它从隐藏区拖出来）' }
 }
 
+<# 打开控制台（"调度台"）：没在跑就先拉起引擎的控制台服务，然后开浏览器到指定页。
+   端口取 instance.json 的 console.port（默认 7788）；判活用一个 1 秒超时的 HTTP 请求，不阻塞托盘。 #>
+function Open-Console([string]$hash = '', [switch]$DryRun) {
+  $port = 7788
+  try { $port = (Get-Content -Raw -Encoding UTF8 (Join-Path $instanceRoot 'sync/instance.json') | ConvertFrom-Json).console.port ?? 7788 } catch { }
+  $url = "http://127.0.0.1:$port/$hash"
+  $alive = $false
+  try { $null = Invoke-WebRequest -Uri "http://127.0.0.1:$port/api/status" -TimeoutSec 1 -UseBasicParsing; $alive = $true } catch { }
+  Write-Host "  控制台：$url（服务$(if ($alive) { '已在跑' } else { '未在跑，将拉起' })）"
+  if ($DryRun) { return }
+  if (-not $alive) {
+    $srv = Join-Path $engineRoot 'apps/sync-console/server.mjs'
+    $node = (Get-Command node -ErrorAction SilentlyContinue).Source
+    if (-not $node -or -not (Test-Path $srv)) { [System.Windows.Forms.MessageBox]::Show("找不到控制台服务：$srv", '打开控制台') | Out-Null; return }
+    Start-Process -FilePath $node -ArgumentList @($srv, '--instance', $instanceRoot, '--port', "$port") -WindowStyle Hidden
+    Start-Sleep -Seconds 2
+  }
+  Start-Process $url
+}
 function Set-Autostart([bool]$on) {
   $startup = [Environment]::GetFolderPath('Startup')
   $lnk = Join-Path $startup 'ai-sync tray.lnk'
@@ -204,6 +227,7 @@ function Set-Autostart([bool]$on) {
 if ($Action -eq 'install-autostart') { Set-Autostart $true; exit 0 }
 if ($Action -eq 'uninstall-autostart') { Set-Autostart $false; exit 0 }
 if ($Action -eq 'promote-icon') { Set-IconPromoted; exit 0 }
+if ($Action -eq 'open-console') { Open-Console $ConsolePage -DryRun:$DryRun; exit 0 }
 
 if ($Action -eq 'probe') {
   $b = Get-Brief
@@ -227,8 +251,11 @@ $notify = New-Object System.Windows.Forms.NotifyIcon
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
 $miBrief = $menu.Items.Add('简报…')
+$miConsole = $menu.Items.Add('打开控制台（调度台）')
+$miAdapters = $menu.Items.Add('适配器设置…')
 $miSync = $menu.Items.Add('立即同步')
-$miLog = $menu.Items.Add('打开日志')
+$miLogView = $menu.Items.Add('日志（可视）')
+$miLog = $menu.Items.Add('原始日志文件…')
 $miAuto = $menu.Items.Add('随登录自启')
 $miAuto.CheckOnClick = $true
 $miAuto.Checked = Test-Path (Join-Path ([Environment]::GetFolderPath('Startup')) 'ai-sync tray.lnk')
@@ -261,6 +288,9 @@ function Update-Tray([switch]$AllowBalloon) {
 }
 
 $miBrief.add_Click({ Show-Brief (Get-Brief) })
+$miConsole.add_Click({ Open-Console '' })
+$miAdapters.add_Click({ Open-Console '#settings' })
+$miLogView.add_Click({ Open-Console '#logs' })
 $miSync.add_Click({ Invoke-Tick; Start-Sleep -Seconds 8; Update-Tray })
 $miLog.add_Click({
     $f = (Get-ChildItem -Path $logDir -Filter 'tick-*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1).FullName

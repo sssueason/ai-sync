@@ -8,15 +8,22 @@ const api = async (p, opt) => {
   try { return JSON.parse(t); } catch { return { raw: t }; }
 };
 
-// ---------- 标签页 ----------
+// ---------- 标签页（支持 #status / #wizard / #settings / #align / #logs 直达，供托盘菜单唤起） ----------
+function activateTab(name) {
+  const b = document.querySelector(`.tab[data-tab="${name}"]`);
+  if (!b) return;
+  document.querySelectorAll('.tab').forEach((x) => x.classList.toggle('active', x === b));
+  document.querySelectorAll('.panel').forEach((p) => p.classList.toggle('active', p.id === 'tab-' + name));
+  if (name === 'logs') loadLog();
+  if (name === 'settings') loadAdapters();
+}
 for (const b of document.querySelectorAll('.tab')) {
   b.onclick = () => {
-    document.querySelectorAll('.tab').forEach((x) => x.classList.toggle('active', x === b));
-    document.querySelectorAll('.panel').forEach((p) => p.classList.toggle('active', p.id === 'tab-' + b.dataset.tab));
-    if (b.dataset.tab === 'logs') loadLog();
-    if (b.dataset.tab === 'settings') loadAdapters();
+    activateTab(b.dataset.tab);
+    history.replaceState(null, '', '#' + b.dataset.tab);
   };
 }
+window.addEventListener('hashchange', () => activateTab(location.hash.slice(1)));
 
 // ---------- 状态 ----------
 function renderStatus(s) {
@@ -178,11 +185,61 @@ $('#alignPlan').onclick = () => runAlign(false);
 $('#alignApply').onclick = () => { if (confirm('执行对齐会改动本地文件（镜像侧冲突不丢数据，败者会另存侧车）。继续？')) runAlign(true); };
 
 // ---------- 日志 / 立即同步 ----------
+// ---------- 日志（解析成可读表格，而不是倒原文） ----------
+// 理由（2026-09-17 用户反馈"日志可读性太差"）：tick 日志每行是一条紧凑摘要，原文倒出来没人看得下去。
+// 这里把它拆成「时间 / 结果 / 变更 / 备注」四列，并把键值对翻成人话；原文仍可一键展开。
+const KEYMAP = {
+  pull: '拉取', commit: '提交', push: '推送', skip: '让路', elapsed: '耗时',
+};
+function parseTickLine(line) {
+  // 兼容两种写法：老 `pull=1 commit=0 …` 与新 `拉取=1 提交=0 …`（都在同一行的固定位置）
+  const m = /^tick\s+(\S+)\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(.*?)\brc=(-?\d+)\s*\|\s*(.*)$/.exec(line.trim());
+  if (!m) return null;
+  const [, machine, time, body, rc, note] = m;
+  const kv = {};
+  for (const pair of body.trim().split(/\s+/)) {
+    const mm = /^([^\s=]+)=(\S+)$/.exec(pair);
+    if (mm) kv[mm[1]] = mm[2];
+  }
+  const changes = Object.entries(kv)
+    .filter(([k]) => ['pull', 'commit', 'push', 'skip', '拉取', '提交', '推送', '让路'].includes(k))
+    .filter(([, v]) => Number(v) !== 0)
+    .map(([k, v]) => `${KEYMAP[k] || k} ${v}`)
+    .join(' · ') || '无变更';
+  const elapsed = kv.elapsed || kv['耗时'] || '';
+  return { machine, time, rc: Number(rc), changes, elapsed, note: note.trim() };
+}
+
 async function loadLog() {
   const r = await api('/api/logs?name=' + encodeURIComponent($('#logName').value || 'tick'));
-  $('#logOut').textContent = r.tail || '(空)';
+  const lines = (r.tail || '').split(/\r?\n/).filter((x) => x.trim());
+  const rows = [];
+  const plain = [];
+  for (const line of lines) {
+    const p = parseTickLine(line);
+    if (p) rows.push({ ...p, raw: line });
+    else plain.push(line);
+  }
+  const html = [];
+  if (rows.length) {
+    html.push('<table><thead><tr><th>时间</th><th>结果</th><th>变更</th><th>耗时</th><th>备注</th></tr></thead><tbody>');
+    for (const r2 of rows.reverse()) {
+      const lv = r2.rc === 0 ? 'PASS' : 'FAIL';
+      const label = r2.rc === 0 ? '正常' : `rc=${r2.rc} 有问题`;
+      html.push(`<tr><td>${r2.time.slice(5)}</td><td class="lv ${lv}">${label}</td><td>${r2.changes}</td><td class="hint">${r2.elapsed}</td><td class="hint">${r2.note || '—'}</td></tr>`);
+    }
+    html.push('</tbody></table>');
+  }
+  if (plain.length) {
+    html.push('<h3>其它输出</h3><pre class="out">' + plain.slice(-40).join('\n') + '</pre>');
+  }
+  $('#logOut').innerHTML = html.join('') || '(没有日志)';
+  $('#logRaw').textContent = (r.tail || '').trim() || '(空)';
+  if (!$('#logRawToggle').checked) $('#logRaw').classList.add('hidden');
+  else $('#logRaw').classList.remove('hidden');
 }
 $('#loadLog').onclick = loadLog;
+$('#logRawToggle').onchange = loadLog;
 $('#logName').onchange = loadLog;
 $('#btnTick').onclick = async () => {
   $('#btnTick').disabled = true;
@@ -200,4 +257,5 @@ async function loadStatus() { renderStatus(await api('/api/status')); }
 loadInstance();
 loadMachine();   // 向导②：同步空间 + 文件夹范围（可编辑，校验在服务端）
 loadStatus();
+activateTab(location.hash.slice(1) || 'status');   // 托盘菜单可直接唤起某页（#logs / #settings …）
 setInterval(loadStatus, 60000);

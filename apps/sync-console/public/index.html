@@ -89,10 +89,13 @@
   <!-- 日志 -->
   <section id="tab-logs" class="panel">
     <div class="row">
-      <select id="logName"><option value="tick">tick</option><option value="daily">daily</option><option value="converge">converge</option></select>
-      <button id="loadLog" class="ghost">刷新日志</button>
+      <select id="logName"><option value="tick">同步 tick</option><option value="daily">每日重活</option><option value="tick-<machine>">本机 tick 原始</option></select>
+      <button id="loadLog" class="ghost">刷新</button>
+      <label class="chk"><input id="logRawToggle" type="checkbox"> 显示原始行</label>
+      <span class="hint">表格 = 每轮一行摘要（时间/结果/实际发生的变更/耗时/备注）；失败行的备注里有诊断</span>
     </div>
-    <pre id="logOut" class="out"></pre>
+    <div id="logOut"></div>
+    <pre id="logRaw" class="out hidden"></pre>
   </section>
 </main>
 <footer class="hint">ai-sync · 默认只绑 127.0.0.1 · 本页所有动作都通过引擎的 CLI 执行（不额外发明接口）</footer>
