@@ -287,6 +287,48 @@ function scheduleFacts() {
   }
   return { platform: process.platform, task: '(未找到 install/install.mjs)', installed: false, want: cfg.tick.intervalMinutes, inSync: null, mirror: null, detail: '缺安装器' };
 }
+/* ---------------------------------------------------------------- 引擎自身版本（更新提示） */
+
+/** 本机正在跑的引擎落后远端多少 —— 落后就提示更新，并把命令写清楚。
+ *  为什么值得单列：引擎装在各机器的独立 clone 里，只有人手动 `git pull` 才会前进；
+ *  没有这条检查时，"某台机器还在跑两周前的代码"是完全不可见的。 */
+function engineFacts() {
+  const out = { path: ENGINE, rev: null, branch: null, behind: null, remote: null, detail: '' };
+  // 原地布局（引擎就是实例仓）时这条检查没有意义：那个仓的落后已由「仓库 ...」几项覆盖，
+  // 而且 tick 每轮自己会拉 ⇒ 在这里再报一次只会闪出"要及时更新"的假警报（2026-09-17 实测）。
+  if (resolve(ENGINE) === resolve(INSTANCE)) {
+    out.detail = '本机为原地布局（引擎与实例同目录），版本追随由 tick 的仓库拉取负责';
+    return out;
+  }
+  if (!isGitRepo(ENGINE)) {
+    out.detail = '引擎目录不是 git 仓，无法比对远端';
+    return out;
+  }
+  out.branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], ENGINE) || null;
+  out.rev = git(['rev-parse', '--short', 'HEAD'], ENGINE) || null;
+  out.remote = git(['remote', 'get-url', 'origin'], ENGINE) || null;
+  if (!out.branch || out.branch === 'HEAD') {
+    out.detail = '游离 HEAD（不在分支上），无法比对远端';
+    return out;
+  }
+  if (has('--no-fetch')) {
+    out.detail = '本轮 --no-fetch：没有与远端比对';
+    return out;
+  }
+  try {
+    execFileSync('git', ['-C', ENGINE, 'fetch', '-q', 'origin', out.branch], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
+  } catch (e) {
+    out.detail = `fetch 失败，未比对（${String(e.message || e).split('\n')[0]}）`;
+    return out;
+  }
+  // 注意方向：`HEAD..origin/<branch>` 才是"远端有、本地没有"= 落后。
+  // （2026-09-17 故障注入抓到：写成 `origin/<branch>..HEAD` 数的是领先，落后永远算成 0 ⇒ 假绿。）
+  const n = git(['rev-list', '--count', `HEAD..origin/${out.branch}`], ENGINE);
+  out.behind = n === '' ? null : Number(n);
+  out.detail = out.behind === 0 ? `与 origin/${out.branch} 一致` : `落后 origin/${out.branch} ${out.behind} 个提交`;
+  return out;
+}
+
 /* ---------------------------------------------------------------- 渲染产物对账 */
 
 function artifactFacts() {
@@ -382,12 +424,19 @@ if (schedule.mirror) {
   else add('镜像调度与配置一致', 'FAIL', `${m.task} 与 cloudMirror.schedule 一致`, m.installed ? m.detail || '时间/模式不一致' : `${m.task} 不存在`);
 }
 
+// 引擎更新提示：落后 ⇒ WARN（不是 FAIL —— 旧代码照样能跑，但不能装作没这回事）
+const eng = engineFacts();
+if (eng.behind === null) add('引擎代码为最新', 'INFO', '与远端一致', eng.detail || '未检查');
+else if (eng.behind > 0)
+  add('引擎代码为最新', 'WARN', `与 origin/${eng.branch} 一致`, `落后 ${eng.behind} 个提交（当前 ${eng.rev}）—— 更新：git -C "${eng.path}" pull`);
+else add('引擎代码为最新', 'PASS', `与 origin/${eng.branch} 一致`, `0 落后（${eng.rev}）`);
+
 if (conv.statePush && conv.statePush.ok === false) add('跨端状态已推送', 'WARN', '推送成功', conv.statePush.error || '上轮推送失败');
 
 const fleetList = [];
 for (const [id, s] of Object.entries(fleet.machines)) {
   const age = mins(parseStamp(s.at));
-  fleetList.push({ machine: id, at: s.at, ageMin: age, rc: s.tick?.rc ?? null, actions: s.actions || [], intervalMin: s.tick?.intervalMin ?? null });
+  fleetList.push({ machine: id, at: s.at, ageMin: age, rc: s.tick?.rc ?? null, actions: s.actions || [], intervalMin: s.tick?.intervalMin ?? null, engineRev: s.engineRev ?? null, engineBehind: s.engineBehind ?? null });
   if (age !== null && age > statePushMinutes * 2 && id !== machine) {
     add(`远端 ${id} 状态新鲜`, 'WARN', `≤ ${statePushMinutes * 2} 分钟`, `${age} 分钟前`);
   }
@@ -407,6 +456,8 @@ const payload = {
   at: stamp(),
   machine,
   engine: ENGINE,
+  engineRev: eng.rev,
+  engineBehind: eng.behind,
   instance: INSTANCE,
   instanceRepo: isGitRepo(INSTANCE),
   lastSyncAt: tick.lastAt,
@@ -432,6 +483,8 @@ if (WRITE_STATE) {
   const compact = {
     machine,
     engine: ENGINE,
+    engineRev: eng.rev,
+    engineBehind: eng.behind,
     at: payload.at,
     tick: { intervalMin: cfg.tick.intervalMinutes, lastAt: tickAt, rc: Number.isFinite(rc) ? rc : null, elapsedSec: Number.isFinite(elapsed) ? elapsed : null },
     repos: repos.map((r) => ({ id: r.id, ahead: r.ahead, behind: r.behind, dirty: r.dirty })),
