@@ -277,10 +277,15 @@ export function detectMirror(instance, cfg = loadInstance(instance)) {
     const plist = join(homedir(), 'Library', 'LaunchAgents', `${out.task}.plist`);
     out.installed = existsSync(plist);
     out.plist = plist;
-    // 手工挂过的旧 label 也要看见：引擎接管后如果它还留着，会一天跑两趟（且没人知道）
+    /* 手工挂过的旧同步类 LaunchAgent 也要看见：引擎接管后如果它还留着，会一天跑两趟（且没人知道）。
+       ⚠️ 只认**同步类** label，并**排除引擎自己的**（tick / mirror / 托盘）——
+       2026-09-18 实测误报：第一版用 `cn.ai-*` 前缀筛选，把本机合法的 tick label（形如
+       `cn.<实例名>.tick`）与托盘 label 也列成"旧 LaunchAgent，应 bootout"，等于让人去删自己的 tick。 */
+    const known = new Set([out.task, tickLabel(cfg), 'cn.ai-sync.tray']);
     const legacy = readdirSync(join(homedir(), 'Library', 'LaunchAgents'))
-      .filter((f) => f.startsWith('cn.ai-') && f.endsWith('.plist') && f !== `${out.task}.plist`)
-      .map((f) => f.replace(/\.plist$/, ''));
+      .filter((f) => f.endsWith('.plist'))
+      .map((f) => f.replace(/\.plist$/, ''))
+      .filter((l) => !known.has(l) && /sync|mirror|daily|shared/i.test(l));
     if (legacy.length) out.legacy = legacy;
     if (!spec.enabled) {
       out.inSync = !out.installed;
@@ -294,7 +299,7 @@ export function detectMirror(instance, cfg = loadInstance(instance)) {
       out.inSync = same;
       out.detail = same ? '与配置一致' : recorded ? `配置已变（上次装的是 ${JSON.stringify(recorded)}）` : '缺少 mirror-spec.json（多半是手工挂的，应收编）';
     }
-    if (legacy.length) out.detail += `；发现旧 LaunchAgent：${legacy.join('、')}（引擎接管后应 bootout，否则会重复跑）`;
+    if (legacy.length) out.detail += `；发现疑似同步类旧 LaunchAgent：${legacy.join('、')}（核对确认引擎那条已在跑之后再 bootout，否则会重复跑）`;
     return out;
   }
   if (process.platform !== 'win32') {
