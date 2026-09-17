@@ -17,7 +17,7 @@
 import { createServer } from 'node:http';
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, realpathSync } from 'node:fs';
 import { join, dirname, resolve, extname, basename } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { homedir } from 'node:os';
 import { execFile, spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
@@ -33,6 +33,12 @@ const val = (f, d = null) => {
 const INSTANCE = resolve(val('--instance') || process.env.AI_SYNC_INSTANCE || ENGINE);
 const PUBLIC = join(HERE, 'public');
 const cfgFile = join(INSTANCE, 'sync', 'instance.json');
+
+// 校验器：与 sync-doctor **共用一份实现**（规则不再两处漂）。动态 import，兼容两种布局：
+//   原地：<仓根>/apps/sync-console/ → <仓根>/tools/sync-doctor.mjs
+//   拆分：<引擎根>/apps/sync-console/ → <引擎根>/tools/sync-doctor.mjs
+const doctorPath = join(HERE, '..', '..', 'tools', 'sync-doctor.mjs');
+const doctorMod = existsSync(doctorPath) ? await import(pathToFileURL(doctorPath).href) : null;
 
 function loadCfg() {
   try {
@@ -221,43 +227,41 @@ const server = createServer(async (req, res) => {
         }
         const cur = read();
         const mu2in = body.mu2 || {};
-        const errors = [];
-        const dest = expandHome(String(mu2in.dest ?? cur.mu2?.dest ?? ''));
-        if (mu2in.enabled !== false) {
-          if (!dest) errors.push('同步空间根不能为空（或显式 enabled:false 关掉镜像）');
-          else if (!existsSync(dest)) errors.push(`同步空间根不存在：${dest}`);
-          else if (!statSync(dest).isDirectory()) errors.push(`同步空间根不是目录：${dest}`);
-          else if (existsSync(join(dest, '.git'))) errors.push(`同步空间根里有 .git —— 云盘不能托管 git 仓：${dest}`);
+        const candidate = { ...cur };
+        if (mu2in.enabled === false) delete candidate.mu2;
+        else {
+          candidate.mu2 = {
+            ...(cur.mu2 || {}),
+            dest: String(mu2in.dest ?? cur.mu2?.dest ?? ''),
+            autoSeed: mu2in.autoSeed !== false,
+            sets: Array.isArray(mu2in.sets) ? mu2in.sets : cur.mu2?.sets || [],
+          };
         }
-        const sets = Array.isArray(mu2in.sets) ? mu2in.sets : cur.mu2?.sets || [];
-        const seenTarget = new Set();
-        const normSets = [];
-        for (const [i, s] of sets.entries()) {
-          const id = String(s.id || '').trim();
-          const source = expandHome(String(s.source || '').trim());
-          const target = String(s.target || '').trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
-          const at = `第 ${i + 1} 个集合`;
-          if (!/^[a-z0-9._-]+$/i.test(id)) errors.push(`${at}：id 只能含字母数字._-（当前「${id}」）`);
-          if (!source) errors.push(`${at}：source（你的权威目录）不能为空`);
-          else if (!existsSync(source)) errors.push(`${at}：source 不存在：${source}`);
-          else if (!statSync(source).isDirectory()) errors.push(`${at}：source 不是目录：${source}`);
-          if (!target) errors.push(`${at}：target（镜像内子目录）不能为空`);
-          else if (/^([a-zA-Z]:|\/)/.test(target)) errors.push(`${at}：target 必须是**相对**子目录，不能是绝对路径（当前「${target}」）`);
-          else if (target.split('/').includes('..')) errors.push(`${at}：target 不能含 ..（当前「${target}」）`);
-          if (target && seenTarget.has(target.toLowerCase())) errors.push(`${at}：target 与前面的集合重复（${target}）——两个集合写同一处必然冲突`);
-          seenTarget.add(target.toLowerCase());
-          normSets.push({ id, source, target });
+        // **校验只此一份**：与 sync-doctor 共用 validateMachineConfig（2026-09-17 起；先前这里内联了一份会漂）。
+        // 它同时给出**归一化**结果（~ 展开、target 去反斜杠），保存的就是归一化后的那份。
+        if (!doctorMod?.validateMachineConfig) {
+          return sendJson(res, 500, { errors: [`校验器不可用：找不到 tools/sync-doctor.mjs（找过 ${doctorPath || '(无候选)'}）`] });
         }
-        if (errors.length) return sendJson(res, 400, { errors, hint: '校验不过不会落盘（宁可让你重填，也不写半成品配置）' });
+        const v = doctorMod.validateMachineConfig(candidate);
+        if (v.errors.length) {
+          return sendJson(res, 400, { errors: v.errors, warnings: v.warnings, hint: '校验不过不会落盘（宁可让你重填，也不写半成品配置）' });
+        }
         const next = { ...cur };
-        if (mu2in.enabled === false) delete next.mu2;
-        else next.mu2 = { ...(cur.mu2 || {}), dest, autoSeed: mu2in.autoSeed !== false, sets: normSets };
+        if (candidate.mu2) next.mu2 = v.normalized;
+        else delete next.mu2;
         try {
           writeFileSync(mfile, JSON.stringify(next, null, 2) + '\n', 'utf8');
         } catch (e) {
           return sendJson(res, 500, { errors: [`写 ${mfile} 失败：${e.message}`] });
         }
-        return sendJson(res, 200, { ok: true, file: mfile, config: next, dest: dest || null, looksCloudRoot: dest ? /baidu|百度|nutstore|坚果|onedrive|dropbox|icloud|syncdisk|同步空间/i.test(basename(dest)) : false });
+        return sendJson(res, 200, {
+          ok: true,
+          file: mfile,
+          config: next,
+          dest: v.dest,
+          warnings: v.warnings,
+          looksCloudRoot: v.dest ? /baidu|百度|nutstore|坚果|onedrive|dropbox|icloud|syncdisk|同步空间/i.test(basename(v.dest)) : false,
+        });
       }
     }
 
