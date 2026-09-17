@@ -8,8 +8,13 @@
  * 引擎里只有这一个地方知道"平台调度怎么装"，避免三处各写一份（旧实现就是这样漂的）。
  *
  * 装出来的东西：
- *   Windows 计划任务名 = `tick.taskName`（默认 `ai-sync-tick`）→ 动作 = `node <引擎根>/tools/sync-tick.mjs --instance <实例根>`
- *   macOS launchd label = `tick.launchdLabel`（默认 `ai-sync.tick`）→ 同一个动作
+ *   Windows 计划任务名 = `tick.taskName`（默认 `ai-sync-tick`）→ 动作 =
+ *     `wscript <引擎根>\install\run-hidden.vbs <实例根>\sync\state\tick-cmd.txt`
+ *     （命令文件里是 `node <引擎根>/tools/sync-tick.mjs --instance <实例根>`；走 run-hidden.vbs 是为了
+ *      **不冒控制台窗口**，同时把子进程退出码原样交回任务计划 —— 细节见 docs/OPERATIONS.md §8）
+ *   Windows 镜像任务名 = `cloudMirror.taskName`（默认 `ai-sync-mirror`）→ 同一套隐藏执行，按
+ *     `cloudMirror.schedule` 触发；`cloudMirror.enabled=false` 时会被主动卸下
+ *   macOS launchd label = `tick.launchdLabel`（默认 `ai-sync.tick`）→ 同一个 tick 动作
  *
  * 用法：
  *   node install/install.mjs --instance <实例根> [--register] [--unregister] [--interval 5] [--json]

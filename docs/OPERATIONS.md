@@ -112,3 +112,49 @@ node <引擎根>/apps/sync-console/server.mjs --stop
 - **不要在同步空间（云端镜像）里编辑文件**，见 `SYNC-SPACE.md` §3。
 - **不要在两台机器上同时编辑同一份二进制文档**（docx/pptx/pdf）：没有合并语义，只会产生侧车副本。
 - **不要手改 `sync/state/` 下的文件**：那是状态，不是配置。
+
+## 8. 静默运行与可调节拍
+
+两件事要一起看，因为它们互相牵制：**节拍是可调的**，而**每一次自动运行都不许冒窗口**。
+
+### 8.1 可调项（都在 `sync/instance.json`；控制台「设置」页可直接改，保存即生效）
+
+| 想要什么 | 配置键 | 生效方式 |
+|---|---|---|
+| tick 间隔 | `tick.intervalMinutes`（默认 5） | 保存后立即重排平台调度；就算当时没生效，下一轮 tick 开头也会自愈 |
+| 跨端状态推送间隔 | `tick.statePushMinutes`（默认 15） | 同上 |
+| 云盘镜像时刻 | `cloudMirror.schedule.times`（默认 `["22:00"]`，可写多个）/ `{mode:"interval",intervalMinutes:N}` | 保存后立即重排 `ai-sync-mirror` 任务 |
+| 关掉镜像 | `cloudMirror.enabled=false` | 保存时**主动卸下**镜像任务（不留一个不会触发的空任务） |
+
+**适配器（producers/owners）没有各自的节拍**：它们每轮 tick 各跑一次，`tick.intervalMinutes` 就是它们唯一的节拍源。
+（"每个适配器单独定时"是另一个特性，目前不存在 —— 别去 descriptor 里找 `interval`，找不到。）
+
+对账入口：`node tools/sync-schedule.mjs`（只报告）/ `--reconcile`（重排）。`sync-status.mjs` 断言
+「tick 间隔与配置一致」+「镜像调度与配置一致」，不一致即 FAIL。`cloudMirror.schedule` 曾经是**死旋钮**
+（改了没有任何东西消费它 —— 实际跑的是手搓的计划任务），这两条断言就是防它复发。
+
+### 8.2 为什么没有黑框（Windows）
+
+计划任务的动作**不是** `node.exe` / `pwsh.exe`，而是：
+
+```
+wscript.exe "<引擎根>\install\run-hidden.vbs" "<实例根>\sync\state\tick-cmd.txt"
+```
+
+- 交互式身份下直接跑控制台程序会**创建控制台窗口**（每 5 分钟闪一次）。`wscript` 没有控制台，
+  `run-hidden.vbs` 再用 `WshShell.Run(cmd, 0, True)`（SW_HIDE）拉真正的子进程 ⇒ 屏幕上不出现。
+- **退出码保真**：`WScript.Quit <子进程码>` 原样交回任务计划 ⇒「上次运行结果」不是恒 0。
+  恒 0 就是假绿：tick 失败时巡检也看不出来。
+- 命令**写在文件里**而不是任务参数里：任务参数是原始字符串，内嵌引号会被 WSH 的命令行解析合并。
+  命令文件必须是 **UTF-16LE 带 BOM**：按 ANSI 读会把非 ASCII 路径（用户名含中文）变成问号；
+  缺 BOM 会被读成空。写入由 `install.mjs` 的 `writeCmdFile()` 一处负责。
+- `run-hidden.vbs` 必须**保持纯 ASCII**：wscript 按 ANSI 代码页读 `.vbs`，中文注释会被误解码并吞掉换行，
+  把下面的代码整段注释掉（实测退出码 7 → 3，静默失效）。`sync-doctor.mjs` 有断言 + 真跑一次探测。
+
+Windows 仍会给该子进程分配一个**隐藏的** conhost（`可见=False`）。2026-09-17 用 `EnumWindows`
+枚举 `ConsoleWindowClass` 做对照实测：旧写法新窗口 `可见=True`（会闪），新写法 `可见=False`（不闪）。
+
+### 8.3 凭据提示在隐藏窗口下 = 隐形挂死
+
+tick 的 git 调用固定带 `GIT_TERMINAL_PROMPT=0` 与 `GCM_INTERACTIVE=Never`：隐藏窗口里没人看得见
+凭据提示，一旦弹出就是挂到超时为止。宁可快速失败（错误进 stderr / 日志行），也不要隐形等待。

@@ -67,8 +67,8 @@ node <引擎根>/install/install.mjs --instance <实例根> --register --interva
 
 | 平台 | 它会做什么 | 核对 |
 |---|---|---|
-| Windows | 建/更新计划任务 `tick.taskName`（默认 `ai-sync-tick`），动作 = `node <引擎根>/tools/sync-tick.mjs --instance <实例根>` | `Get-ScheduledTaskInfo -TaskName ai-sync-tick \| Select LastRunTime,LastTaskResult`（`0` = 正常） |
-| macOS | 写 `~/Library/LaunchAgents/<tick.launchdLabel>.plist` 并 `launchctl bootstrap` | `launchctl print gui/$(id -u)/ai-sync.tick \| head -20` |
+| Windows | 建/更新计划任务 `tick.taskName`（默认 `ai-sync-tick`），动作 = `wscript "<引擎根>\install\run-hidden.vbs" "<实例根>\sync\state\tick-cmd.txt"`（命令文件里才是 `node <引擎根>/tools/sync-tick.mjs --instance <实例根>`；这样跑**不冒窗口**且退出码照传，见 `OPERATIONS.md` §8）；同时按 `cloudMirror.schedule` 建/更新 `ai-sync-mirror` | `Get-ScheduledTaskInfo -TaskName ai-sync-tick \| Select LastRunTime,LastTaskResult`（`0` = 正常） |
+| macOS | 写 `~/Library/LaunchAgents/<tick.launchdLabel>.plist` 并 `launchctl bootstrap`（镜像调度暂未实现，`--register` 会以 `[--] 镜像调度：…` 明确跳过，不假装成功） | `launchctl print gui/$(id -u)/ai-sync.tick \| head -20` |
 
 **期望**：`[OK] register 成功（ai-sync-tick）`。
 
