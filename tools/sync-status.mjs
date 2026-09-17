@@ -293,26 +293,36 @@ function scheduleFacts() {
  *  为什么值得单列：引擎装在各机器的独立 clone 里，只有人手动 `git pull` 才会前进；
  *  没有这条检查时，"某台机器还在跑两周前的代码"是完全不可见的。 */
 function engineFacts() {
-  const out = { path: ENGINE, rev: null, branch: null, behind: null, remote: null, detail: '' };
-  // 原地布局（引擎就是实例仓）时这条检查没有意义：那个仓的落后已由「仓库 ...」几项覆盖，
-  // 而且 tick 每轮自己会拉 ⇒ 在这里再报一次只会闪出"要及时更新"的假警报（2026-09-17 实测）。
+  const out = { path: ENGINE, rev: null, branch: null, behind: null, remote: null, detail: '', inPlace: false };
+  /* 原地布局（引擎就是实例仓）时，真正决定"该更新谁"的是**已安装的引擎**（计划任务/托盘跑的那份）。
+     2026-09-17 实测的坑：手动跑实例副本时这句检查只能算"不适用" ⇒ 写出的心跳里 engineRev=null，
+     控制台对其他机器的表里本机就一直显示"未上报"。所以这里退回去看 ~/.ai-sync/engine：有就报它的版本，
+     没有才如实说"不适用"。规则与 Windows 托盘的 $engineForRun 完全一致（同一套判据，免得两边漂）。 */
+  let dir = ENGINE;
   if (resolve(ENGINE) === resolve(INSTANCE)) {
-    out.detail = '本机为原地布局（引擎与实例同目录），版本追随由 tick 的仓库拉取负责';
+    const sib = join(homedir(), '.ai-sync', 'engine');
+    if (existsSync(join(sib, 'tools', 'sync-tick.mjs'))) {
+      dir = sib;
+      out.path = sib;
+      out.inPlace = true;
+    } else {
+      out.detail = '本机为原地布局（引擎与实例同目录）且没有独立安装的引擎，版本追随由 tick 的仓库拉取负责';
+      return out;
+    }
+  }
+  if (!isGitRepo(dir)) {
+    out.detail = `引擎目录不是 git 仓（${dir}），无法比对远端`;
     return out;
   }
-  if (!isGitRepo(ENGINE)) {
-    out.detail = '引擎目录不是 git 仓，无法比对远端';
-    return out;
-  }
-  out.branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], ENGINE) || null;
-  out.rev = git(['rev-parse', '--short', 'HEAD'], ENGINE) || null;
-  out.remote = git(['remote', 'get-url', 'origin'], ENGINE) || null;
+  out.branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], dir) || null;
+  out.rev = git(['rev-parse', '--short', 'HEAD'], dir) || null;
+  out.remote = git(['remote', 'get-url', 'origin'], dir) || null;
   if (!out.branch || out.branch === 'HEAD') {
     out.detail = '游离 HEAD（不在分支上），无法比对远端';
     return out;
   }
   const ref = `origin/${out.branch}`;
-  if (git(['rev-parse', '--verify', '--quiet', ref], ENGINE) === '') {
+  if (git(['rev-parse', '--verify', '--quiet', ref], dir) === '') {
     out.detail = `本地还没有 ${ref} 引用（clone 未完成？），无法比对`;
     return out;
   }
@@ -327,7 +337,7 @@ function engineFacts() {
   out.fetched = false;
   if (!has('--no-fetch') && due) {
     try {
-      execFileSync('git', ['-C', ENGINE, 'fetch', '-q', 'origin', out.branch], {
+      execFileSync('git', ['-C', dir, 'fetch', '-q', 'origin', out.branch], {
         encoding: 'utf8',
         windowsHide: true,
         timeout: 60000,
@@ -343,7 +353,7 @@ function engineFacts() {
   }
   // 注意方向：`HEAD..origin/<branch>` 才是"远端有、本地没有"= 落后。
   // （2026-09-17 故障注入抓到：写成 `origin/<branch>..HEAD` 数的是领先，落后永远算成 0 ⇒ 假绿。）
-  const n = git(['rev-list', '--count', `HEAD..${ref}`], ENGINE);
+  const n = git(['rev-list', '--count', `HEAD..${ref}`], dir);
   out.behind = n === '' ? null : Number(n);
   const ageMin = lastFetch ? Math.round((Date.now() - lastFetch) / 60000) : null;
   const howFresh = out.fetched ? '刚刚刷新' : ageMin === null ? '尚未刷新过' : `${ageMin} 分钟前刷新的远端信息`;
@@ -449,10 +459,11 @@ if (schedule.mirror) {
 
 // 引擎更新提示：落后 ⇒ WARN（不是 FAIL —— 旧代码照样能跑，但不能装作没这回事）
 const eng = engineFacts();
-if (eng.behind === null) add('引擎代码与远端一致', 'INFO', '与远端一致', eng.detail || '未检查');
+const inPlaceNote = eng.inPlace ? '（本机为原地布局：这里报的是已安装引擎的版本）' : '';
+if (eng.behind === null) add('引擎代码与远端一致', 'INFO', '与远端一致', (eng.detail || '未检查') + inPlaceNote);
 else if (eng.behind > 0)
-  add('引擎代码与远端一致', 'WARN', `与 origin/${eng.branch} 一致`, `落后 ${eng.behind} 个提交（当前 ${eng.rev}）—— 更新：git -C "${eng.path}" pull`);
-else add('引擎代码与远端一致', 'PASS', `与 origin/${eng.branch} 一致`, `0 落后（${eng.rev}）`);
+  add('引擎代码与远端一致', 'WARN', `与 origin/${eng.branch} 一致`, `落后 ${eng.behind} 个提交（当前 ${eng.rev}）—— 更新：git -C "${eng.path}" pull${inPlaceNote}`);
+else add('引擎代码与远端一致', 'PASS', `与 origin/${eng.branch} 一致`, `0 落后（${eng.rev}）${inPlaceNote}`);
 
 if (conv.statePush && conv.statePush.ok === false) add('跨端状态已推送', 'WARN', '推送成功', conv.statePush.error || '上轮推送失败');
 
