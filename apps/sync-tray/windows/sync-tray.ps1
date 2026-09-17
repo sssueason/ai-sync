@@ -74,7 +74,12 @@ function Get-Tooltip([object]$b) {
   }
   $n = $b.actions.Count
   $line2 = if ($n -gt 0) {
-    $items = ($b.actions | Select-Object -First 3 | ForEach-Object { "$($_.text)" }) -join '；'
+    # 待办可能来自**对端**（本机图标也会因此变琥珀色）⇒ 必须标出机器名，否则用户会去本机找一个不存在的配置
+    $me = [string]$b.raw.machine
+    $items = ($b.actions | Select-Object -First 3 | ForEach-Object {
+        $src = [string]$_.source
+        if ($src -and $src -ne $me) { "[$src] $($_.text)" } else { "$($_.text)" }
+      }) -join '；'
     "待办 $n：$items"
   } elseif ($b.problems.Count -gt 0) {
     "问题 $($b.problems.Count)：$($b.problems[0])"
