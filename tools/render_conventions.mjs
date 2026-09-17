@@ -21,7 +21,7 @@
  *   node render_conventions.mjs            # 渲染写入
  *   node render_conventions.mjs --audit    # 只报告偏差，不写文件
  */
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
@@ -31,7 +31,12 @@ const HOME = homedir();
 // 渲染目标（opencode / dsh 的 live 文件）是**本机**文件。原地部署时两者同目录；引擎独立部署时用
 // $AI_SYNC_ENGINE / $AI_SYNC_INSTANCE 区分。写死某个仓名会让公开引擎在别人机器上找不到东西。
 const ENGINE = process.env.AI_SYNC_ENGINE ? join(process.env.AI_SYNC_ENGINE) : join(dirname(fileURLToPath(import.meta.url)), '..');
-const AI = process.env.AI_SYNC_INSTANCE ? join(process.env.AI_SYNC_INSTANCE) : ENGINE;
+// 2026-09-17（macOS 实测修复，见实例 docs/ai-sync-mac-fixes-20260917.md）：实例根若经 symlink 访问（如 ~/.ai-sync/instance → 实例仓），
+// tilde(SRC) 会把 symlink 路径渲染进 live 文件 → 与真实路径版本互报 drift（还会把 symlink 写进内容）。
+// 统一 realpath 归一：内容里出现的永远是真实位置。
+const AI = process.env.AI_SYNC_INSTANCE
+  ? realpathSync(process.env.AI_SYNC_INSTANCE)
+  : ENGINE;
 const SRC = join(AI, 'docs', 'conventions.md');
 
 /** 展示用路径：本机绝对路径 → `~/...` 形式（指针句里写进 live 文件的是**真实位置**，不是占位符）。 */
@@ -204,4 +209,7 @@ console.log(
     (failures.length ? ` + ${failures.length} FAIL (小节缺失，canonical 无法落到该文件)` : ''),
 );
 // 先写盘再退出：即使有 FAIL，能渲染的部分仍然渲染；非零退出让 tick/CI 看得见
+// --audit 有 drift 也非零（2026-09-17，假绿防线 §3）：否则"有偏差"和"全对"是同一个退出码，
+// 任何按 rc 判定的巡检都会漏掉它。渲染模式不变（渲染模式里 drift 本来就是要写盘的对象）。
 if (failures.length) process.exit(2);
+if (audit && dirty > 0) process.exit(2);

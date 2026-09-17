@@ -21,7 +21,12 @@ import Foundation
 
 let engineRoot = ProcessInfo.processInfo.environment["AI_SYNC_ENGINE"]
     ?? (NSHomeDirectory() as NSString).appendingPathComponent(".ai-sync/engine")
-let instanceRoot = ProcessInfo.processInfo.environment["AI_SYNC_INSTANCE"] ?? engineRoot
+let instanceRoot: String = {
+    if let env = ProcessInfo.processInfo.environment["AI_SYNC_INSTANCE"], !env.isEmpty { return env }
+    let conv = (NSHomeDirectory() as NSString).appendingPathComponent(".ai-sync/instance")
+    if FileManager.default.fileExists(atPath: (conv as NSString).appendingPathComponent("sync/instance.json")) { return conv }
+    return engineRoot
+}()
 let statusTool = (engineRoot as NSString).appendingPathComponent("tools/sync-status.mjs")
 let logDir = (instanceRoot as NSString).appendingPathComponent("sync/logs")
 
@@ -45,8 +50,8 @@ func loadBrief() -> Brief {
     guard FileManager.default.fileExists(atPath: statusTool) else { b.error = "缺 \(statusTool)"; return b }
     let tmp = NSTemporaryDirectory() + "ai-sync-brief-\(ProcessInfo.processInfo.processIdentifier).json"
     let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    p.arguments = ["node", statusTool, "--instance", instanceRoot, "--out", tmp, "--no-fetch", "--quiet"]
+    p.executableURL = URL(fileURLWithPath: "/bin/zsh")   // GUI 启动时 PATH 极小，必须经登录 shell 找 node
+    p.arguments = ["-lc", "node '\(statusTool)' --instance '\(instanceRoot)' --out '\(tmp)' --no-fetch --quiet"]
     p.standardOutput = FileHandle.nullDevice
     p.standardError = FileHandle.nullDevice
     do { try p.run() } catch { b.error = "无法启动 node：\(error.localizedDescription)"; return b }
@@ -193,7 +198,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.messageText = b.ok ? "同步简报 · \(b.state.uppercased())" : "同步状态不可用"
         var lines: [String] = []
         if b.ok {
-            lines.append("最后同步：\(b.lastSyncAt)（\(b.agoMin.map { "\($0) 分钟前" } ?? "刚刚"））  间隔：\(b.interval) 分钟")
+            let ago = b.agoMin.map { "\($0) 分钟前" } ?? "刚刚"
+            lines.append("最后同步：\(b.lastSyncAt)（\(ago)）  间隔：\(b.interval) 分钟")
             lines.append("")
             lines.append(contentsOf: b.checkLines)
             if !b.machines.isEmpty {
@@ -210,10 +216,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func runTick() {
-        let tick = (instanceRoot as NSString).appendingPathComponent("sync/mac/mac-sync.sh")
+        let tick = (engineRoot as NSString).appendingPathComponent("tools/sync-tick.mjs")
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        p.arguments = ["-lc", "\(tick) tick"]
+        p.arguments = ["-lc", "node '\(tick)' --instance '\(instanceRoot)'"]
         try? p.run()
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { self.refresh(balloon: false) }
     }

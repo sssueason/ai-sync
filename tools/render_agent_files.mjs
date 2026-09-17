@@ -25,7 +25,7 @@
  *   node render_agent_files.mjs --audit    # 只报告偏差，不写文件
  *   node render_agent_files.mjs --verbose  # 打印每个目标的动作
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir, hostname } from 'node:os';
@@ -37,7 +37,12 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 原地部署时两者同目录；引擎独立部署时用 $AI_SYNC_ENGINE / $AI_SYNC_INSTANCE 区分。
 // 写死 `<实例根>` 会让公开引擎在别人机器上找不到东西——所以这里一律动态解析。
 const ENGINE = process.env.AI_SYNC_ENGINE ? join(process.env.AI_SYNC_ENGINE) : join(HERE, '..');
-const AI = process.env.AI_SYNC_INSTANCE ? join(process.env.AI_SYNC_INSTANCE) : ENGINE;
+// 2026-09-17（macOS 实测修复，见实例 docs/ai-sync-mac-fixes-20260917.md）：实例根若经 symlink 访问（如 ~/.ai-sync/instance → 实例仓），
+// tilde(SRC) 会把 symlink 路径渲染进 live 文件 → 与真实路径版本互报 drift（还会把 symlink 写进内容）。
+// 统一 realpath 归一：内容里出现的永远是真实位置。
+const AI = process.env.AI_SYNC_INSTANCE
+  ? realpathSync(process.env.AI_SYNC_INSTANCE)
+  : ENGINE;
 const SRC = join(AI, 'agents', 'injection-block.md');
 const BEGIN = '<!-- ai-shared-managed: injection BEGIN -->';
 const END = '<!-- ai-shared-managed: injection END -->';
@@ -168,4 +173,5 @@ for (const t of TARGETS) {
 }
 console.log(`machine=${machine} vault=${vaultPath}`);
 console.log(audit ? `audit done: ${changed} target(s) drifted` : `render done: ${changed} target(s) written`);
-process.exit(0);
+// --audit 有 drift 必须非零（2026-09-17，假绿防线 §3）：否则按 rc 判定的巡检看不见偏差。
+process.exit(audit && changed > 0 ? 2 : 0);

@@ -22,7 +22,7 @@
  * 凭据绝不写入 servers.json，用 --extra 注入。
  */
 
-import { readFileSync, writeFileSync, readdirSync, existsSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, existsSync, unlinkSync, realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir, hostname, platform } from 'node:os';
@@ -34,7 +34,12 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 渲染目标（workbuddy / dsh profile / opencode）是**本机 live 文件**。原地部署时两者同目录；
 // 引擎独立部署时靠 $AI_SYNC_ENGINE / $AI_SYNC_INSTANCE 区分。写死 `<实例根>` 会让别人跑不起来。
 const ENGINE = process.env.AI_SYNC_ENGINE ? join(process.env.AI_SYNC_ENGINE) : join(HERE, '..', '..');
-const AI = process.env.AI_SYNC_INSTANCE ? join(process.env.AI_SYNC_INSTANCE) : ENGINE;
+// 2026-09-17（macOS 实测修复，见实例 docs/ai-sync-mac-fixes-20260917.md）：实例根若经 symlink 访问（如 ~/.ai-sync/instance → 实例仓），
+// tilde(SRC) 会把 symlink 路径渲染进 live 文件 → 与真实路径版本互报 drift（还会把 symlink 写进内容）。
+// 统一 realpath 归一：内容里出现的永远是真实位置。
+const AI = process.env.AI_SYNC_INSTANCE
+  ? realpathSync(process.env.AI_SYNC_INSTANCE)
+  : ENGINE;
 const SRC = join(AI, 'mcp', 'servers.json');
 const WB = join(HOME, '.workbuddy', 'mcp.json');
 const OC = join(HOME, '.config', 'opencode', 'opencode.jsonc');
@@ -368,4 +373,6 @@ for (const r of report) {
   console.log(`[${status}] ${r.name} -> ${r.path}`);
 }
 console.log(audit ? `audit done: ${dirty} target(s) drifted` : `render done: ${dirty} target(s) written`);
-process.exit(0);
+// --audit 有 drift 必须非零（2026-09-17，假绿防线 §3）：否则"有偏差"和"全对"是同一个退出码，
+// 按 rc 判定的巡检会漏掉它（sync-status 解析 drift 数字不受影响）。
+process.exit(audit && dirty > 0 ? 2 : 0);
