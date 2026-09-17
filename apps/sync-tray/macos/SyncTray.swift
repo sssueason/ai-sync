@@ -3,16 +3,20 @@
 // 与 Windows 版（../windows/sync-tray.ps1）**能力面对齐**：
 //   · 图标 = 循环双箭头（NSBezierPath 画的矢量弧线，不依赖 emoji 字体）
 //   · 右下角标 = 状态：绿实心圆=正常 · 黄三角=有警告 · 红方块叉=有失败（形状+颜色双编码）
-//   · 鼠标悬浮 → toolTip 两行：`同步正常 · 21:26（0 分钟前）` + `待办 2：…`
-//   · 菜单：简报… / 立即同步 / 打开日志 / 随登录自启 / 退出
+//   · 鼠标悬浮 → toolTip 两行：`同步正常 · 21:26（0 分钟前）` + 待办/引擎更新/无待办
+//   · 菜单（**与 Windows 同一套，刻意保持短**）：
+//       打开控制台 / 立即同步一次 / 引擎可更新(仅在落后时出现) / — /
+//       随登录自启(勾选) / 状态变化时气泡提醒(勾选，默认关) / — / 退出
+//     简报与日志都是控制台里的页，不再各占一项（Windows 侧 2026-09-17 同样精简）。
 //   · CLI：--probe 打印真实状态与文案后退出（可测性，对应 Windows 的 -Probe）
 //
-// ⚠️ **本文件尚未在 macOS 上编译验证**（作者机器无 Swift 工具链）。
-//    作者只做了静态审阅；**请 macOS 侧跑 `bash build.sh --probe` 后把结果回填**：
-//      · 编译是否通过（swiftc 版本）
-//      · --probe 输出的 state / lastSyncAt / tip 三行
-//      · 菜单栏图标与角标是否与 Windows 版视觉一致
-//    在此之前，本文件的正确性状态是"未验证"，不要当成可用件（conventions §3 假绿防线）。
+// ⚠️ **本文件本轮改动未在 macOS 上编译验证**（作者机器无 Swift 工具链）。
+//    上一轮的 5 处修复是 macOS 侧实测后回填的；**本轮新增部分请同样回填**：
+//      · `bash build.sh --probe` 是否编译通过（swiftc 版本）
+//      · --probe 输出的 state / tip 三行（tip 第二行在引擎落后时应显示「引擎可更新」）
+//      · 菜单是否出现「打开控制台」，点了能否拉起控制台并打开浏览器
+//      · 「状态变化时气泡提醒」勾选状态是否跨重启保留（flag 文件 sync/logs/.tray-balloon）
+//    在此之前，本文件本轮改动的正确性状态是"未验证"，不要当成可用件（conventions §3 假绿防线）。
 //
 // 构建：bash build.sh          （产出 dist/SyncTray.app，ad-hoc 签名）
 //       bash build.sh --install（顺便装到 /Applications）
@@ -29,6 +33,8 @@ let instanceRoot: String = {
 }()
 let statusTool = (engineRoot as NSString).appendingPathComponent("tools/sync-status.mjs")
 let logDir = (instanceRoot as NSString).appendingPathComponent("sync/logs")
+/// 气泡提醒开关：**默认关**（用户 2026-09-17 要求保持静默）。与 Windows 同一套 flag 文件。
+let balloonFlag = (logDir as NSString).appendingPathComponent(".tray-balloon")
 
 struct Brief {
     var ok = false
@@ -41,17 +47,23 @@ struct Brief {
     var problems: [String] = []
     var machines: [(String, String, Int?, Int, Int)] = []   // (id, at, ageMin, rc, todos)
     var checkLines: [String] = []
+    var engineRev: String? = nil
+    var engineBehind: Int? = nil
 }
 
 /// 跑 `node sync-status.mjs --out <tmp>` 再按 UTF-8 读文件。
 /// **不走管道**：这样完全不经过控制台编码（Windows 侧实测过同一类坑），macOS 上也更省心。
-func loadBrief() -> Brief {
+/// `fetch=false` 时加 `--no-fetch`（定时刷新用，避免每 2 分钟打一次网络）；
+/// 用户**打开菜单**时用 `fetch=true` 复核一次 —— 否则"引擎是否落后"在 --no-fetch 下永远是未知。
+func loadBrief(fetch: Bool = false) -> Brief {
     var b = Brief()
     guard FileManager.default.fileExists(atPath: statusTool) else { b.error = "缺 \(statusTool)"; return b }
     let tmp = NSTemporaryDirectory() + "ai-sync-brief-\(ProcessInfo.processInfo.processIdentifier).json"
+    var parts: [String] = ["node", "'\(statusTool)'", "--instance", "'\(instanceRoot)'", "--out", "'\(tmp)'", "--quiet"]
+    if !fetch { parts.append("--no-fetch") }
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/zsh")   // GUI 启动时 PATH 极小，必须经登录 shell 找 node
-    p.arguments = ["-lc", "node '\(statusTool)' --instance '\(instanceRoot)' --out '\(tmp)' --no-fetch --quiet"]
+    p.arguments = ["-lc", parts.joined(separator: " ")]
     p.standardOutput = FileHandle.nullDevice
     p.standardError = FileHandle.nullDevice
     do { try p.run() } catch { b.error = "无法启动 node：\(error.localizedDescription)"; return b }
@@ -67,6 +79,8 @@ func loadBrief() -> Brief {
     b.lastSyncAt = (obj["lastSyncAt"] as? String) ?? "?"
     b.agoMin = obj["lastSyncAgoMin"] as? Int
     b.interval = (obj["intervalMinutes"] as? Int) ?? 5
+    b.engineRev = obj["engineRev"] as? String
+    b.engineBehind = obj["engineBehind"] as? Int
     for a in (obj["actions"] as? [[String: Any]]) ?? [] {
         b.actions.append(((a["source"] as? String) ?? "?", (a["text"] as? String) ?? ""))
     }
@@ -97,6 +111,10 @@ func tooltip(_ b: Brief) -> String {
     if !b.actions.isEmpty {
         let items = b.actions.prefix(3).map { $0.1 }.joined(separator: "；")
         body = "待办 \(b.actions.count)：\(items)"
+    } else if (b.engineBehind ?? 0) > 0 {
+        // 引擎落后 ⇒ 说清楚"能更新"（否则只看到"有提醒"却不知道提醒什么）
+        let n = b.engineBehind ?? 0
+        body = "引擎可更新（落后 \(n) 个提交）→ 菜单里打开控制台看更新命令"
     } else if let first = b.problems.first {
         body = "问题 \(b.problems.count)：\(first)"
     } else {
@@ -154,79 +172,126 @@ func makeIcon(state: String) -> NSImage {
     return img
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var item: NSStatusItem!
     var timer: Timer?
     var lastState = ""
+    var updateItem: NSMenuItem!
+    var autostartItem: NSMenuItem!
+    var balloonItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ note: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         buildMenu()
-        refresh(balloon: false)
-        timer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { _ in self.refresh(balloon: true) }
+        refresh(balloon: false, fetch: true)
+        timer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { _ in self.refresh(balloon: true, fetch: false) }
     }
 
     func buildMenu() {
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "简报…", action: #selector(showBrief), keyEquivalent: "b"))
-        menu.addItem(NSMenuItem(title: "立即同步", action: #selector(runTick), keyEquivalent: "s"))
-        menu.addItem(NSMenuItem(title: "打开日志", action: #selector(openLog), keyEquivalent: "l"))
-        menu.addItem(NSMenuItem(title: "随登录自启", action: #selector(toggleAutostart), keyEquivalent: ""))
+        menu.delegate = self
+        menu.addItem(NSMenuItem(title: "打开控制台", action: #selector(openConsole), keyEquivalent: "o"))
+        menu.addItem(NSMenuItem(title: "立即同步一次", action: #selector(runTick), keyEquivalent: "s"))
+        updateItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        updateItem.isEnabled = false
+        updateItem.isHidden = true
+        menu.addItem(updateItem)
+        menu.addItem(.separator())
+        autostartItem = NSMenuItem(title: "随登录自启", action: #selector(toggleAutostart), keyEquivalent: "")
+        menu.addItem(autostartItem)
+        balloonItem = NSMenuItem(title: "状态变化时气泡提醒", action: #selector(toggleBalloon), keyEquivalent: "")
+        menu.addItem(balloonItem)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         item.menu = menu
+        syncCheckmarks()
     }
 
-    @objc func refresh(balloon: Bool) {
-        let b = loadBrief()
+    /// 打开菜单时**复核一次**（带 fetch）：定时刷新走 --no-fetch 省网络，
+    /// 但"引擎是否落后"必须有网络才看得准 —— 用户看菜单的这一刻是最合适的时机。
+    func menuWillOpen(_ menu: NSMenu) {
+        refresh(balloon: false, fetch: true)
+    }
+
+    func syncCheckmarks() {
+        let plist = (NSHomeDirectory() as NSString).appendingPathComponent("Library/LaunchAgents/cn.ai-sync.tray.plist")
+        autostartItem.state = FileManager.default.fileExists(atPath: plist) ? .on : .off
+        balloonItem.state = FileManager.default.fileExists(atPath: balloonFlag) ? .on : .off
+    }
+
+    @objc func refresh(balloon: Bool, fetch: Bool = false) {
+        let b = loadBrief(fetch: fetch)
         let st = b.ok ? b.state : "fail"
         item.button?.image = makeIcon(state: st)
         item.button?.toolTip = tooltip(b)
-        if balloon && st != "ok" && st != lastState {
-            // 只在**状态跳变**时提示一次（否则每 2 分钟骚扰）
+        // 引擎可更新：只在真落后时出现，并把命令写清楚（与 Windows 版同文案）
+        let behind = b.engineBehind ?? 0
+        if behind > 0 {
+            updateItem.title = "引擎可更新（落后 \(behind) 个提交）"
+            updateItem.isHidden = false
+        } else {
+            updateItem.isHidden = true
+        }
+        let balloonOn = FileManager.default.fileExists(atPath: balloonFlag)
+        if balloon && balloonOn && st != "ok" && st != lastState {
+            // 只在**开关打开**且状态跳变时提示一次（默认关：用户要求静默；否则每 2 分钟骚扰）
             let n = NSUserNotification()
             n.title = "ai-sync 同步"
             n.informativeText = tooltip(b)
             NSUserNotificationCenter.default.deliver(n)
         }
         lastState = st
+        syncCheckmarks()
     }
 
-    @objc func showBrief() {
-        let b = loadBrief()
-        let alert = NSAlert()
-        alert.messageText = b.ok ? "同步简报 · \(b.state.uppercased())" : "同步状态不可用"
-        var lines: [String] = []
-        if b.ok {
-            let ago = b.agoMin.map { "\($0) 分钟前" } ?? "刚刚"
-            lines.append("最后同步：\(b.lastSyncAt)（\(ago)）  间隔：\(b.interval) 分钟")
-            lines.append("")
-            lines.append(contentsOf: b.checkLines)
-            if !b.machines.isEmpty {
-                lines.append(""); lines.append("--- 全队 ---")
-                for m in b.machines { lines.append("\(m.0)  \(m.1)  \(m.2.map { "\($0) 分钟前" } ?? "")  rc=\(m.3)  待办=\(m.4)") }
+    @objc func toggleBalloon() {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: balloonFlag) {
+            try? fm.removeItem(atPath: balloonFlag)
+        } else {
+            try? fm.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+            try? "on".write(toFile: balloonFlag, atomically: true, encoding: .utf8)
+        }
+        syncCheckmarks()
+    }
+
+    /// 打开控制台：没在跑就先拉起（与 Windows 的 Open-Console 同一套语义），再开浏览器。
+    /// 端口取 sync/instance.json 的 console.port（默认 7788）。
+    @objc func openConsole() {
+        let port = consolePort()
+        let alive = shell("/usr/bin/curl", ["-s", "-o", "/dev/null", "-m", "1", "http://127.0.0.1:\(port)/api/status"]) == 0
+        if !alive {
+            let srv = (engineRoot as NSString).appendingPathComponent("apps/sync-console/server.mjs")
+            guard FileManager.default.fileExists(atPath: srv) else {
+                alert("找不到控制台服务：\(srv)")
+                return
             }
-            if !b.actions.isEmpty {
-                lines.append(""); lines.append("--- 待办 ---")
-                for a in b.actions { lines.append("· [\(a.0)] \(a.1)") }
-            }
-        } else { lines.append(b.error) }
-        alert.informativeText = lines.joined(separator: "\n")
-        alert.runModal()
+            // 显式传引擎/实例根：控制台据此判断"引擎是否落后"，不传会退化成"原地布局"而永远报未知
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            p.arguments = ["-lc", "AI_SYNC_ENGINE='\(engineRoot)' AI_SYNC_INSTANCE='\(instanceRoot)' nohup node '\(srv)' --instance '\(instanceRoot)' --port \(port) >/dev/null 2>&1 &"]
+            try? p.run()
+            Thread.sleep(forTimeInterval: 1.5)
+        }
+        if let u = URL(string: "http://127.0.0.1:\(port)/") { NSWorkspace.shared.open(u) }
+    }
+
+    func consolePort() -> Int {
+        let f = (instanceRoot as NSString).appendingPathComponent("sync/instance.json")
+        if let d = FileManager.default.contents(atPath: f),
+           let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+           let c = o["console"] as? [String: Any],
+           let p = c["port"] as? Int { return p }
+        return 7788
     }
 
     @objc func runTick() {
         let tick = (engineRoot as NSString).appendingPathComponent("tools/sync-tick.mjs")
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        p.arguments = ["-lc", "node '\(tick)' --instance '\(instanceRoot)'"]
+        p.arguments = ["-lc", "node '\(tick)' --instance '\(instanceRoot)' --no-jitter"]
         try? p.run()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { self.refresh(balloon: false) }
-    }
-
-    @objc func openLog() {
-        let f = (logDir as NSString).appendingPathComponent("tick-\(Self.dayStamp()).log")
-        NSWorkspace.shared.open(FileManager.default.fileExists(atPath: f) ? URL(fileURLWithPath: f) : URL(fileURLWithPath: logDir))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { self.refresh(balloon: false, fetch: false) }
     }
 
     @objc func toggleAutostart() {
@@ -249,7 +314,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? xml.write(toFile: plist, atomically: true, encoding: .utf8)
             _ = shell("/bin/launchctl", ["bootstrap", "gui/\(getuid())", plist])
         }
-        refresh(balloon: false)
+        syncCheckmarks()
+        refresh(balloon: false, fetch: false)
+    }
+
+    func alert(_ msg: String) {
+        let a = NSAlert()
+        a.messageText = "ai-sync"
+        a.informativeText = msg
+        a.runModal()
     }
 
     static func dayStamp() -> String {
@@ -264,14 +337,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 // CLI：--probe（可测性，对应 Windows 的 -Probe）
 if CommandLine.arguments.contains("--probe") {
-    let b = loadBrief()
+    let b = loadBrief(fetch: true)
     print("state=\(b.ok ? b.state : "fail")  ok=\(b.ok)")
     print("lastSyncAt=\(b.lastSyncAt)  agoMin=\(b.agoMin.map(String.init) ?? "-")  interval=\(b.interval)")
+    print("engineRev=\(b.engineRev ?? "-")  engineBehind=\(b.engineBehind.map(String.init) ?? "-")")
     print("actions=\(b.actions.count)")
     print("tip:")
     for line in tooltip(b).split(separator: "\n") { print("  |\(line)") }
     for st in ["ok", "warn", "fail"] { _ = makeIcon(state: st) }
     print("icons: ok/warn/fail 已生成")
+    let balloonOn = FileManager.default.fileExists(atPath: balloonFlag)
+    print("balloon=\(balloonOn ? "on" : "off（默认静默）")")
+    print("menu: 打开控制台 / 立即同步一次 / 引擎可更新(仅落后时) / — / 随登录自启(勾选) / 状态变化时气泡提醒(勾选，默认关) / — / 退出")
     exit(0)
 }
 
