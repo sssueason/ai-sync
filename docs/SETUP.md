@@ -106,6 +106,15 @@ node <引擎根>/tools/sync-align.mjs --apply  # 确认后执行
 ### A6. 起图标（可选但推荐）
 
 Windows：双击 `apps/sync-tray/windows/sync-tray.vbs`（无窗口常驻）；自启勾菜单里的「随登录自启」。
+
+> ⚠️ **Windows 11 会把新出现的托盘图标默认塞进隐藏区**（「显示隐藏的图标」︿ 后面）——
+> 症状是"进程在跑、状态文件在更新，但任务栏上看不见"。一条命令把它提升为「始终显示」：
+> ```powershell
+> pwsh -File <引擎根>\apps\sync-tray\windows\sync-tray.ps1 -PromoteIcon
+> ```
+> 该设置通常要重启一次 `explorer.exe` 才生效（也可以手动把它从隐藏区拖出来固定）。
+> 等价的手工路径：设置 → 个性化 → 任务栏 → 其他系统托盘图标。
+
 macOS：`bash apps/sync-tray/macos/build.sh --install`，然后打开 `SyncTray.app`。
 
 **期望**：出现 🔄 图标，右下角绿圆；悬浮显示"同步正常 · HH:MM（N 分钟前）"。

@@ -16,7 +16,8 @@
 # 设计取舍：刷新只跑 `sync-status.mjs --json --no-fetch`（本地为主，不为了刷新去联网）；
 # 气泡只在**状态跳变**时弹一次（否则每 2 分钟骚扰一次，人会直接关掉通知）。
 param(
-  [ValidateSet('run', 'probe', 'install-autostart', 'uninstall-autostart')][string]$Action = 'run',
+  [ValidateSet('run', 'probe', 'install-autostart', 'uninstall-autostart', 'promote-icon')][string]$Action = 'run',
+  [switch]$PromoteIcon,
   # 常用动作也给开关形式（脚本/测试/文档里更顺手）：-Probe / -InstallAutostart / -UninstallAutostart
   [switch]$Probe,
   [switch]$InstallAutostart,
@@ -28,6 +29,7 @@ param(
 if ($Probe) { $Action = 'probe' }
 if ($InstallAutostart) { $Action = 'install-autostart' }
 if ($UninstallAutostart) { $Action = 'uninstall-autostart' }
+if ($PromoteIcon) { $Action = 'promote-icon' }
 $ErrorActionPreference = 'Continue'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -142,10 +144,43 @@ function Show-Brief([object]$b) {
 }
 
 function Invoke-Tick {
-  $tick = Join-Path $instanceRoot 'sync/sync-lite.ps1'
-  if (-not (Test-Path $tick)) { [System.Windows.Forms.MessageBox]::Show("找不到 $tick", '立即同步') | Out-Null; return }
+  # 2026-09-17（P5 后修正）：优先调**引擎的** node tick（跨平台单实现）。
+  # 原先只认实例里的 sync/sync-lite.ps1 ⇒ 迁移到引擎后这里会调错东西，全新装机更是直接"找不到"。
+  $nodeTick = Join-Path $engineRoot 'tools/sync-tick.mjs'
   $pwsh = (Get-Process -Id $PID).Path
+  if (Test-Path $nodeTick) {
+    $node = (Get-Command node -ErrorAction SilentlyContinue).Source
+    if (-not $node) { [System.Windows.Forms.MessageBox]::Show('找不到 node（引擎 tick 需要它）', '立即同步') | Out-Null; return }
+    Start-Process -FilePath $node -ArgumentList @($nodeTick, '--instance', $instanceRoot, '--no-jitter') -WindowStyle Hidden
+    return
+  }
+  $tick = Join-Path $instanceRoot 'sync/sync-lite.ps1'
+  if (-not (Test-Path $tick)) { [System.Windows.Forms.MessageBox]::Show("找不到 $nodeTick 也找不到 $tick", '立即同步') | Out-Null; return }
   Start-Process -FilePath $pwsh -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-File', $tick, '-NoJitter') -WindowStyle Hidden
+}
+
+<# Win11 默认把**新出现的**托盘图标放进隐藏区（"显示隐藏的图标" 的 ︿ 后面）⇒
+   症状是"进程在跑、状态文件在更新，但用户看不见图标"（2026-09-17 实测踩到）。
+   本函数把该图标提升为「始终显示」：改的是每用户外观设置，可逆（IsPromoted=0 回默认）。
+   判据：HKCU\Control Panel\NotifyIconSettings\<id> 的 InitialTooltip 含「同步」，
+   或 ExecutablePath 是 pwsh 且 tooltip 为空（首次注册时可能还没记上）。 #>
+function Set-IconPromoted {
+  $base = 'HKCU:\Control Panel\NotifyIconSettings'
+  if (-not (Test-Path $base)) { Write-Host '  [--] 没有该注册表项（Win10 或本机不用此机制）；手动：设置 → 个性化 → 任务栏 → 其他系统托盘图标'; return }
+  $hits = 0
+  foreach ($k in Get-ChildItem $base) {
+    $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
+    $tip = [string]$p.InitialTooltip
+    $exe = [string]$p.ExecutablePath
+    $isOurs = ($tip -like '*同步*') -or ($exe -like '*pwsh*' -and [string]::IsNullOrWhiteSpace($tip))
+    if (-not $isOurs) { continue }
+    if ($p.IsPromoted -eq 1) { Write-Host "  [OK] 已是「始终显示」：$($k.PSChildName)"; $hits++; continue }
+    Set-ItemProperty -Path $k.PSPath -Name IsPromoted -Value 1 -Type DWord
+    Write-Host "  [OK] 已设为「始终显示」：$($k.PSChildName)"
+    $hits++
+  }
+  if ($hits -eq 0) { Write-Host '  [--] 没找到本图标的注册项（先把托盘跑起来一次再执行）' }
+  else { Write-Host '  提示：该设置通常要重启一次 explorer.exe 才在任务栏生效（也可手动把它从隐藏区拖出来）' }
 }
 
 function Set-Autostart([bool]$on) {
@@ -168,6 +203,7 @@ function Set-Autostart([bool]$on) {
 
 if ($Action -eq 'install-autostart') { Set-Autostart $true; exit 0 }
 if ($Action -eq 'uninstall-autostart') { Set-Autostart $false; exit 0 }
+if ($Action -eq 'promote-icon') { Set-IconPromoted; exit 0 }
 
 if ($Action -eq 'probe') {
   $b = Get-Brief
@@ -188,7 +224,6 @@ if ($Action -eq 'probe') {
 # ---------------------------------------------------------------- 常驻托盘
 
 $notify = New-Object System.Windows.Forms.NotifyIcon
-$notify.Visible = $true
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
 $miBrief = $menu.Items.Add('简报…')
@@ -234,7 +269,8 @@ $miLog.add_Click({
 $miAuto.add_Click({ Set-Autostart $miAuto.Checked })
 $miExit.add_Click({ $notify.Visible = $false; [System.Windows.Forms.Application]::Exit() })
 
-Update-Tray
+Update-Tray          # 先设 Icon/Text，再让图标可见：这样 Explorer 记录的 InitialTooltip 才是真 tooltip
+$notify.Visible = $true
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = [Math]::Max(30, $RefreshSeconds) * 1000
 $timer.add_Tick({ Update-Tray -AllowBalloon })

@@ -31,6 +31,9 @@
 待办 2：重启 opencode 生效；重启 WorkBuddy 生效
 ```
 
+> Windows 11 提示：如果任务栏上看不到图标，它多半在「显示隐藏的图标」︿ 里（系统对新图标默认如此）。
+> 一条命令固定到可见区：pwsh -File <引擎根>\apps\sync-tray\windows\sync-tray.ps1 -PromoteIcon（之后重启一次 explorer.exe）。
+
 **右键菜单**：
 
 | 项 | 做什么 |
