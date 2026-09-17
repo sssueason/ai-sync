@@ -45,8 +45,16 @@
         <div id="mirrorCheck" class="check-line"></div>
         <div id="browser" class="browser hidden"></div>
       </li>
-      <li><b>② 各端参与 &amp; 文件夹范围</b>
-        <p class="hint">这两项由**数据**决定，不是本页的自由开关：参与端 = 已 <code>enroll</code> 的机器（列表见「状态」页的全队表）；文件夹范围 = 各机 <code>machines/&lt;machine&gt;.json</code> 里声明的 <code>mu2.sets</code>（属主可写、他人只读）。可视化编辑随 P4 的 enroll 流程一起落地 —— 在此之前请**不要**期待这里能点选（本页不提供假开关）。</p>
+      <li><b>② 同步空间 &amp; 文件夹范围</b>
+        <p class="hint">镜像（µ2）是**可选**的：留空/关掉就是纯 git 同步。填空时请选网盘客户端配的那个**同步文件夹根**（不是子目录）。
+          **属主模型**：每个 <code>source</code> 只由一台机器写；两个集合写同一个 <code>target</code> 必然冲突（会被拦下）。</p>
+        <div class="row"><label class="chk"><input id="mu2Enabled" type="checkbox"> 启用云盘镜像</label>
+          <label>同步空间根<input id="mu2Dest" placeholder="例如 ~/BaiduSyncdisk" size="42"></label>
+          <button id="browseDest" class="ghost">浏览…</button></div>
+        <div id="destCheck" class="check-line"></div>
+        <table id="setsTable"><thead><tr><th>id</th><th>source（你的权威目录，机器本地可写）</th><th>target（镜像内子目录）</th><th>预估</th><th></th></tr></thead><tbody></tbody></table>
+        <div class="row"><button id="addSet" class="ghost">+ 加一个集合</button><button id="saveMachine">保存机器配置</button><span id="machineMsg" class="hint"></span></div>
+        <div id="browseTargetHint" class="hint">（「浏览…」会填到最近点选的那个输入框：同步空间根，或某个集合的 source）</div>
       </li>
       <li><b>③ 节拍与自启</b>
         <div class="row"><label>tick 间隔（分钟）<input id="interval" type="number" min="1" max="120"></label>

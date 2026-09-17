@@ -84,6 +84,71 @@ $('#saveCfg').onclick = async () => {
   loadInstance();
 };
 
+// ---------- 向导②：同步空间 + 文件夹范围（真正可编辑） ----------
+// 设计：编辑的是 <实例根>/sync/machines/<机器>.json 的 mu2 段；**校验在服务端做**（不通过不落盘），
+// 前端只负责把错误原样显示出来 —— 绝不在前端"猜"能不能写。
+let machineCfg = null;
+let browseTarget = 'dest'; // 'dest' | { rowIndex }
+const $setRows = () => Array.from(document.querySelectorAll('#setsTable tbody tr'));
+
+async function loadMachine() {
+  const r = await api('/api/machine');
+  machineCfg = r;
+  const mu2 = r.config?.mu2 || {};
+  $('#mu2Enabled').checked = !!mu2.dest;
+  $('#mu2Dest').value = mu2.dest || '';
+  const tb = document.querySelector('#setsTable tbody');
+  tb.innerHTML = '';
+  for (const s of mu2.sets || []) addSetRow(s);
+  if (!(mu2.sets || []).length) addSetRow({});
+  return r;
+}
+
+function addSetRow(s = {}) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `
+    <td><input class="setId" size="10" value="${s.id || ''}" placeholder="docs"></td>
+    <td><input class="setSrc" size="46" value="${s.source || ''}" placeholder="~/Documents/papers">
+        <button class="ghost browseSrc" type="button">浏览…</button></td>
+    <td><input class="setTgt" size="16" value="${s.target || ''}" placeholder="papers"></td>
+    <td class="est hint">—</td>
+    <td><button class="ghost estBtn" type="button">预估</button> <button class="ghost delBtn" type="button">删</button></td>`;
+  document.querySelector('#setsTable tbody').appendChild(tr);
+  tr.querySelector('.browseSrc').onclick = () => {
+    browseTarget = tr;
+    browse(tr.querySelector('.setSrc').value || '~');
+  };
+  tr.querySelector('.delBtn').onclick = () => tr.remove();
+  tr.querySelector('.estBtn').onclick = async () => {
+    const p = tr.querySelector('.setSrc').value;
+    const cell = tr.querySelector('.est');
+    cell.textContent = '统计中…';
+    const e = await api('/api/sets/estimate?path=' + encodeURIComponent(p));
+    cell.textContent = e.ok ? `${e.files} 个文件 / ${e.mb} MB${e.truncated ? '（到上限，实际更多）' : ''}` : (e.error || '失败');
+  };
+}
+
+$('#addSet').onclick = () => addSetRow({});
+$('#browseDest').onclick = () => {
+  browseTarget = 'dest';
+  browse($('#mu2Dest').value || '~');
+};
+
+$('#saveMachine').onclick = async () => {
+  const sets = $setRows()
+    .map((tr) => ({ id: tr.querySelector('.setId').value.trim(), source: tr.querySelector('.setSrc').value.trim(), target: tr.querySelector('.setTgt').value.trim() }))
+    .filter((s) => s.id || s.source || s.target);
+  const body = { mu2: { enabled: $('#mu2Enabled').checked, dest: $('#mu2Dest').value.trim(), sets } };
+  $('#machineMsg').textContent = '保存中…';
+  const r = await api('/api/machine', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  if (r.errors) {
+    $('#machineMsg').innerHTML = '<span class="fail-t">未保存（校验不过）：</span><br>' + r.errors.map((x) => '· ' + x).join('<br>');
+  } else {
+    $('#machineMsg').innerHTML = `<span class="ok-t">已保存 ${r.file}${r.looksCloudRoot === false ? '（注意：目录名不像常见网盘同步根，确认它真是客户端的同步文件夹）' : ''}</span>`;
+    loadMachine();
+  }
+};
+
 // ---------- 适配器 ----------
 async function loadAdapters() {
   const r = await api('/api/adapters');
@@ -133,5 +198,6 @@ $('#btnTick').onclick = async () => {
 // ---------- 启动 ----------
 async function loadStatus() { renderStatus(await api('/api/status')); }
 loadInstance();
+loadMachine();   // 向导②：同步空间 + 文件夹范围（可编辑，校验在服务端）
 loadStatus();
 setInterval(loadStatus, 60000);

@@ -194,6 +194,114 @@ const server = createServer(async (req, res) => {
       return sendJson(res, 200, await listDirs(url.searchParams.get('path') || homedir()));
     }
 
+    /* ---------------- 机器配置（同步空间 + 文件夹范围）----------------
+     * 这是"部署后可以选本地同步空间 / 选同步文件夹范围"的落地点：直接编辑
+     * <实例根>/sync/machines/<机器>.json 的 mu2 段，**写前逐项校验、校验不过不落盘**（避免半成品配置）。 */
+    if (p === '/api/machine') {
+      const mid =
+        process.env.AI_SYNC_MACHINE ||
+        process.env.DSH_MACHINE ||
+        (existsSync(join(INSTANCE, 'sync', 'local.machine')) ? readFileSync(join(INSTANCE, 'sync', 'local.machine'), 'utf8').trim() : hostname().toLowerCase());
+      const mfile = join(INSTANCE, 'sync', 'machines', `${mid}.json`);
+      const read = () => {
+        try {
+          return JSON.parse(readFileSync(mfile, 'utf8'));
+        } catch {
+          return {};
+        }
+      };
+      if (req.method === 'GET') return sendJson(res, 200, { machine: mid, file: mfile, config: read() });
+
+      if (req.method === 'POST') {
+        let body;
+        try {
+          body = JSON.parse((await readBody(req)) || '{}');
+        } catch (e) {
+          return sendJson(res, 400, { errors: [`请求体不是 JSON：${e.message}`] });
+        }
+        const cur = read();
+        const mu2in = body.mu2 || {};
+        const errors = [];
+        const dest = expandHome(String(mu2in.dest ?? cur.mu2?.dest ?? ''));
+        if (mu2in.enabled !== false) {
+          if (!dest) errors.push('同步空间根不能为空（或显式 enabled:false 关掉镜像）');
+          else if (!existsSync(dest)) errors.push(`同步空间根不存在：${dest}`);
+          else if (!statSync(dest).isDirectory()) errors.push(`同步空间根不是目录：${dest}`);
+          else if (existsSync(join(dest, '.git'))) errors.push(`同步空间根里有 .git —— 云盘不能托管 git 仓：${dest}`);
+        }
+        const sets = Array.isArray(mu2in.sets) ? mu2in.sets : cur.mu2?.sets || [];
+        const seenTarget = new Set();
+        const normSets = [];
+        for (const [i, s] of sets.entries()) {
+          const id = String(s.id || '').trim();
+          const source = expandHome(String(s.source || '').trim());
+          const target = String(s.target || '').trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+          const at = `第 ${i + 1} 个集合`;
+          if (!/^[a-z0-9._-]+$/i.test(id)) errors.push(`${at}：id 只能含字母数字._-（当前「${id}」）`);
+          if (!source) errors.push(`${at}：source（你的权威目录）不能为空`);
+          else if (!existsSync(source)) errors.push(`${at}：source 不存在：${source}`);
+          else if (!statSync(source).isDirectory()) errors.push(`${at}：source 不是目录：${source}`);
+          if (!target) errors.push(`${at}：target（镜像内子目录）不能为空`);
+          else if (/^([a-zA-Z]:|\/)/.test(target)) errors.push(`${at}：target 必须是**相对**子目录，不能是绝对路径（当前「${target}」）`);
+          else if (target.split('/').includes('..')) errors.push(`${at}：target 不能含 ..（当前「${target}」）`);
+          if (target && seenTarget.has(target.toLowerCase())) errors.push(`${at}：target 与前面的集合重复（${target}）——两个集合写同一处必然冲突`);
+          seenTarget.add(target.toLowerCase());
+          normSets.push({ id, source, target });
+        }
+        if (errors.length) return sendJson(res, 400, { errors, hint: '校验不过不会落盘（宁可让你重填，也不写半成品配置）' });
+        const next = { ...cur };
+        if (mu2in.enabled === false) delete next.mu2;
+        else next.mu2 = { ...(cur.mu2 || {}), dest, autoSeed: mu2in.autoSeed !== false, sets: normSets };
+        try {
+          writeFileSync(mfile, JSON.stringify(next, null, 2) + '\n', 'utf8');
+        } catch (e) {
+          return sendJson(res, 500, { errors: [`写 ${mfile} 失败：${e.message}`] });
+        }
+        return sendJson(res, 200, { ok: true, file: mfile, config: next, dest: dest || null, looksCloudRoot: dest ? /baidu|百度|nutstore|坚果|onedrive|dropbox|icloud|syncdisk|同步空间/i.test(basename(dest)) : false });
+      }
+    }
+
+    // 范围预估：给"我到底要镜像多少东西"一个数（有上限，避免在大树上卡住）
+    if (p === '/api/sets/estimate') {
+      const src = expandHome(url.searchParams.get('path') || '');
+      if (!src || !existsSync(src) || !statSync(src).isDirectory()) return sendJson(res, 200, { ok: false, error: '目录不存在或不是目录' });
+      const cap = Number(url.searchParams.get('limit') || 30000);
+      let files = 0;
+      let bytes = 0;
+      let truncated = false;
+      const JUNK = /^(~\$|\.~lock\.|Thumbs\.db$|\.DS_Store$|desktop\.ini$)|\.(baiduyun)\./i;
+      const stack = [src];
+      const t0 = Date.now();
+      while (stack.length) {
+        const d = stack.pop();
+        let ents = [];
+        try {
+          ents = readdirSync(d, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        for (const e of ents) {
+          const full = join(d, e.name);
+          if (e.isDirectory()) {
+            if (e.name === '.git' || e.name === 'node_modules') continue;
+            stack.push(full);
+          } else if (e.isFile()) {
+            if (JUNK.test(e.name)) continue;
+            files++;
+            try {
+              bytes += statSync(full).size;
+            } catch {}
+          }
+          if (files > cap || Date.now() - t0 > 15000) {
+            truncated = true;
+            break;
+          }
+        }
+        if (truncated) break;
+      }
+      return sendJson(res, 200, { ok: true, path: src, files, bytes, mb: Math.round((bytes / 1048576) * 10) / 10, truncated, cap });
+    }
+
     if (p === '/api/align') {
       const apply = url.searchParams.get('apply') === '1';
       const r = await node('sync-align.mjs', apply ? ['--apply'] : []);
