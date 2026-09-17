@@ -409,7 +409,9 @@ if ($Action -eq 'probe') {
   Write-Output ("actions={0}" -f $b.actions.Count)
   Write-Output "tip:"
   Get-Tooltip $b | ForEach-Object { "  |$_" }
-  Write-Output "menu: 打开控制台 / 立即同步一次 / 检查并更新引擎（落后时显示落后几提交）/ — / 随登录自启(勾选) / 状态变化时气泡提醒(勾选，默认关) / — / 退出（双击图标 = 打开控制台）"
+  $miTxt = if ($miUpdate) { $miUpdate.Text } else { '(未构建)' }
+    Write-Output ("menuUpdate={0}" -f $miTxt)
+    Write-Output "menu: 打开控制台 / 立即同步一次 / 检查并更新引擎（落后时显示落后几提交）/ — / 随登录自启(勾选) / 状态变化时气泡提醒(勾选，默认关) / — / 退出（双击图标 = 打开控制台）"
   foreach ($st in @('ok', 'warn', 'fail')) {
     $i = New-SyncIcon $st
     Write-Output ("icon[{0}] = {1}x{2} ({3} bytes)" -f $st, $i.Width, $i.Height, ($i.ToBitmap().GetPixel(26, 26).ToArgb()))
