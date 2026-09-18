@@ -346,6 +346,30 @@ async function main() {
     }
   }
 
+  /* 5c. 一次性迁移（引擎 tools/sync-migrate.mjs）：只跑 danger=safe 的；manual-only 只登记待人工。
+     与卫生门禁同理 —— **不改 tick 的 rc**：迁移失败是"某台机器没跟上"，不是"这轮同步没跑成"；
+     它由 sync-status 的「迁移」断言暴露（失败 ⇒ FAIL，待人工 ⇒ WARN）。 */
+  let migrate = null;
+  if (!DRY) {
+    const migTool = join(ENGINE, 'tools', 'sync-migrate.mjs');
+    if (existsSync(migTool)) {
+      const r = spawnSync(process.execPath, [migTool, '--instance', INSTANCE, '--json'],
+        { encoding: 'utf8', windowsHide: true, timeout: 300 * 1000, maxBuffer: 32 * 1024 * 1024 });
+      try {
+        const j = JSON.parse(String(r.stdout || '').trim());
+        migrate = {
+          applied: (j.applied || []).length,
+          ok: (j.skipped || []).length,
+          failed: (j.failed || []).length + (j.mismatched || []).length,
+          manual: (j.pendingManual || []).length,
+          ids: (j.applied || []).map((x) => x.id),
+        };
+      } catch { migrate = { broken: true }; }   // 运行器在但拿不到结果 ⇒ 留痕，不当成"没有迁移"
+    } else {
+      migrate = { missing: true };
+    }
+  }
+
   /* 6. 日志（格式与既有 tick 一致：一行摘要 + 渲染器末行 + 可选 conv 摘要） */
   const elapsed = Math.round((Date.now() - t0) / 1000);
   // 日志行可读性（2026-09-17 用户反馈"日志可读性太差"）：三个渲染器各吐一句 `render done: 0 target(s) written`
@@ -380,6 +404,11 @@ async function main() {
   else if (hygiene?.missing) line += ' | 卫生：缺少 tools/sync-hygiene.mjs（本轮未检查）';
   else if (hygiene && hygiene.fails) line += ` | 卫生：FAIL=${hygiene.fails} WARN=${hygiene.warns}（明细见 sync/state/hygiene-${machine}.json）`;
   else if (hygiene) line += ` | 卫生：通过${hygiene.warns ? `（WARN=${hygiene.warns}）` : ''}`;
+  // 迁移同理：跑了什么、有没有待人工，都要在持久日志里留痕
+  if (migrate?.broken) line += ' | 迁移：运行器未返回结果（本轮未检查）';
+  else if (migrate?.missing) line += ' | 迁移：缺少 tools/sync-migrate.mjs（本轮未检查）';
+  else if (migrate && migrate.applied) line += ` | 迁移：应用 ${migrate.applied} 条（${migrate.ids.join(', ')}）${migrate.manual ? `待人工 ${migrate.manual}` : ''}${migrate.failed ? ` FAIL=${migrate.failed}` : ''}`;
+  else if (migrate) line += ` | 迁移：无需应用${migrate.failed ? ` FAIL=${migrate.failed}` : ''}${migrate.manual ? `（待人工 ${migrate.manual}）` : ''}`;
   if (!DRY) {
     try {
       const dir = join(INSTANCE, 'sync', 'logs');

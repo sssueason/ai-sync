@@ -513,6 +513,28 @@ if (schedule.mirror) {
     } else add('文本卫生门禁', 'PASS', 'FAIL=0', `WARN=${h.warns}（${h.at}）`);
   }
 }
+/* 一次性迁移（2026-09-18）：tick 每轮跑引擎的 tools/sync-migrate.mjs（只跑 danger=safe 的），
+   结果落 sync/state/migrations-<machine>.json。这里分级：
+   有 safe 迁移失败/熔断 ⇒ FAIL（这台机器没跟上，且已经连续失败，需要人看）；
+   只有 manual-only 待人工 ⇒ WARN（脚本按纪律不代劳，但要让你看得见）；
+   状态文件都没有 ⇒ WARN（还没跑过）；全绿 ⇒ PASS。 */
+{
+  const f = join(INSTANCE, 'sync', 'state', `migrations-${machine}.json`);
+  if (!existsSync(f)) add('一次性迁移', 'WARN', '有 migrations-<machine>.json', '还没跑过（下一轮 tick 生成）');
+  else {
+    let m = null;
+    try { m = JSON.parse(readFileSync(f, 'utf8')); } catch { m = null; }
+    if (!m) add('一次性迁移', 'FAIL', '可解析状态文件', `解析失败：${f}`);
+    else {
+      const applied = Object.entries(m.applied || {}).filter(([, v]) => v && v.ok).map(([k]) => k);
+      const blocked = Object.entries(m.blocked || {});
+      const manual = (m.pendingManual || []).filter((p) => !p.done);
+      if (blocked.length) add('一次性迁移', 'FAIL', '无失败/熔断', `${blocked.length} 条熔断：${blocked.map(([k, v]) => `${k}(×${v.tries})`).join(' | ')}`);
+      else if (manual.length) add('一次性迁移', 'WARN', '待人工 0 条', `${manual.length} 条待人工：${manual.map((p) => p.id).join(' | ')}（命令见 sync/migrations/README.md）`);
+      else add('一次性迁移', 'PASS', '无待人工', `已生效 ${applied.length} 条（${m.at || ''}）`);
+    }
+  }
+}
 // 引擎更新提示：落后 ⇒ WARN（不是 FAIL —— 旧代码照样能跑，但不能装作没这回事）
 const eng = engineFacts();
 const inPlaceNote = eng.inPlace ? '（本机为原地布局：这里报的是已安装引擎的版本）' : '';
