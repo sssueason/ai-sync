@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "note": "幂等应用规格：把'拉下来的新版本'变成'真的生效'。**只放 tick 不做、且有可靠判据（verify）的动作** —— tick 已经在做 pull/渲染/裁剪/卫生/迁移，重复登记等于造第二套机制。执行器 = 引擎 tools/sync-apply.mjs；状态落 sync/state/apply-<machine>.json（机器本地）。占位符：{engine} {instance} {node}。",
+  "units": [
+    {
+      "id": "schedule",
+      "platforms": ["win32", "darwin", "linux"],
+      "when": { "files": ["sync/instance.json"] },
+      "verify": { "kind": "cmd", "argv": ["{node}", "{engine}/install/install.mjs", "--instance", "{instance}"], "okExit": [0] },
+      "run": { "argv": ["{node}", "{engine}/install/install.mjs", "--instance", "{instance}", "--register"] },
+      "timeoutSec": 240,
+      "reason": "调度（tick 间隔 / 镜像时刻）与 instance.json 不一致时重注册。判据现成：install.mjs 的 report 模式在'未安装或间隔不一致'时返回非零（--register 本身幂等）"
+    },
+    {
+      "id": "tray-macos",
+      "platforms": ["darwin"],
+      "when": { "files": ["apps/sync-tray/macos/SyncTray.swift", "apps/sync-tray/macos/build.sh"] },
+      "verify": {
+        "kind": "artifact-newer",
+        "artifact": "apps/sync-tray/macos/dist/SyncTray.app/Contents/MacOS/SyncTray",
+        "sources": ["apps/sync-tray/macos/SyncTray.swift", "apps/sync-tray/macos/build.sh"]
+      },
+      "run": { "argv": ["bash", "{instance}/apps/sync-tray/macos/build.sh"] },
+      "timeoutSec": 300,
+      "reason": "托盘源码变了才重编（产物比源码旧才算未生效）。Windows 侧托盘是解释执行的 .ps1 ⇒ 无需构建，故不设 unit"
+    }
+  ],
+  "_deferred": [
+    {
+      "id": "dsh-launcher",
+      "why": "dsh/app/apply-app.ps1 幂等（内容相同则不动），但它没有可靠的'是否已一致'判据（-DryRun 的退出码不区分'无变化'与'有变化'）⇒ 按本项目纪律：**没有可靠 verify 的动作不进 apply**。要纳入先给它加一个 check 原语（例如 --check 在'已一致'时返回 0、'需更新'时返回 2）。"
+    },
+    {
+      "id": "render / prune",
+      "why": "tick 每轮已经在做（三个渲染器 + sync-prune.mjs）⇒ 登记为 apply unit 只会变成第二套机制。"
+    }
+  ]
+}
