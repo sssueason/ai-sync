@@ -10,7 +10,9 @@
  * 检查项：
  *   1. instance.json 能否解析 + tick/console 取值范围
  *   2. machines/<机器>.json：存在、可解析、mu1 的路径真的存在且是 git 仓
- *   3. mu2（云盘镜像，可选）：根存在/是目录/不含 .git；每个集合 id/source/target 合法、target 唯一
+ *   3. mu2（云盘镜像，可选）：根存在/是目录/不含 .git；每个集合 id/source/target 合法、target 唯一、
+ *      **过滤字段齐备**（没有任何过滤字段 = 整树镜像；源是 Documents/Desktop/Downloads 这类宽目录
+ *      必须声明 onlySubdirs 或 includeExt——2026-09-18 的 16.7 万文件误镜像事故即由此而来）
  *   4. 适配器：producers/owners 的 JSON 可解析；instance.json 里启用的 id 真的存在
  *   5. 仓库卫生：跟踪集里**不该有** node_modules / *.db / *.pem / *.key / 原始数据扩展名 / .DS_Store / sync/state 下的机器本地点文件
  *   6. 调度：平台任务是否装了、间隔与配置是否一致（复用 install.mjs 的 detectSchedule）
@@ -84,6 +86,27 @@ export function validateMachineConfig(machineCfg, { requirePaths = true } = {}) 
     else if (target.split('/').includes('..')) errors.push(`${at}: target 不能含 ..（当前「${target}」）`);
     if (target && seen.has(target.toLowerCase())) errors.push(`${at}: target 与前面的集合重复（${target}）——两个集合写同一处必然冲突`);
     seen.add(target.toLowerCase());
+    /* ---------------------------------------------------------------- 过滤字段必须齐备（2026-09-18 实测事故）
+     * 事故形态：某台机器的 8 个集合被一次编辑**抹掉全部过滤字段**（excludeExt / excludeDirNames /
+     * onlySubdirs / onlyFiles / includeExt），退化成"整棵树全镜像" ⇒ tree-sync 报"待推 167,731"，
+     * 手动 seed 把 16.7 万文件（含 12,387 个 node_modules、470 个 .git、大量 .tif/.zip 原始数据）
+     * 推进了云盘同步空间。下面两条规则让这种回归在**写前校验**与**巡检**当场变红。
+     * 注意：同一个 target 被**不同机器**的集合共用是设计（union mirror，9 个目标名都是多机共用），
+     * 所以这里只查"一台机器内重复"，不查跨机重复。 */
+    const FILTER_KEYS = ['onlySubdirs', 'onlyFiles', 'includeExt', 'excludeExt', 'excludeDirNames'];
+    const hasFilter = FILTER_KEYS.some((k) => (Array.isArray(s[k]) ? s[k].length > 0 : Boolean(s[k])));
+    if (!hasFilter) {
+      errors.push(`${at}（${id}）: 没有任何过滤字段（${FILTER_KEYS.join(' / ')}）⇒ 会把整棵 source 树镜像出去；至少给一个 excludeExt 或 excludeDirNames`);
+    }
+    // 宽源（家目录本身，或家目录下的 Documents / Desktop / Downloads）**只给黑名单是不够的**：
+    // 黑名单挡住原始数据，挡不住"整个用户文档夹里的游戏、聊天缓存、App 数据"——本次就是这么
+    // 把 111,138 个文件当成了"该镜像的内容"。宽源必须白名单（onlySubdirs 或 includeExt）。
+    const srcRaw = String(s.source || '').trim().replace(/\\/g, '/');
+    const broadSource = !srcRaw || /^~\/?$/.test(srcRaw) || /(^|\/)(Documents|Desktop|Downloads|文档|桌面|下载)\/?$/i.test(srcRaw);
+    const hasAllow = (Array.isArray(s.onlySubdirs) && s.onlySubdirs.length > 0) || (Array.isArray(s.includeExt) && s.includeExt.length > 0);
+    if (broadSource && !hasAllow) {
+      errors.push(`${at}（${id}）: source 是用户家目录级宽目录（${s.source}）⇒ 必须声明 onlySubdirs 或 includeExt（只给黑名单等于把整个文档夹镜像出去，2026-09-18 因此误镜像 111,138 个文件）`);
+    }
     normalizedSets.push({ id, source, target });
   }
   if (dest && !/baidu|百度|nutstore|坚果|onedrive|dropbox|icloud|syncdisk|同步空间/i.test(basename(dest))) {
