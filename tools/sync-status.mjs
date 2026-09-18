@@ -535,6 +535,27 @@ if (schedule.mirror) {
     }
   }
 }
+/* 应用一致性（2026-09-18）：tick 每轮跑引擎的 tools/sync-apply.mjs（幂等应用：调度对账、需要重编的产物），
+   结果落 sync/state/apply-<machine>.json。分级：有 unit 熔断/失败 ⇒ FAIL（这台机器没跟上）；
+   全绿 ⇒ PASS（并报出发起时"当前是否真的生效"的 verify 结论数量）。 */
+{
+  const f = join(INSTANCE, 'sync', 'state', `apply-${machine}.json`);
+  if (!existsSync(f)) add('应用一致性', 'WARN', '有 apply-<machine>.json', '还没跑过（下一轮 tick 生成）');
+  else {
+    let a = null;
+    try { a = JSON.parse(readFileSync(f, 'utf8')); } catch { a = null; }
+    if (!a) add('应用一致性', 'FAIL', '可解析状态文件', `解析失败：${f}`);
+    else {
+      const units = Object.entries(a.units || {});
+      const okUnits = units.filter(([, v]) => v && v.ok).map(([k]) => k);
+      const badUnits = units.filter(([, v]) => v && v.ok === false).map(([k]) => k);
+      const blocked = Object.entries(a.blocked || {});
+      if (blocked.length) add('应用一致性', 'FAIL', '无熔断', `${blocked.length} 条熔断：${blocked.map(([k, v]) => `${k}(×${v.tries})`).join(' | ')}`);
+      else if (badUnits.length) add('应用一致性', 'FAIL', '全部 unit 已生效', `${badUnits.join(' | ')}`);
+      else add('应用一致性', 'PASS', '全部 unit 已生效', `${okUnits.length} 条生效（${okUnits.join(', ') || '无 unit'}）`);
+    }
+  }
+}
 // 引擎更新提示：落后 ⇒ WARN（不是 FAIL —— 旧代码照样能跑，但不能装作没这回事）
 const eng = engineFacts();
 const inPlaceNote = eng.inPlace ? '（本机为原地布局：这里报的是已安装引擎的版本）' : '';

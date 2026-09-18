@@ -370,6 +370,31 @@ async function main() {
     }
   }
 
+  /* 5d. 幂等应用（引擎 tools/sync-apply.mjs）：把"拉下来"变成"真的生效" —— 只做 tick 不做的那几件
+     （平台调度对账、需要重编的产物）。判据是 **verify**（当前是否真的生效），内容哈希只用来省掉
+     反复调用；tick 已经在做的 pull/渲染/裁剪**不重复登记**（第二套机制比不做更糟）。
+     同前：**不改 tick 的 rc**，失败由 sync-status 的「应用一致性」断言暴露。 */
+  let applied = null;
+  if (!DRY) {
+    const applyTool = join(ENGINE, 'tools', 'sync-apply.mjs');
+    if (existsSync(applyTool)) {
+      const r = spawnSync(process.execPath, [applyTool, '--instance', INSTANCE, '--json'],
+        { encoding: 'utf8', windowsHide: true, timeout: 600 * 1000, maxBuffer: 32 * 1024 * 1024 });
+      try {
+        const j = JSON.parse(String(r.stdout || '').trim());
+        applied = {
+          run: (j.run || []).length,
+          ok: (j.ok || []).length,
+          skipped: (j.skipped || []).length,
+          failed: (j.failed || []).length,
+          ids: (j.run || []).map((x) => x.id),
+        };
+      } catch { applied = { broken: true }; }
+    } else {
+      applied = { missing: true };
+    }
+  }
+
   /* 6. 日志（格式与既有 tick 一致：一行摘要 + 渲染器末行 + 可选 conv 摘要） */
   const elapsed = Math.round((Date.now() - t0) / 1000);
   // 日志行可读性（2026-09-17 用户反馈"日志可读性太差"）：三个渲染器各吐一句 `render done: 0 target(s) written`
@@ -409,6 +434,11 @@ async function main() {
   else if (migrate?.missing) line += ' | 迁移：缺少 tools/sync-migrate.mjs（本轮未检查）';
   else if (migrate && migrate.applied) line += ` | 迁移：应用 ${migrate.applied} 条（${migrate.ids.join(', ')}）${migrate.manual ? `待人工 ${migrate.manual}` : ''}${migrate.failed ? ` FAIL=${migrate.failed}` : ''}`;
   else if (migrate) line += ` | 迁移：无需应用${migrate.failed ? ` FAIL=${migrate.failed}` : ''}${migrate.manual ? `（待人工 ${migrate.manual}）` : ''}`;
+  // 应用同理：执行了什么、跳过了多少，都要在持久日志里留痕
+  if (applied?.broken) line += ' | 应用：执行器未返回结果（本轮未应用）';
+  else if (applied?.missing) line += ' | 应用：缺少 tools/sync-apply.mjs（本轮未应用）';
+  else if (applied && (applied.run || applied.failed)) line += ` | 应用：执行 ${applied.run} 条${applied.ids.length ? `（${applied.ids.join(', ')}）` : ''}${applied.failed ? ` FAIL=${applied.failed}` : ''}`;
+  else if (applied) line += ` | 应用：无需执行（跳过 ${applied.skipped}）`;
   if (!DRY) {
     try {
       const dir = join(INSTANCE, 'sync', 'logs');
