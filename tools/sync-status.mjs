@@ -457,6 +457,43 @@ if (schedule.mirror) {
   else add('镜像调度与配置一致', 'FAIL', `${m.task} 与 cloudMirror.schedule 一致`, m.installed ? m.detail || '时间/模式不一致' : `${m.task} 不存在`);
 }
 
+/* 镜像"真的跑过"（2026-09-18 新增）：调度注册 ≠ 跑过。实测两种误判都会发生 ——
+   ① 假红：重新注册会把 LastRunTime 重置成"从未运行"（本次就见到 267011），任务看着从没跑过；
+   ② 假绿：任务在、但每晚静默失败时没人会去看那份 transcript。
+   所以判据用**产物**：tree-sync 报告是镜像每轮写一个的文件（sync/reports/tree-sync-*.md）。 */
+{
+  const mirrorCfg = cfg.cloudMirror || {};
+  const rdir = join(INSTANCE, 'sync', 'reports');
+  let newest = null;
+  try {
+    for (const f of readdirSync(rdir)) {
+      if (!/^tree-sync-.*\.md$/.test(f)) continue;
+      const st = statSync(join(rdir, f));
+      if (!newest || st.mtimeMs > newest.mtimeMs) newest = { f, mtimeMs: st.mtimeMs };
+    }
+  } catch {}
+  const MIRROR_MAX_H = 36;
+  if (mirrorCfg.enabled === false) add('镜像实际运行', 'PASS', '按配置关闭', 'cloudMirror.enabled=false');
+  else if (!newest) add('镜像实际运行', 'WARN', `≤ ${MIRROR_MAX_H} 小时内有 tree-sync 报告`, '本机没有 tree-sync 报告（首次注册？或该机镜像由对侧代跑）');
+  else {
+    const ageH = (Date.now() - newest.mtimeMs) / 3600000;
+    const detail = `${newest.f}（${ageH.toFixed(1)} 小时前）`;
+    if (ageH <= MIRROR_MAX_H) add('镜像实际运行', 'PASS', `≤ ${MIRROR_MAX_H} 小时内有 tree-sync 报告`, detail);
+    else add('镜像实际运行', 'FAIL', `≤ ${MIRROR_MAX_H} 小时内有 tree-sync 报告`, `${detail} —— 镜像可能没在跑：查 sync/logs/daily-*.log 的 seed/tree-sync 段，或手动跑 seed-mu2.ps1`);
+  }
+}
+
+/* daily 日志编码自检（2026-09-18）：Start-Transcript 会把汉字逐字写两遍（成因未查明），
+   daily.ps1 每轮自检并落状态文件；这里把它**抬到看得见的地方**。不影响同步正确性 ⇒ WARN 而非 FAIL。 */
+{
+  const f = join(INSTANCE, 'sync', 'logs', '.daily-log-encoding');
+  if (!existsSync(f)) add('daily 日志编码自检', 'WARN', 'ok', '尚无自检结果（daily 还没跑过新版本）');
+  else {
+    const v = readFileSync(f, 'utf8').trim();
+    if (v === 'ok') add('daily 日志编码自检', 'PASS', 'ok', '汉字未双写');
+    else add('daily 日志编码自检', 'WARN', 'ok', `自检=${v}（daily 日志汉字被逐字写两遍，见 sync/logs/daily-*.log 末尾判决行）`);
+  }
+}
 // 引擎更新提示：落后 ⇒ WARN（不是 FAIL —— 旧代码照样能跑，但不能装作没这回事）
 const eng = engineFacts();
 const inPlaceNote = eng.inPlace ? '（本机为原地布局：这里报的是已安装引擎的版本）' : '';

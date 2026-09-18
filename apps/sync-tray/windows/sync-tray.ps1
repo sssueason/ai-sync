@@ -28,7 +28,8 @@ param(
   [switch]$UpdateEngine,
   [int]$RefreshSeconds = 120,
   [string]$Engine = '',
-  [string]$Instance = ''
+  [string]$Instance = '',
+  [string]$ResultFile = ''      # 子进程回传 JSON 结果（菜单路径的异步「更新引擎」）；空 = 只打 stdout
 )
 if ($Probe) { $Action = 'probe' }
 if ($InstallAutostart) { $Action = 'install-autostart' }
@@ -108,6 +109,41 @@ function Get-Brief {
   try { $b = $json | ConvertFrom-Json } catch { return [pscustomobject]@{ ok = $false; error = "JSON 解析失败（$($_.Exception.GetType().Name): $($_.Exception.Message)）首段: $($json.Substring(0, [Math]::Min(60, $json.Length)))" } }
   # sync-status 在有 FAIL 时退出码为 2，但 JSON 仍有效 ⇒ 只认 JSON
   [pscustomobject]@{ ok = $true; state = $b.state; at = $b.at; lastSyncAt = $b.lastSyncAt; agoMin = $b.lastSyncAgoMin; actions = @($b.actions); problems = @($b.problems); machines = @($b.machines); interval = $b.intervalMinutes; raw = $b }
+}
+<# ---------------------------------------------------------------- 异步取状态（2026-09-18）
+   为什么改：实测 `node sync-status.mjs --no-fetch` 单次 1.0–1.1 秒。旧版在 UI 线程上同步跑它，
+   于是每 2 分钟消息泵被堵 1 秒、启动时再堵 1 秒 —— 表现就是"右键点下去菜单半天不出来 / 点好几下才有反应"。
+   现在 UI 线程只做两件毫秒级的事：Start-Process 起子进程、用 Timer 轮询一个已生成的 JSON 文件。
+   Get-Brief（同步版）保留给 -Probe / CLI：可测性不能因为改成异步而丢掉。 #>
+$script:briefJob = $null
+$script:briefError = ''
+function Start-Brief([switch]$Fetch) {
+  if ($script:briefJob) { return }              # 已有在跑：不堆叠（慢机上堆叠会让滞后越来越大）
+  if (-not (Test-Path $statusTool)) { $script:briefError = "缺 $statusTool"; return }
+  $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("ai-sync-brief-{0}.json" -f $PID)
+  Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+  $env:AI_SYNC_INSTANCE = $instanceRoot; $env:AI_SYNC_ENGINE = $engineForRun
+  $node = (Get-Command node -ErrorAction SilentlyContinue).Source
+  if (-not $node) { $script:briefError = '找不到 node（sync-status 需要它）'; return }
+  $toolArgs = @($statusTool, '--instance', $instanceRoot, '--out', $tmp, '--quiet')
+  if (-not $Fetch) { $toolArgs += '--no-fetch' }
+  try { $p = Start-Process -FilePath $node -ArgumentList $toolArgs -WindowStyle Hidden -PassThru }
+  catch { $script:briefError = "启动 sync-status 失败：$($_.Exception.Message)"; return }
+  $script:briefJob = [pscustomobject]@{ proc = $p; out = $tmp; t0 = [datetime]::Now; fetch = [bool]$Fetch }
+}
+function Harvest-Brief {
+  if (-not $script:briefJob) { return $null }
+  $j = $script:briefJob
+  if (-not $j.proc.HasExited) {
+    if ((([datetime]::Now) - $j.t0).TotalSeconds -gt 45) { try { $j.proc.Kill() } catch { } } else { return $null }
+  }
+  $script:briefJob = $null
+  $raw = $null
+  if (Test-Path $j.out) { $raw = Get-Content -Raw -Encoding UTF8 $j.out }
+  Remove-Item -LiteralPath $j.out -Force -ErrorAction SilentlyContinue
+  if (-not $raw) { return [pscustomobject]@{ ok = $false; error = "sync-status 未产出结果（超时或退出码 $($j.proc.ExitCode)）" } }
+  try { $bb = $raw | ConvertFrom-Json } catch { return [pscustomobject]@{ ok = $false; error = "JSON 解析失败（$($_.Exception.GetType().Name)）：$($_.Exception.Message)" } }
+  return [pscustomobject]@{ ok = $true; state = $bb.state; at = $bb.at; lastSyncAt = $bb.lastSyncAt; agoMin = $bb.lastSyncAgoMin; actions = @($bb.actions); problems = @($bb.problems); machines = @($bb.machines); interval = $bb.intervalMinutes; raw = $bb }
 }
 
 function Get-Tooltip([object]$b) {
@@ -194,17 +230,20 @@ function New-SyncIcon([string]$state) {
 function Invoke-Tick {
   # 2026-09-17（P5 后修正）：优先调**引擎的** node tick（跨平台单实现）。
   # 原先只认实例里的 sync/sync-lite.ps1 ⇒ 迁移到引擎后这里会调错东西，全新装机更是直接"找不到"。
+  # 2026-09-18：返回进程对象（-PassThru）。调用方用轮询等它结束，**不再在 UI 线程 Start-Sleep 8 秒**
+  # （那 8 秒里托盘完全不响应右键，正是"卡顿"的主因之一）。
   $nodeTick = Join-Path $engineForRun 'tools/sync-tick.mjs'
   $pwsh = (Get-Process -Id $PID).Path
   if (Test-Path $nodeTick) {
     $node = (Get-Command node -ErrorAction SilentlyContinue).Source
-    if (-not $node) { [System.Windows.Forms.MessageBox]::Show('找不到 node（引擎 tick 需要它）', '立即同步') | Out-Null; return }
-    Start-Process -FilePath $node -ArgumentList @($nodeTick, '--instance', $instanceRoot, '--no-jitter') -WindowStyle Hidden
-    return
+    if (-not $node) { [System.Windows.Forms.MessageBox]::Show('找不到 node（引擎 tick 需要它）', '立即同步') | Out-Null; return $null }
+    try { return (Start-Process -FilePath $node -ArgumentList @($nodeTick, '--instance', $instanceRoot, '--no-jitter') -WindowStyle Hidden -PassThru) }
+    catch { [System.Windows.Forms.MessageBox]::Show("无法启动同步：$($_.Exception.Message)", '立即同步') | Out-Null; return $null }
   }
   $tick = Join-Path $instanceRoot 'sync/sync-lite.ps1'
-  if (-not (Test-Path $tick)) { [System.Windows.Forms.MessageBox]::Show("找不到 $nodeTick 也找不到 $tick", '立即同步') | Out-Null; return }
-  Start-Process -FilePath $pwsh -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-File', $tick, '-NoJitter') -WindowStyle Hidden
+  if (-not (Test-Path $tick)) { [System.Windows.Forms.MessageBox]::Show("找不到 $nodeTick 也找不到 $tick", '立即同步') | Out-Null; return $null }
+  try { return (Start-Process -FilePath $pwsh -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-File', $tick, '-NoJitter') -WindowStyle Hidden -PassThru) }
+  catch { [System.Windows.Forms.MessageBox]::Show("无法启动同步：$($_.Exception.Message)", '立即同步') | Out-Null; return $null }
 }
 
 <# Win11 默认把**新出现的**托盘图标放进隐藏区（"显示隐藏的图标" 的 ︿ 后面）⇒
@@ -249,6 +288,30 @@ function Open-Console([string]$hash = '', [switch]$DryRun) {
     Start-Sleep -Seconds 2
   }
   Start-Process $url
+}
+<# 端口连通性探测（毫秒级 TCP 连接，不发起 HTTP、不起进程）：轮询泵用它等控制台起来。 #>
+function Test-PortOpen([int]$port, [int]$timeoutMs = 200) {
+  $c = New-Object System.Net.Sockets.TcpClient
+  try {
+    $iar = $c.BeginConnect('127.0.0.1', $port, $null, $null)
+    if ($iar.AsyncWaitHandle.WaitOne($timeoutMs)) { $c.EndConnect($iar); return $c.Connected }
+    return $false
+  } catch { return $false } finally { $c.Close() }
+}
+
+<# 菜单点「打开控制台」的异步版（2026-09-18）：旧版在 UI 线程 Start-Sleep 2 秒等服务起来，
+   那 2 秒里右键菜单打不开。现在只负责"拉起服务 + 记下目标 URL"，由 250ms 轮询泵等端口真通了再开浏览器。 #>
+function Start-ConsoleOpen([string]$hash = '') {
+  $port = 7788
+  try { $port = (Get-Content -Raw -Encoding UTF8 (Join-Path $instanceRoot 'sync/instance.json') | ConvertFrom-Json).console.port ?? 7788 } catch { }
+  $url = "http://127.0.0.1:$port/$hash"
+  if (Test-PortOpen $port) { Start-Process $url | Out-Null; return }
+  $srv = Join-Path $engineForRun 'apps/sync-console/server.mjs'
+  $node = (Get-Command node -ErrorAction SilentlyContinue).Source
+  if (-not $node -or -not (Test-Path $srv)) { [System.Windows.Forms.MessageBox]::Show("找不到控制台服务：$srv", '打开控制台') | Out-Null; return }
+  try { Start-Process -FilePath $node -ArgumentList @($srv, '--instance', $instanceRoot, '--port', "$port") -WindowStyle Hidden }
+  catch { [System.Windows.Forms.MessageBox]::Show("拉起控制台失败：$($_.Exception.Message)", '打开控制台') | Out-Null; return }
+  $script:consoleWait = [pscustomobject]@{ port = $port; url = $url; t0 = [datetime]::Now }
 }
 function Set-Autostart([bool]$on) {
   $startup = [Environment]::GetFolderPath('Startup')
@@ -361,8 +424,9 @@ function Update-Engine([switch]$DryRun) {
   return [pscustomobject]$r
 }
 
-function Show-EngineUpdate([switch]$DryRun) {
-  $r = Update-Engine -DryRun:$DryRun
+<# 更新引擎的结果文案（**单一来源**）：CLI 分支打 stdout、菜单路径弹窗，两处同源，
+   否则"菜单说失败、命令行说成功"这类分歧没人查得动。 #>
+function Format-EngineUpdateLines([object]$r) {
   $lines = @()
   if (-not $r.ok) {
     $lines += '更新失败（未做任何改动）'
@@ -374,17 +438,43 @@ function Show-EngineUpdate([switch]$DryRun) {
     $lines += ''
     foreach ($s in $r.steps) { $lines += "· $s" }
     if ($r.pulled -gt 0 -and @($r.changed).Count) { $lines += ''; $lines += "本次涉及（前 5）：$((@($r.changed) | Select-Object -First 5) -join '、')" }
-    if ($r.restartTray -and -not $DryRun) { $lines += ''; $lines += '托盘已用新代码重启（图标可能闪一下）。' }
+    if ($r.restartTray) { $lines += ''; $lines += '托盘已用新代码重启（图标可能闪一下）。' }
   }
-  [System.Windows.Forms.MessageBox]::Show(($lines -join "`n"), '更新引擎') | Out-Null
-  if ($r.ok -and $r.restartTray -and -not $DryRun) {
-    # 托盘自身更新：拉起新实例再退出自己（新实例接管图标）
+  return $lines
+}
+
+<# 菜单点「检查并更新引擎」：git fetch/pull 最长可跑 45–90 秒，**绝不能在 UI 线程上做**
+   （旧版同步做 ⇒ 点完菜单整个托盘僵住；实测无超时那版卡到 600s）。
+   做法：拉一个隐藏子进程跑本脚本的 CLI 分支（-Action update-engine -ResultFile），
+   结果落 JSON，由 250ms 轮询泵收获后再弹窗。 #>
+function Start-EngineUpdate {
+  if ($script:updateJob) { return }
+  $outFile = Join-Path $logDir ("engine-update-{0}.json" -f $PID)
+  Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue
+  $me = $PSCommandPath; if (-not $me) { $me = $MyInvocation.MyCommand.Path }
+  $pwshExe = (Get-Process -Id $PID).Path
+  $miUpdate.Enabled = $false
+  $miUpdate.Text = '正在检查更新…'
+  try {
+    $p = Start-Process -FilePath $pwshExe -WindowStyle Hidden -PassThru -ArgumentList @(
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $me,
+      '-Action', 'update-engine', '-Instance', $instanceRoot, '-ResultFile', $outFile)
+  } catch {
+    $miUpdate.Enabled = $true; $miUpdate.Text = '检查并更新引擎'
+    [System.Windows.Forms.MessageBox]::Show("无法启动更新进程：$($_.Exception.Message)", '更新引擎') | Out-Null
+    return
+  }
+  $script:updateJob = [pscustomobject]@{ proc = $p; out = $outFile; t0 = [datetime]::Now }
+}
+
+function Complete-EngineUpdate([object]$r) {
+  [System.Windows.Forms.MessageBox]::Show(((Format-EngineUpdateLines $r) -join "`n"), '更新引擎') | Out-Null
+  if ($r.ok -and $r.restartTray) {
+    # 托盘自身更新：拉起新实例接管图标，然后自己退出（新实例读的是刚 pull 下来的新代码）
     Start-Process -FilePath 'wscript.exe' -ArgumentList ("`"$here\sync-tray.vbs`" `"$instanceRoot`"") | Out-Null
     Start-Sleep -Seconds 2
     $notify.Visible = $false
     [System.Windows.Forms.Application]::Exit()
-  } else {
-    Update-Tray
   }
 }
 
@@ -397,12 +487,17 @@ if ($Action -eq 'open-console') { Open-Console $ConsolePage -DryRun:$DryRun; exi
 
 if ($Action -eq 'update-engine') {
   # 无 UI（可测）：打印结论，退出码 0=成功 / 1=失败
+  # -ResultFile：菜单路径的异步子进程用 —— 托盘 UI 靠这个 JSON 弹窗，不再在 UI 线程上同步跑 git。
   $r = Update-Engine -DryRun:$DryRun
   Write-Output ("engine={0}  branch={1}" -f $r.engine, $r.branch)
   Write-Output ("before={0}  after={1}  pulled={2}{3}" -f $r.before, $r.after, $r.pulled, $(if ($r.dryRun) { '  (dry-run)' } else { '' }))
   foreach ($s in $r.steps) { Write-Output ("  · " + $s) }
   if (@($r.changed).Count) { Write-Output ("  changed({0}): {1}" -f @($r.changed).Count, ((@($r.changed) | Select-Object -First 6) -join ', ')) }
   if ($r.ok) { Write-Output 'RESULT: OK' } else { Write-Output ("RESULT: FAIL - " + $r.error) }
+  if ($ResultFile) {
+    try { Set-Content -LiteralPath $ResultFile -Value ($r | ConvertTo-Json -Depth 6 -Compress) -Encoding UTF8 }
+    catch { Write-Output ("  [WARN] 写结果文件失败：" + $_.Exception.Message) }
+  }
   exit $(if ($r.ok) { 0 } else { 1 })
 }
 
@@ -448,34 +543,100 @@ $miExit = $menu.Items.Add('退出')
 
 $script:lastState = ''
 $script:curIcon = $null
-function Update-Tray([switch]$AllowBalloon) {
-  $b = Get-Brief
+function Apply-Brief([object]$b) {
   $st = if (-not $b.ok) { 'fail' } else { $b.state }
-  $newIcon = New-SyncIcon $st
-  if ($script:curIcon) { try { $script:curIcon.Dispose() } catch { } }
-  $script:curIcon = $newIcon
-  $notify.Icon = $newIcon
-  $notify.Text = Get-Tooltip $b
-  # 动态标签：落后就直说落后几个提交（与 tooltip 同一判据），没落后就显示当前版本
-  $miUpdate.Text = Get-UpdateMenuText $b
-  $notify.ContextMenuStrip = $menu
-  # 气泡只在**开关打开**且状态跳变时弹一次（默认关：用户要求静默；否则每轮刷新都弹 = 骚扰）
-  $prev = ''
-  if (Test-Path $stateFile) { $prev = (Get-Content -Raw $stateFile -ErrorAction SilentlyContinue) }
-  if ($AllowBalloon -and (Test-Path $balloonFlag) -and $st -ne 'ok' -and $st -ne $prev) {
-    $notify.BalloonTipTitle = 'ai-sync 同步'
-    $notify.BalloonTipText = (Get-Tooltip $b)
-    $notify.BalloonTipIcon = if ($st -eq 'fail') { [System.Windows.Forms.ToolTipIcon]::Error } else { [System.Windows.Forms.ToolTipIcon]::Warning }
-    $notify.ShowBalloonTip(8000)
+  # 只在**状态真的变了**才重建/重设图标：每轮都 Set 一次会触发 Explorer 重画托盘图标
+  # （图标闪烁 + 右键第一下变钝）——旧版每 2 分钟无条件重设。
+  if ($st -ne $script:curIconState -or -not $script:curIcon) {
+    $newIcon = New-SyncIcon $st
+    if ($script:curIcon) { try { $script:curIcon.Dispose() } catch { } }
+    $script:curIcon = $newIcon
+    $notify.Icon = $newIcon
+    $script:curIconState = $st
   }
+  $tip = Get-Tooltip $b
+  if ($tip -ne $script:curTip) { $notify.Text = $tip; $script:curTip = $tip }
+  $lbl = Get-UpdateMenuText $b
+  if ($lbl -ne $miUpdate.Text) { $miUpdate.Text = $lbl }
+  return $st
+}
+
+function Save-TrayState([string]$st) {
   if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
   Set-Content -Path $stateFile -Value $st -Encoding UTF8 -NoNewline
   $script:lastState = $st
 }
 
-$miConsole.add_Click({ Open-Console '' })
-$miSync.add_Click({ Invoke-Tick; Start-Sleep -Seconds 8; Update-Tray })
-$miUpdate.add_Click({ Show-EngineUpdate })
+function Request-Refresh([switch]$AllowBalloon, [switch]$Fetch) {
+  if ($AllowBalloon) { $script:wantBalloon = $true }
+  Start-Brief -Fetch:$Fetch
+}
+
+# 兼容旧调用点：语义 = 立刻要一次刷新，但**不阻塞**
+function Update-Tray([switch]$AllowBalloon) { Request-Refresh -AllowBalloon:$AllowBalloon }
+
+<# 250ms 轮询泵：UI 线程上只做"查进程是否结束 + 读一个小 JSON 文件 + 探一次端口"。
+   所有耗时工作都在子进程里，消息泵永远不被堵 —— 这是"右键不再卡"的根本。 #>
+function Step-Pump {
+  $b = Harvest-Brief
+  if ($b) {
+    $st = Apply-Brief $b
+    if ($script:wantBalloon -and (Test-Path $balloonFlag) -and $st -ne 'ok' -and $st -ne $script:lastState) {
+      $notify.BalloonTipTitle = 'ai-sync 同步'
+      $notify.BalloonTipText = (Get-Tooltip $b)
+      $notify.BalloonTipIcon = if ($st -eq 'fail') { [System.Windows.Forms.ToolTipIcon]::Error } else { [System.Windows.Forms.ToolTipIcon]::Warning }
+      $notify.ShowBalloonTip(8000)
+    }
+    $script:wantBalloon = $false
+    Save-TrayState $st
+  }
+  if ($script:tickJob) {
+    $j = $script:tickJob
+    if ($j.proc.HasExited -or ((([datetime]::Now) - $j.t0).TotalSeconds -gt 300)) {
+      $script:tickJob = $null
+      $miSync.Text = '立即同步一次'
+      Request-Refresh
+    }
+  }
+  if ($script:updateJob) {
+    $j = $script:updateJob
+    if ($j.proc.HasExited -or ((([datetime]::Now) - $j.t0).TotalSeconds -gt 300)) {
+      if (-not $j.proc.HasExited) { try { $j.proc.Kill() } catch { } }
+      $script:updateJob = $null
+      $raw = if (Test-Path $j.out) { Get-Content -Raw -Encoding UTF8 $j.out } else { $null }
+      Remove-Item -LiteralPath $j.out -Force -ErrorAction SilentlyContinue
+      $miUpdate.Enabled = $true
+      $miUpdate.Text = '检查并更新引擎'
+      if ($raw) {
+        try { Complete-EngineUpdate ($raw | ConvertFrom-Json) }
+        catch { [System.Windows.Forms.MessageBox]::Show("更新结果无法解析：$($_.Exception.Message)", '更新引擎') | Out-Null }
+      } else {
+        [System.Windows.Forms.MessageBox]::Show("更新进程未产出结果（退出码 $($j.proc.ExitCode)）", '更新引擎') | Out-Null
+      }
+      Request-Refresh -Fetch
+    }
+  }
+  if ($script:consoleWait) {
+    $w = $script:consoleWait
+    if (Test-PortOpen $w.port) { $script:consoleWait = $null; Start-Process $w.url | Out-Null }
+    elseif ((([datetime]::Now) - $w.t0).TotalSeconds -gt 12) { $script:consoleWait = $null; Start-Process $w.url | Out-Null }
+  }
+}
+$script:lastState = ''
+$script:curIcon = $null
+$script:curIconState = ''
+$script:curTip = ''
+$script:wantBalloon = $false
+$script:tickJob = $null
+$script:updateJob = $null
+$script:consoleWait = $null
+
+$miConsole.add_Click({ Start-ConsoleOpen })
+$miSync.add_Click({
+    $p = Invoke-Tick
+    if ($p) { $script:tickJob = [pscustomobject]@{ proc = $p; t0 = [datetime]::Now }; $miSync.Text = '同步中…（本轮结束即刷新）' }
+  })
+$miUpdate.add_Click({ Start-EngineUpdate })
 $miAuto.add_Click({ Set-Autostart $miAuto.Checked })
 $miBalloon.add_Click({
     if ($miBalloon.Checked) { Set-Content -Path $balloonFlag -Value 'on' -Encoding UTF8 -NoNewline }
@@ -483,13 +644,23 @@ $miBalloon.add_Click({
   })
 $miExit.add_Click({ $notify.Visible = $false; [System.Windows.Forms.Application]::Exit() })
 # 双击图标也开控制台（一般人右键才看菜单；双击是"打开"的通用手势）
-$notify.add_DoubleClick({ Open-Console '' })
+$notify.add_DoubleClick({ Start-ConsoleOpen })
 
-Update-Tray          # 先设 Icon/Text，再让图标可见：这样 Explorer 记录的 InitialTooltip 才是真 tooltip
+# 菜单只挂一次：每轮刷新都重挂会触发 Explorer 重建托盘菜单（右键第一下变钝）
+$notify.ContextMenuStrip = $menu
+$notify.Text = '同步状态获取中…'
 $notify.Visible = $true
+
+# 慢循环（每 RefreshSeconds 要一次刷新，--no-fetch 不为刷图标去联网）+ 快泵（250ms，纯本地检查）
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = [Math]::Max(30, $RefreshSeconds) * 1000
-$timer.add_Tick({ Update-Tray -AllowBalloon })
+$timer.add_Tick({ Request-Refresh -AllowBalloon })
 $timer.Start()
+$pump = New-Object System.Windows.Forms.Timer
+$pump.Interval = 250
+$pump.add_Tick({ Step-Pump })
+$pump.Start()
+
+Request-Refresh -AllowBalloon -Fetch
 [System.Windows.Forms.Application]::Run()
 $notify.Dispose()

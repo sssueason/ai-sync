@@ -278,6 +278,7 @@ async function main() {
 
   /* 4. 跨端状态 + 调度自愈 */
   const statusTool = join(ENGINE, 'tools', 'sync-status.mjs');
+
   const schedTool = join(ENGINE, 'tools', 'sync-schedule.mjs');
   if (existsSync(statusTool) && !DRY) {
     const r = spawnSync(process.execPath, [statusTool, '--instance', INSTANCE, '--write-state', '--rc', String(issues.length), '--tick-at', stamp(), '--quiet'], {
@@ -287,9 +288,14 @@ async function main() {
     });
     stats.stateNote = String(r.stdout || '').trim().split(/\r?\n/).filter(Boolean).pop() || '';
   }
-  if (existsSync(schedTool) && !DRY) {
+  /* 2026-09-18 实测踩到的坑：临时实例（fixture）跑 tick 时，这一步会把**本机的真实计划任务**改成
+     对齐那个临时实例的 tick.intervalMinutes —— 注入测试因此把生产任务从 20 分钟改成了 5 分钟。
+     调度对账属于"机器级副作用"，测非生产实例时必须能显式关掉（AI_SYNC_NO_SCHEDULE=1）。 */
+  if (existsSync(schedTool) && !DRY && process.env.AI_SYNC_NO_SCHEDULE !== '1') {
     const r = spawnSync(process.execPath, [schedTool, '--instance', INSTANCE, '--reconcile', '--quiet'], { encoding: 'utf8', windowsHide: true, timeout: 5 * 60 * 1000 });
     stats.schedNote = String(r.stdout || '').trim();
+  } else if (process.env.AI_SYNC_NO_SCHEDULE === '1') {
+    stats.schedNote = 'AI_SYNC_NO_SCHEDULE=1 → 跳过调度对账（测试模式）';
   }
 
   /* 5. 保留策略：日志与报告不无限堆积（每轮跑一次，代价只是一次目录列举） */
@@ -324,7 +330,7 @@ async function main() {
     }
     return parts.join(' | ');
   })();
-  let line = `tick ${machine} ${stamp()} 拉取=${stats.pulled} 提交=${stats.committed} 推送=${stats.pushed} 让路=${stats.skipped} 耗时=${elapsed}s ${issues.length ? `rc=${issues.length}` : 'rc=0'} | ${notes3}`;
+  let line = `tick ${machine} ${stamp()} 拉取=${stats.pulled} 提交=${stats.committed} 推送=${stats.pushed} 整合失败=${stats.skipped} 耗时=${elapsed}s ${issues.length ? `rc=${issues.length}` : 'rc=0'} | ${notes3}`;
   // 「只读机器」的跳过必须进**日志行**（2026-09-17 实测发现：它原先只打印在 stdout，而 stdout 是瞬时的、日志才是持久证据）
   if (stats.readOnly) line += ' | read-only（本机标记为只读：已本地提交，未推送）';
   if (stats.convNote) line += ` | 收敛：${String(stats.convNote).replace(/^converge done: /, '')}`;
@@ -342,7 +348,15 @@ async function main() {
     try {
       const dir = join(INSTANCE, 'sync', 'logs');
       mkdirSync(dir, { recursive: true });
-      writeFileSync(join(dir, `tick-${machine}.log`), line + '\n', { flag: 'a' });
+      /* 2026-09-18：**失败明细必须进持久日志**。原先只写摘要行（rc=${issues.length}），
+         而 `[FAIL] <repo>: 整合失败` 这类明细只走 stdout —— 计划任务用 run-hidden.vbs 把 stdout 藏掉，
+         于是事后翻日志只有 "rc=1"、毫无线索（2026-09-18 实测：两次 rc=1 只能靠当事人回忆才解释得清）。
+         notes 同理（"抢占陈旧锁"这类状态变化也要留痕，否则它只活在瞬时 stdout 里）。 */
+      const tail = [
+        ...notes.map((n) => `[注] ${n}`),
+        ...issues.map((i) => `[FAIL] ${i}`),
+      ];
+      writeFileSync(join(dir, `tick-${machine}.log`), [line, ...tail].join('\n') + '\n', { flag: 'a' });
     } catch (e) {
       issues.push(`写日志失败：${e.message}`);
     }

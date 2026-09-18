@@ -18,6 +18,13 @@
 //      · --probe 输出的 state / tip 三行（tip 第二行在引擎落后时应显示「引擎可更新」）
 //      · 菜单是否出现「打开控制台」，点了能否拉起控制台并打开浏览器
 //      · 「状态变化时气泡提醒」勾选状态是否跨重启保留（flag 文件 sync/logs/.tray-balloon）
+//    2026-09-18 本轮（菜单卡顿修复，与 Windows 侧同一套做法）另需回填：
+//      · **右键点图标 → 菜单是否立刻出现**（旧版请在 `menuWillOpen` 里同步 fetch，菜单要等网络返回；
+//        这一条是本轮的核心修复，必须在真机上肉眼确认"点下去就出来"）
+//      · 点「检查并更新引擎」→ 标题是否先变「正在检查更新…」、菜单是否**全程可再次打开**
+//        （旧版在菜单动作里同步跑 git fetch/pull，最长 45–90 秒冻住菜单）
+//      · 点「打开控制台」→ 是否不再有约 1.5 秒僵住，且浏览器最终能打开
+//      · 定时刷新（每 120 秒）期间反复右键，菜单是否始终跟手
 //    在此之前，本文件本轮改动的正确性状态是"未验证"，不要当成可用件（conventions §3 假绿防线）。
 //
 // 构建：bash build.sh          （产出 dist/SyncTray.app，ad-hoc 签名）
@@ -98,6 +105,16 @@ func loadBrief(fetch: Bool = false) -> Brief {
         b.checkLines.append("[\((c["level"] as? String) ?? "?")] \((c["name"] as? String) ?? "?")  ← 期望 \((c["expected"] as? String) ?? "?") / 实际 \((c["actual"] as? String) ?? "?")")
     }
     return b
+}
+/// 异步取简报（2026-09-18）。**为什么必须有它**：旧版 `menuWillOpen` 直接调同步 `loadBrief`，
+/// 里面 `p.waitUntilExit()` 会一直等到 node 跑完（带 fetch 时还要等网络）——
+/// 菜单的绘制被卡在 I/O 后面，用户看到的就是"右键点下去菜单半天不出来"。
+/// 现在：菜单路径只读缓存，取数一律走后台队列，完成后回主线程更新图标/文案/标题。
+func loadBriefAsync(fetch: Bool, completion: @escaping (Brief) -> Void) {
+    DispatchQueue.global(qos: .utility).async {
+        let b = loadBrief(fetch: fetch)
+        DispatchQueue.main.async { completion(b) }
+    }
 }
 
 func tooltip(_ b: Brief) -> String {
@@ -181,6 +198,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var updateItem: NSMenuItem!
     var autostartItem: NSMenuItem!
     var balloonItem: NSMenuItem!
+    // 2026-09-18 异步化所需状态：缓存简报（菜单打开时先用它渲染）+ 在跑标记（避免刷新堆叠）
+    var lastBrief: Brief? = nil
+    var refreshing = false
+    var updatingEngine = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -208,10 +229,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         syncCheckmarks()
     }
 
-    /// 打开菜单时**复核一次**（带 fetch）：定时刷新走 --no-fetch 省网络，
-    /// 但"引擎是否落后"必须有网络才看得准 —— 用户看菜单的这一刻是最合适的时机。
+    /// 打开菜单时**绝不能同步取数**（2026-09-18 修）：旧版在这里 `refresh(fetch: true)`，
+    /// 于是"右键 → 等 git/node 跑完（含网络 fetch）→ 菜单才画出来"。这就是 mac 侧菜单卡顿的主因。
+    /// 现在这里只做毫秒级的本地事：勾选状态（读文件）+ 用缓存简报刷新文案；带 fetch 的复核丢到后台，
+    /// 回来后自行更新标题与图标（用户已经看到菜单，不会觉得卡）。
     func menuWillOpen(_ menu: NSMenu) {
-        refresh(balloon: false, fetch: true)
+        syncCheckmarks()
+        if let b = lastBrief { apply(b, balloon: false) }
+        requestRefresh(fetch: true, balloon: false)
     }
 
     func syncCheckmarks() {
@@ -221,13 +246,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func refresh(balloon: Bool, fetch: Bool = false) {
-        let b = loadBrief(fetch: fetch)
+        // 兼容旧调用点：立刻返回，真正的取数在后台（见 requestRefresh）
+        requestRefresh(fetch: fetch, balloon: balloon)
+    }
+
+    /// 取一次简报：**不阻塞 UI 线程**。同一时刻只允许一个在跑（慢机上堆叠只会让显示越来越滞后）。
+    func requestRefresh(fetch: Bool, balloon: Bool) {
+        if refreshing { return }
+        refreshing = true
+        loadBriefAsync(fetch: fetch) { b in
+            self.refreshing = false
+            self.lastBrief = b
+            self.apply(b, balloon: balloon)
+        }
+    }
+
+    /// 把一份简报渲染到菜单栏（图标 / tooltip / 更新入口标题 / 可选气泡）。只在主线程调用。
+    func apply(_ b: Brief, balloon: Bool) {
         let st = b.ok ? b.state : "fail"
         item.button?.image = makeIcon(state: st)
         item.button?.toolTip = tooltip(b)
         // 引擎更新入口：落后时标题直说落后几个提交，不落后就显示当前版本（与 Windows 托盘同款文案）
         let behind = b.engineBehind ?? 0
-        if behind > 0 {
+        if updatingEngine {
+            updateItem.title = "正在检查更新…"
+        } else if behind > 0 {
             updateItem.title = "更新引擎（落后 \(behind) 个提交）"
         } else if let rev = b.engineRev {
             updateItem.title = "检查并更新引擎（当前 \(rev)）"
@@ -259,23 +302,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 打开控制台：没在跑就先拉起（与 Windows 的 Open-Console 同一套语义），再开浏览器。
     /// 端口取 sync/instance.json 的 console.port（默认 7788）。
+    /// 打开控制台（2026-09-18 修）：旧版在菜单动作里 `Thread.sleep(1.5)` 等服务起来，
+    /// 那 1.5 秒里菜单栏是僵的。现在只有"已在跑"这一种情况立即开浏览器，
+    /// 否则拉起服务后在**后台**等端口通（最多 8 秒），通了再回主线程打开浏览器。
     @objc func openConsole() {
         let port = consolePort()
-        let alive = shell("/usr/bin/curl", ["-s", "-o", "/dev/null", "-m", "1", "http://127.0.0.1:\(port)/api/status"]) == 0
-        if !alive {
-            let srv = (engineRoot as NSString).appendingPathComponent("apps/sync-console/server.mjs")
-            guard FileManager.default.fileExists(atPath: srv) else {
-                alert("找不到控制台服务：\(srv)")
-                return
-            }
-            // 显式传引擎/实例根：控制台据此判断"引擎是否落后"，不传会退化成"原地布局"而永远报未知
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            p.arguments = ["-lc", "AI_SYNC_ENGINE='\(engineRoot)' AI_SYNC_INSTANCE='\(instanceRoot)' nohup node '\(srv)' --instance '\(instanceRoot)' --port \(port) >/dev/null 2>&1 &"]
-            try? p.run()
-            Thread.sleep(forTimeInterval: 1.5)
+        let url = URL(string: "http://127.0.0.1:\(port)/")
+        if portOpen(port) {
+            if let u = url { NSWorkspace.shared.open(u) }
+            return
         }
-        if let u = URL(string: "http://127.0.0.1:\(port)/") { NSWorkspace.shared.open(u) }
+        let srv = (engineRoot as NSString).appendingPathComponent("apps/sync-console/server.mjs")
+        guard FileManager.default.fileExists(atPath: srv) else {
+            alert("找不到控制台服务：\(srv)")
+            return
+        }
+        // 显式传引擎/实例根：控制台据此判断"引擎是否落后"，不传会退化成"原地布局"而永远报未知
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        p.arguments = ["-lc", "AI_SYNC_ENGINE='\(engineRoot)' AI_SYNC_INSTANCE='\(instanceRoot)' nohup node '\(srv)' --instance '\(instanceRoot)' --port \(port) >/dev/null 2>&1 &"]
+        try? p.run()
+        DispatchQueue.global(qos: .utility).async {
+            let deadline = Date().addingTimeInterval(8)
+            while Date() < deadline && !self.portOpen(port) { Thread.sleep(forTimeInterval: 0.25) }
+            DispatchQueue.main.async { if let u = url { NSWorkspace.shared.open(u) } }
+        }
+    }
+
+    /// 端口探活（毫秒级；用 1 秒超时的 curl，与旧版同一判据 —— 不引入新的依赖与 socket API）
+    func portOpen(_ port: Int) -> Bool {
+        return shell("/usr/bin/curl", ["-s", "-o", "/dev/null", "-m", "1", "http://127.0.0.1:\(port)/api/status"]) == 0
     }
 
     func consolePort() -> Int {
@@ -319,34 +375,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 一键更新引擎（与 Windows 托盘同一套语义）：fetch → 落后判定 → pull --ff-only →
     /// 安装器有变则重注册调度；托盘自身有变则提示重编（macOS 上不能自重建 App）。
+    /// 2026-09-18：整段 git 操作**挪到后台队列**。旧版在菜单动作里同步跑（fetch 45s / pull 90s 超时），
+    /// 那段时间菜单栏完全没反应 —— 与"右键卡顿"是同一类病。
     @objc func updateEngine() {
+        if updatingEngine { return }
+        updatingEngine = true
+        updateItem.isEnabled = false
+        updateItem.title = "正在检查更新…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let msg = self.performEngineUpdate()
+            DispatchQueue.main.async {
+                self.updatingEngine = false
+                self.updateItem.isEnabled = true
+                self.updateItem.title = "检查并更新引擎"
+                self.alert(msg)
+                self.requestRefresh(fetch: true, balloon: false)
+            }
+        }
+    }
+
+    /// 真正的更新流程（**在后台队列上跑**；返回要弹给用户的文案，不自己弹窗）
+    func performEngineUpdate() -> String {
         var steps: [String] = []
         let (brc, brRaw) = gitRun(["rev-parse", "--abbrev-ref", "HEAD"], 15)
         let branch = brRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         if brc != 0 || branch.isEmpty || branch == "HEAD" {
-            alert("更新失败（未做任何改动）\n\n引擎不在分支上：\n\(brRaw)")
-            return
+            return "更新失败（未做任何改动）\n\n引擎不在分支上：\n\(brRaw)"
         }
         let (_, beforeRaw) = gitRun(["rev-parse", "--short", "HEAD"], 15)
         let before = beforeRaw.trimmingCharacters(in: .whitespacesAndNewlines)
-        // 低速阈值：防"连上了但永远不动"把菜单拖住
+        // 低速阈值：防"连上了但永远不动"把更新流程拖住
         let (fc, fout) = gitRun(["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=20", "fetch", "--quiet", "origin", branch], 45)
         if fc != 0 {
-            alert("更新失败（未做任何改动）\n\ngit fetch 失败：\n\(fout)")
-            return
+            return "更新失败（未做任何改动）\n\ngit fetch 失败：\n\(fout)"
         }
         let (_, behindRaw) = gitRun(["rev-list", "--count", "HEAD..origin/\(branch)"], 15)
         let behind = Int(behindRaw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
-        var changed = ""
         if behind > 0 {
             let (pc, pout) = gitRun(["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=20", "pull", "--ff-only"], 90)
             if pc != 0 {
-                alert("更新失败（未做任何改动）\n\ngit pull --ff-only 失败（本地有分叉或未提交改动？）：\n\(pout)")
-                return
+                return "更新失败（未做任何改动）\n\ngit pull --ff-only 失败（本地有分叉或未提交改动？）：\n\(pout)"
             }
             steps.append("拉取 \(behind) 个提交")
             let (_, c) = gitRun(["diff", "--name-only", before, "HEAD"], 20)
-            changed = c
             if c.contains("install/") {
                 let srv = (engineRoot as NSString).appendingPathComponent("install/install.mjs")
                 let rc2 = shell("/bin/zsh", ["-lc", "node '\(srv)' --instance '\(instanceRoot)' --register"])
@@ -370,9 +441,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var msg = behind > 0 ? "引擎已更新：\(before) → \(after)" : "引擎已是最新：\(after)"
         msg += "\n分支：\(branch)    目录：\(engineRoot)\n\n"
         msg += steps.map { "· " + $0 }.joined(separator: "\n")
-        alert(msg)
-        refresh(balloon: false, fetch: true)
+        return msg
     }
+
 
     @objc func toggleAutostart() {
         let plist = (NSHomeDirectory() as NSString).appendingPathComponent("Library/LaunchAgents/cn.ai-sync.tray.plist")
