@@ -395,6 +395,28 @@ async function main() {
     }
   }
 
+  /* 5e. 诊断包（**条件命中才生成**）：把"看得到红、说不清为什么"变成"出事有档案"。
+     触发 = 本轮卫生/迁移/应用任一有失败，或本轮 tick 有 issues；生成器自己按指纹去重
+     （同一状况不重复堆积）。只读采集，唯一写入物是报告文件。 */
+  let bundle = null;
+  if (!DRY) {
+    const bundleTool = join(ENGINE, 'tools', 'sync-ops-bundle.mjs');
+    const why = [
+      hygiene && hygiene.fails ? `卫生 FAIL=${hygiene.fails}` : null,
+      migrate && migrate.failed ? `迁移失败=${migrate.failed}` : null,
+      applied && applied.failed ? `应用失败=${applied.failed}` : null,
+      issues.length ? `本轮 tick issues=${issues.length}` : null,
+    ].filter(Boolean);
+    if (existsSync(bundleTool) && why.length) {
+      const r = spawnSync(process.execPath, [bundleTool, '--instance', INSTANCE, '--json', '--reason', why.join(' · ')],
+        { encoding: 'utf8', windowsHide: true, timeout: 300 * 1000, maxBuffer: 32 * 1024 * 1024 });
+      try {
+        const j = JSON.parse(String(r.stdout || '').trim());
+        if (j.generated) bundle = { out: j.out, reasons: j.reasons || why, fingerprint: j.fingerprint };
+      } catch { bundle = { broken: true }; }
+    }
+  }
+
   /* 6. 日志（格式与既有 tick 一致：一行摘要 + 渲染器末行 + 可选 conv 摘要） */
   const elapsed = Math.round((Date.now() - t0) / 1000);
   // 日志行可读性（2026-09-17 用户反馈"日志可读性太差"）：三个渲染器各吐一句 `render done: 0 target(s) written`
@@ -439,6 +461,9 @@ async function main() {
   else if (applied?.missing) line += ' | 应用：缺少 tools/sync-apply.mjs（本轮未应用）';
   else if (applied && (applied.run || applied.failed)) line += ` | 应用：执行 ${applied.run} 条${applied.ids.length ? `（${applied.ids.join(', ')}）` : ''}${applied.failed ? ` FAIL=${applied.failed}` : ''}`;
   else if (applied) line += ` | 应用：无需执行（跳过 ${applied.skipped}）`;
+  // 诊断包：生成了就要在持久日志里留痕（否则"有没有档案"事后无从判断）
+  if (bundle?.broken) line += ' | 诊断包：生成器未返回结果';
+  else if (bundle?.out) line += ` | 诊断包：已生成 ${String(bundle.out).split(/[\\/]/).pop()}（${bundle.reasons.join(' · ')}）`;
   if (!DRY) {
     try {
       const dir = join(INSTANCE, 'sync', 'logs');

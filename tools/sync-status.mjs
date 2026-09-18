@@ -556,6 +556,24 @@ if (schedule.mirror) {
     }
   }
 }
+/* 诊断包（2026-09-18）：条件命中时（卫生/迁移/应用有失败）tick 会生成一份自包含诊断包到 sync/reports/。
+   这里只做一件事：**当前是否还有未处理的问题、有没有对应的档案可看**。
+   条件已清 ⇒ PASS（不长期挂黄）；条件在、包也在 ⇒ WARN 指路；条件在、包还没生成 ⇒ WARN。 */
+{
+  const rd = (p) => { try { return JSON.parse(readFileSync(p, 'utf8')) } catch { return null } };
+  const hyg = rd(join(INSTANCE, 'sync', 'state', `hygiene-${machine}.json`));
+  const mig = rd(join(INSTANCE, 'sync', 'state', `migrations-${machine}.json`));
+  const app = rd(join(INSTANCE, 'sync', 'state', `apply-${machine}.json`));
+  const sig = rd(join(INSTANCE, 'sync', 'state', `ops-bundle-${machine}.json`));
+  const cond = [];
+  if (hyg && hyg.fails > 0) cond.push(`卫生 FAIL=${hyg.fails}`);
+  if (mig && Object.keys(mig.blocked || {}).length) cond.push(`迁移熔断 ${Object.keys(mig.blocked).length}`);
+  if (app && Object.keys(app.blocked || {}).length) cond.push(`应用熔断 ${Object.keys(app.blocked).length}`);
+  if (app && Object.values(app.units || {}).some((u) => u && u.ok === false)) cond.push('应用未生效');
+  if (!cond.length) add('诊断包', 'PASS', '无待看诊断包', '当前无触发条件（卫生/迁移/应用均正常）');
+  else if (sig && sig.out) add('诊断包', 'WARN', '有档案可看', `${cond.join(' · ')} ⇒ sync/reports/${sig.out}`);
+  else add('诊断包', 'WARN', '有档案可看', `${cond.join(' · ')} ⇒ 尚未生成（下一轮 tick 会生成，或手动跑 tools/sync-ops-bundle.mjs --force）`);
+}
 // 引擎更新提示：落后 ⇒ WARN（不是 FAIL —— 旧代码照样能跑，但不能装作没这回事）
 const eng = engineFacts();
 const inPlaceNote = eng.inPlace ? '（本机为原地布局：这里报的是已安装引擎的版本）' : '';
