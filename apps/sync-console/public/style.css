@@ -56,3 +56,29 @@ code{background:var(--line);padding:1px 5px;border-radius:4px;font-size:12px}
 .banner{background:var(--panel);border:1px solid var(--warn);border-left-width:4px;border-radius:10px;padding:10px 12px;margin-bottom:14px;font-size:13px;line-height:1.7}
 .banner code{word-break:break-all}
 .banner .hint{display:block;margin-top:2px}
+
+/* ================= 布局优化（2026-09-18 控制台审计） ================= */
+/* 1) 宽表不撑破整页：HTML 里给表套了 .table-wrap；这里给滚动容器与最小宽度 */
+.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:10px}
+.table-wrap table{min-width:520px}
+/* 2) header 允许换行：品牌里那段说明很长，窄屏会把右侧按钮挤出去 */
+header{flex-wrap:wrap;gap:6px}
+.brand{flex-wrap:wrap;min-width:0}
+.head-right{flex-wrap:wrap}
+/* 3) nav 与 main 同宽对齐（main 居中 1100px；nav 原先固定 18px 内边距 ⇒ 宽屏下按钮贴着左边缘） */
+nav{padding-inline:max(18px,calc((100% - 1100px)/2))}
+/* 4) 键盘可达性（原先只有默认 outline，深色底上几乎看不见）与触摸目标 */
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+@media (pointer:coarse){button{padding:9px 15px}}
+/* 5) 窄屏（手机 / 分屏 / 窄窗口） */
+@media (max-width:640px){
+  header{padding:10px 12px}
+  .brand .hint{display:none}
+  main{padding:12px}
+  nav{padding-inline:12px}
+  td,th{padding:6px 8px;font-size:13px}
+  .card .v{font-size:18px}
+  .out,.check-line{max-height:300px}
+}
+/* 6) 长日志/路径不撑破容器（复制原文时仍完整） */
+pre.out{overflow-wrap:anywhere}

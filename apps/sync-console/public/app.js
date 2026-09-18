@@ -2,8 +2,12 @@
 // 设计：页面只做"显示 + 转发"，所有动作都调引擎既有 CLI（/api/* 之后仍是 sync-status / sync-align / sync-lite），
 // 不在前端重实现任何同步逻辑（否则就是第二套真相）。
 const $ = (s) => document.querySelector(s);
+// 审计 EN-6：所有控制台请求都带自定义头 `X-AI-Sync-Console`。跨站请求无法在不触发预检的情况下
+// 设置自定义头 ⇒ 这一行就是 CSRF 防线的前端半边（服务端在 server.mjs 校验）。
 const api = async (p, opt) => {
-  const r = await fetch(p, opt);
+  const o = Object.assign({}, opt || {});
+  o.headers = Object.assign({ 'X-AI-Sync-Console': '1' }, o.headers || {});
+  const r = await fetch(p, o);
   const t = await r.text();
   try { return JSON.parse(t); } catch { return { raw: t }; }
 };
@@ -12,7 +16,11 @@ const api = async (p, opt) => {
 function activateTab(name) {
   const b = document.querySelector(`.tab[data-tab="${name}"]`);
   if (!b) return;
-  document.querySelectorAll('.tab').forEach((x) => x.classList.toggle('active', x === b));
+  document.querySelectorAll('.tab').forEach((x) => {
+    const on = x === b;
+    x.classList.toggle('active', on);
+    x.setAttribute('aria-selected', on ? 'true' : 'false'); // a11y：原先只有视觉高亮
+  });
   document.querySelectorAll('.panel').forEach((p) => p.classList.toggle('active', p.id === 'tab-' + name));
   if (name === 'logs') loadLog();
   if (name === 'settings') loadAdapters();
@@ -28,6 +36,10 @@ window.addEventListener('hashchange', () => activateTab(location.hash.slice(1)))
 // ---------- 状态 ----------
 function renderStatus(s) {
   const v = $('#verdict');
+  // 布局优化（2026-09-18 审计）：把"这批数据是什么时候取的"摆在眼前 —— 页面每 60 秒自动刷新，
+  // 但用户看不出眼前这屏是新的还是十分钟前的（对端状态本来就带延迟，更需要这个锚点）。
+  const at = $('#dataAt');
+  if (at) at.textContent = '数据 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
   v.className = 'pill ' + (s.state || 'fail');
   v.textContent = { ok: '正常', warn: '有提醒', fail: '有失败' }[s.state] || s.state;
   $('#glyph').textContent = '⟳';
@@ -55,10 +67,12 @@ function renderStatus(s) {
     banner.className = 'banner hidden';
     banner.textContent = '';
   }
-  // level 会进 class 属性 ⇒ 用白名单（转义 + 白名单两层）
-  const LV = new Set(['ok', 'warn', 'fail', 'info']);
+  // level 会进 class 属性 ⇒ 白名单 + 转义两层。
+  // ★ 2026-09-18 修回归：白名单原先写成小写（ok/warn/fail/info），而 CSS 与数据用的是
+  //   **大写** `.lv.PASS/.WARN/.FAIL/.INFO` ⇒ 我上一轮的 EN-4 修复把所有级别都降级成灰色。
+  const LV = new Set(['PASS', 'WARN', 'FAIL', 'INFO']);
   $('#checks tbody').innerHTML = (s.checks || []).map((c) =>
-    `<tr><td class="lv ${LV.has(String(c.level)) ? String(c.level) : 'info'}">${esc(c.level)}</td><td>${esc(c.name)}</td><td class="hint">期望 ${esc(c.expected)}</td><td class="hint">实际 ${esc(c.actual)}</td></tr>`).join('');
+    `<tr><td class="lv ${LV.has(String(c.level).toUpperCase()) ? String(c.level).toUpperCase() : 'INFO'}">${esc(c.level)}</td><td>${esc(c.name)}</td><td class="hint">期望 ${esc(c.expected)}</td><td class="hint">实际 ${esc(c.actual)}</td></tr>`).join('');
   $('#fleet tbody').innerHTML = (s.machines || []).map((m) => {
     const bd = Number(m.engineBehind || 0);
     const rev = m.engineRev ? `<code>${esc(m.engineRev)}</code>` : '<span class="hint">未上报</span>';
@@ -331,13 +345,13 @@ async function loadLog() {
   }
   const html = [];
   if (rows.length) {
-    html.push('<table><thead><tr><th>时间</th><th>结果</th><th>变更</th><th>耗时</th><th>备注</th></tr></thead><tbody>');
+    html.push('<div class="table-wrap"><table><thead><tr><th>时间</th><th>结果</th><th>变更</th><th>耗时</th><th>备注</th></tr></thead><tbody>');
     for (const r2 of rows.reverse()) {
       const lv = r2.rc === 0 ? 'PASS' : 'FAIL';
       const label = r2.rc === 0 ? '正常' : `rc=${r2.rc} 有问题`;
       html.push(`<tr><td>${r2.time.slice(5)}</td><td class="lv ${lv}">${label}</td><td>${r2.changes}</td><td class="hint">${r2.elapsed}</td><td class="hint">${r2.note || '—'}</td></tr>`);
     }
-    html.push('</tbody></table>');
+    html.push('</tbody></table></div>');
   }
   if (plain.length) {
     html.push('<h3>其它输出</h3><pre class="out">' + plain.slice(-40).join('\n') + '</pre>');
@@ -351,12 +365,27 @@ $('#loadLog').onclick = loadLog;
 $('#logRawToggle').onchange = loadLog;
 $('#logName').onchange = loadLog;
 $('#btnTick').onclick = async () => {
-  $('#btnTick').disabled = true;
-  $('#btnTick').textContent = '同步中…';
+  const btn = $('#btnTick');
+  const msg = $('#tickMsg');
+  btn.disabled = true;
+  btn.textContent = '同步中…';
+  if (msg) { msg.textContent = '正在跑一轮（最多 15 分钟）…'; msg.className = 'hint'; }
   const r = await api('/api/tick');
-  $('#btnTick').disabled = false;
-  $('#btnTick').textContent = '立即同步';
-  if (r.code !== 0) alert('tick 退出码 ' + r.code + '\n' + (r.stdout || r.stderr || '').slice(-800));
+  btn.disabled = false;
+  btn.textContent = '立即同步一次';
+  // 布局优化（2026-09-18 审计）：原先用 alert() 弹退出码与最后 800 字输出 —— 阻塞式弹窗、
+  // 手机上很难看，而且把"结果"与"页面状态"割成两块。改为**就地一行**，颜色 + 文字双编码。
+  if (msg) {
+    if (r.code === 0) {
+      msg.textContent = '完成（rc=0）';
+      msg.className = 'hint ok-t';
+    } else {
+      const tail = String(r.stdout || r.stderr || '').trim().split(/\r?\n/).slice(-3).join(' ⏎ ');
+      msg.textContent = `rc=${r.code}：${tail.slice(0, 200)}`;
+      msg.className = 'hint fail-t';
+    }
+    setTimeout(() => { if (msg) { msg.textContent = ''; msg.className = 'hint'; } }, 120000);
+  }
   loadStatus();
   if (document.querySelector('#tab-logs').classList.contains('active')) loadLog();
 };

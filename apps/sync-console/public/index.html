@@ -12,17 +12,19 @@
   <div class="brand"><span class="glyph" id="glyph">⟳</span> ai-sync 控制台
     <span class="hint">本机文件的自动同步：状态、设置、对齐、记录都在这一页</span></div>
   <div class="head-right">
+    <span id="dataAt" class="hint" title="本页数据是这一刻取的；页面每 60 秒自动刷新一次">…</span>
     <span id="verdict" class="pill">…</span>
     <button id="btnTick" class="ghost">立即同步一次</button>
+    <span id="tickMsg" class="hint"></span>
   </div>
 </header>
 
-<nav>
-  <button class="tab active" data-tab="status">总览</button>
-  <button class="tab" data-tab="wizard">设置</button>
-  <button class="tab" data-tab="settings">适配器</button>
-  <button class="tab" data-tab="align">首次对齐</button>
-  <button class="tab" data-tab="logs">运行记录</button>
+<nav role="tablist" aria-label="控制台分区">
+  <button class="tab active" role="tab" aria-selected="true" data-tab="status">总览</button>
+  <button class="tab" role="tab" aria-selected="false" data-tab="wizard">设置</button>
+  <button class="tab" role="tab" aria-selected="false" data-tab="settings">适配器</button>
+  <button class="tab" role="tab" aria-selected="false" data-tab="align">首次对齐</button>
+  <button class="tab" role="tab" aria-selected="false" data-tab="logs">运行记录</button>
 </nav>
 
 <main>
@@ -32,10 +34,10 @@
     <div class="cards" id="cards"></div>
     <h3>逐项检查</h3>
     <p class="hint">每一行是一项自动检查：<b>PASS</b> 没问题 · <b>WARN</b> 提醒（不影响同步）· <b>FAIL</b> 要处理。出现 FAIL 时先看「实际」那列写的原因。</p>
-    <table id="checks"><tbody></tbody></table>
+    <div class="table-wrap"><table id="checks"><tbody></tbody></table></div>
     <h3>其他机器</h3>
     <p class="hint">每台机器同步完都会把自己的状态推上来：看「最后同步」判断谁掉队了，「引擎」列看谁还在跑旧版本（落后 = 那台机器该更新了）。</p>
-    <table id="fleet"><thead><tr><th>机器</th><th>最后同步</th><th>距今</th><th>结果</th><th>引擎版本</th><th>待办</th></tr></thead><tbody></tbody></table>
+    <div class="table-wrap"><table id="fleet"><thead><tr><th>机器</th><th>最后同步</th><th>距今</th><th>结果</th><th>引擎版本</th><th>待办</th></tr></thead><tbody></tbody></table></div>
     <h3>需要你做的事</h3>
     <p class="hint">自动同步做不了、必须人工处理的（例如某个程序要重启才能读到新配置）。做完就会消失。</p>
     <ul id="actions" class="actions"></ul>
@@ -61,7 +63,7 @@
           <label>同步空间根<input id="mu2Dest" placeholder="例如 ~/BaiduSyncdisk" size="42"></label>
           <button id="browseDest" class="ghost">浏览…</button></div>
         <div id="destCheck" class="check-line"></div>
-        <table id="setsTable"><thead><tr><th>id</th><th>来源（本机目录，可编辑）</th><th>镜像里叫</th><th>预估大小</th><th></th></tr></thead><tbody></tbody></table>
+        <div class="table-wrap"><table id="setsTable"><thead><tr><th>id</th><th>来源（本机目录，可编辑）</th><th>镜像里叫</th><th>预估大小</th><th></th></tr></thead><tbody></tbody></table></div>
         <div class="row"><button id="addSet" class="ghost">+ 加一个</button><button id="saveMachine">保存范围</button><span id="machineMsg" class="hint"></span></div>
         <div id="browseTargetHint" class="hint">（「浏览…」会填到最近点选的那个框：同步空间根，或某一行的来源）</div>
       </li>
@@ -83,7 +85,7 @@
   <!-- 适配器 -->
   <section id="tab-settings" class="panel">
     <p class="hint">「适配器」= 让哪些程序的配置跟着同步自动更新。每一项都可以单独关掉：关掉之后它的目标文件不再被同步系统改动（你已经手工调过的就保持原样）。</p>
-    <table id="adapters"><tbody></tbody></table>
+    <div class="table-wrap"><table id="adapters"><tbody></tbody></table></div>
     <div class="row"><span id="adapterMsg" class="hint"></span></div>
     <h3>当前配置文件（只读）</h3>
     <p class="hint">这是本机同步设置的原样内容，只给你核对用，改请用上面的界面。</p>

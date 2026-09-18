@@ -15,7 +15,7 @@
  *   （托盘/菜单栏的「打开控制台」就是拉起它并打开浏览器）
  */
 import { createServer } from 'node:http';
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, realpathSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, realpathSync, unlinkSync } from 'node:fs';
 import { join, dirname, resolve, extname, basename } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { homedir } from 'node:os';
@@ -106,7 +106,12 @@ async function listDirs(p) {
   }
   const allowed = ALLOWED_ROOTS.some((r) => {
     try {
-      return real.toLowerCase().startsWith(realpathSync(r).toLowerCase());
+      const root = realpathSync(r).replace(/[\\/]+$/, '').toLowerCase();
+      const t = real.toLowerCase();
+      // 审计修复：原写法是 `t.startsWith(root)` —— **缺分隔符**，于是允许根 <家目录>
+      // 会连 <家目录>-evil（同前缀的兄弟目录）一起放行。
+      // 必须要求"相等"或"以 root+分隔符开头"（此处刻意不写具体盘符路径：那会被发布门禁判成个人串）。
+      return t === root || t.startsWith(root + '\\') || t.startsWith(root + '/');
     } catch {
       return false;
     }
@@ -124,17 +129,19 @@ async function listDirs(p) {
   const checks = {
     isGitRepo: existsSync(join(real, '.git')),
     writable: (() => {
+      const probeName = '.ai-sync-write-probe';
+      const probe = join(real, probeName);
       try {
-        const probe = join(real, '.ai-sync-write-probe');
         writeFileSync(probe, '');
-        statSync(probe);
         return true;
       } catch {
         return false;
       } finally {
+        // 审计修复：原实现用 `require('node:fs').unlinkSync(probe)` 删除探针，而本文件是 ESM
+        // ⇒ `require` 未定义 ⇒ 抛错被 catch 吞掉 ⇒ **探针文件永久留在被浏览的目录里**。
+        // 那个目录若在某个仓库内，下一轮 `add -A` 就会把它推给所有机器。
         try {
-          const probe = join(real, '.ai-sync-write-probe');
-          if (existsSync(probe)) writeFileSync(probe, ''), require('node:fs').unlinkSync(probe);
+          if (existsSync(probe)) unlinkSync(probe);
         } catch {}
       }
     })(),
@@ -159,6 +166,25 @@ const server = createServer(async (req, res) => {
   const p = url.pathname;
   if (LAN && TOKEN && url.searchParams.get('token') !== TOKEN && req.headers['x-ai-sync-token'] !== TOKEN) {
     return sendJson(res, 401, { error: 'token 不对' });
+  }
+  // 审计 EN-6（CSRF）：状态变更型路由此前是**裸 GET**（`/api/tick`、`/api/align?apply=1`）
+  // ⇒ 任意网页用一个 <img>/表单/sendBeacon 就能让本机跑一轮同步或执行对齐。
+  // 判据（三层，缺一不可）：① Host 必须本机形态（防 DNS rebinding）
+  //   ② 必须带自定义头 `X-AI-Sync-Console: 1`（跨站**无法**设置自定义头而不触发预检 ⇒ 挡住 CSRF）
+  //   ③ `Sec-Fetch-Site` 不得是 cross-site（现代浏览器会带，缺失时按放行处理：老浏览器没有这个头）
+  {
+    const isWrite =
+      req.method !== 'GET' ||
+      p === '/api/tick' ||
+      (p === '/api/align' && url.searchParams.get('apply') === '1');
+    if (isWrite) {
+      const hostOk = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(String(req.headers.host || ''));
+      const hdrOk = req.headers['x-ai-sync-console'] === '1';
+      const siteOk = String(req.headers['sec-fetch-site'] || '').toLowerCase() !== 'cross-site';
+      if (!hostOk || !hdrOk || !siteOk) {
+        return sendJson(res, 403, { error: '写操作需要本机 Host + 自定义头 X-AI-Sync-Console: 1（防 CSRF）' });
+      }
+    }
   }
   try {
     if (p === '/' || p === '/index.html') {
