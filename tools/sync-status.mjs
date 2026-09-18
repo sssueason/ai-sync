@@ -494,6 +494,25 @@ if (schedule.mirror) {
     else add('daily 日志编码自检', 'WARN', 'ok', `自检=${v}（daily 日志汉字被逐字写两遍，见 sync/logs/daily-*.log 末尾判决行）`);
   }
 }
+/* 文本卫生门禁（2026-09-18）：tick 每轮跑 tools/sync-hygiene.mjs 并落 sync/state/hygiene-<machine>.json；
+   这里把它抬到看得见的地方。分级依据"是否会真的坏"：BOM 缺失/EOL 索引违规/冲突标记/机器本地文件被提交
+   ⇒ FAIL（到 5.1、到 bash、或到别的机器上必然出问题）；门禁本身跑不起来 ⇒ FAIL（不能假装通过）；
+   只是没跑过 ⇒ WARN。 */
+{
+  const f = join(INSTANCE, 'sync', 'state', `hygiene-${machine}.json`);
+  if (!existsSync(f)) add('文本卫生门禁', 'WARN', '有 hygiene-<machine>.json', '还没跑过（下一轮 tick 生成）');
+  else {
+    let h = null;
+    try { h = JSON.parse(readFileSync(f, 'utf8')); } catch { h = null; }
+    if (!h) add('文本卫生门禁', 'FAIL', '可解析状态文件', `解析失败：${f}`);
+    else if (h.broken) add('文本卫生门禁', 'FAIL', '门禁可运行', '门禁未返回结果（工具在但拿不到输出）');
+    else if (h.missing) add('文本卫生门禁', 'FAIL', '门禁可运行', '缺少 tools/sync-hygiene.mjs（本轮未检查）');
+    else if (h.fails > 0) {
+      const top = (h.top || []).slice(0, 2).map((x) => `${x.rule} ${x.repo}/${x.rel}`).join(' | ');
+      add('文本卫生门禁', 'FAIL', 'FAIL=0', `${h.fails} 条 FAIL：${top}（明细 ${f}）`);
+    } else add('文本卫生门禁', 'PASS', 'FAIL=0', `WARN=${h.warns}（${h.at}）`);
+  }
+}
 // 引擎更新提示：落后 ⇒ WARN（不是 FAIL —— 旧代码照样能跑，但不能装作没这回事）
 const eng = engineFacts();
 const inPlaceNote = eng.inPlace ? '（本机为原地布局：这里报的是已安装引擎的版本）' : '';

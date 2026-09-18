@@ -315,6 +315,37 @@ async function main() {
     }
   }
 
+  /* 5b. 文本卫生门禁（只报不改）：BOM / EOL（**索引口径**）/ 冲突标记 / 机器本地文件被提交。
+     结果落 sync/state/hygiene-<machine>.json 供 sync-status 断言与人工查看。
+     **故意不改 tick 的 rc**：卫生问题是"仓库内容有缺陷"，不是"这轮同步没跑成"；混进 rc 会让
+     每轮 tick 都报红 —— 而假红的代价比没信号更大（本轮实测教训：假红一多，人就开始忽略所有红）。 */
+  let hygiene = null;
+  if (!DRY) {
+    const hygieneTool = join(ENGINE, 'tools', 'sync-hygiene.mjs');
+    const repoPaths = [...(mc.mu1 || []).filter((r) => r.repo).map((r) => expand(r.path)), ENGINE]
+      .filter((p, i, a) => p && existsSync(join(p, '.git')) && a.indexOf(p) === i);
+    if (existsSync(hygieneTool) && repoPaths.length) {
+      const args = [hygieneTool, '--json', '--max-detail', '20'];
+      for (const p of repoPaths) args.push('--repo', p);
+      const r = spawnSync(process.execPath, args, { encoding: 'utf8', windowsHide: true, timeout: 120 * 1000, maxBuffer: 32 * 1024 * 1024 });
+      try {
+        const j = JSON.parse(String(r.stdout || '').trim());
+        hygiene = { fails: j.fails, warns: j.warns, top: (j.findings || []).filter((f) => f.sev !== 'INFO').slice(0, 20) };
+      } catch {
+        hygiene = { broken: true };   // 工具在但拿不到结果 ⇒ 留痕，不当成"没问题"
+      }
+    } else {
+      hygiene = { missing: true };    // 缺工具 = 必须看得见的降级（否则新装机器上永远没这一项）
+    }
+    if (hygiene) {
+      try {
+        mkdirSync(join(INSTANCE, 'sync', 'state'), { recursive: true });
+        writeFileSync(join(INSTANCE, 'sync', 'state', `hygiene-${machine}.json`),
+          JSON.stringify({ at: stamp(), rc: hygiene.broken ? 99 : hygiene.missing ? 98 : (hygiene.fails ? 2 : 0), ...hygiene }, null, 2) + '\n', 'utf8');
+      } catch (e) { issues.push(`写卫生状态失败：${e.message}`); }
+    }
+  }
+
   /* 6. 日志（格式与既有 tick 一致：一行摘要 + 渲染器末行 + 可选 conv 摘要） */
   const elapsed = Math.round((Date.now() - t0) / 1000);
   // 日志行可读性（2026-09-17 用户反馈"日志可读性太差"）：三个渲染器各吐一句 `render done: 0 target(s) written`
@@ -344,6 +375,11 @@ async function main() {
     if (pruned.truncated) bits.push(`日志截断 ${pruned.truncated}`);
     line += ` | 清理：${bits.join(' + ')}（-${pruned.freed || pruned.freedKB + ' KB'}）`;
   }
+  // 卫生门禁的结果也必须进日志行（否则"没检查"和"检查通过"在日志里长得一模一样）
+  if (hygiene?.broken) line += ' | 卫生：门禁未返回结果（本轮未检查）';
+  else if (hygiene?.missing) line += ' | 卫生：缺少 tools/sync-hygiene.mjs（本轮未检查）';
+  else if (hygiene && hygiene.fails) line += ` | 卫生：FAIL=${hygiene.fails} WARN=${hygiene.warns}（明细见 sync/state/hygiene-${machine}.json）`;
+  else if (hygiene) line += ` | 卫生：通过${hygiene.warns ? `（WARN=${hygiene.warns}）` : ''}`;
   if (!DRY) {
     try {
       const dir = join(INSTANCE, 'sync', 'logs');
