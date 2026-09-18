@@ -54,6 +54,15 @@ const TOKEN = val('--token', cfg.console?.token ?? '');
 const LAN = BIND !== '127.0.0.1' && BIND !== 'localhost';
 const expandHome = (p) => (!p ? p : p === '~' ? homedir() : String(p).startsWith('~/') ? join(homedir(), String(p).slice(2)) : p);
 
+// 审计 EN-5：原判据是 `if (LAN && TOKEN && ...)` —— 当**非本机绑定且没设 token** 时整个条件短路为假，
+// 于是鉴权整体失效（远程可无鉴权访问 /api/status、/api/tick 等）。docs/OPERATIONS.md:64 本来就写着
+// "必须设 token"，所以这里改为 **fail-closed**：配置矛盾时拒绝启动，而不是静默放行。
+if (LAN && !TOKEN) {
+  console.error(`[FAIL] 绑定 ${BIND} 且未设 token → 拒绝启动（否则远程可无鉴权调用 /api/* 与 /api/tick）。`);
+  console.error('       修：instance.json 的 console.token 设一个随机串；或把 console.bind 改回 127.0.0.1。');
+  process.exit(2);
+}
+
 if (has('--stop')) {
   // 停止：读 pid 文件（由本进程写入），SIGTERM 掉
   const pf = join(INSTANCE, 'sync', 'state', '.console.pid');

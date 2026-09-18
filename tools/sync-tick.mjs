@@ -23,6 +23,7 @@ import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir, hostname } from 'node:os';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { assessWorktree, loadRules } from './lib/commit-guard.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const argv = process.argv.slice(2);
@@ -61,6 +62,12 @@ const machine =
   (existsSync(join(INSTANCE, 'sync', 'local.machine')) ? readFileSync(join(INSTANCE, 'sync', 'local.machine'), 'utf8').trim() : hostname().toLowerCase());
 const mc = loadJson(join(INSTANCE, 'sync', 'machines', `${machine}.json`), {}) || {};
 const expand = (p) => (!p ? p : p.startsWith('~/') ? join(homedir(), p.slice(2)) : p);
+
+/* 提交前守卫的规则清单 —— **单一源**：node（本文件）/ PowerShell（sync/_load.ps1）/ bash
+ * （sync/mac/mac-sync.sh）三方读同一份 `sync/commit-guard.rules`；文件缺失时用内置兜底规则。
+ * 审计 PR-4 / X-5：原先这份"机器本地文件"清单在 .gitignore、R4 正则、各脚本里各写一份，必然漂移。 */
+const guardRulesFile = join(INSTANCE, 'sync', 'commit-guard.rules');
+const { rules: guardRules, source: guardRulesSource } = loadRules(guardRulesFile);
 
 const issues = [];
 const notes = [];
@@ -170,15 +177,38 @@ async function main() {
     const dirty = git(path, ['status', '--porcelain']);
     if (typeof dirty === 'string' && dirty) {
       git(path, ['add', '-A']);
-      // 显式带身份：新机器上常常没配 user.name/user.email ⇒ 默认提交会以
-      // `fatal: unable to auto-detect email address` 失败（2026-09-17 TR6 实测：机器生成的提交不该依赖用户先配 git 身份）。
-      const c = git(path, ['-c', `user.name=${machine}`, '-c', `user.email=${machine}@local`, 'commit', '-q', '-m', `sync: ${machine} ${stamp()}`]);
-      if (typeof c === 'object') {
-        issues.push(`${r.id}: commit 失败`);
-        say(`[FAIL] ${r.id}: commit 失败`);
+      // ---- 提交前守卫（审计 EN-8 / EN-16 / PR-4 / X-2）：判据只看**内容与状态**，不看退出码 ----
+      // 顺序：先 add -A（守卫才能把机器本地文件移出暂存区）→ 守卫 → 暂存区非空才提交。
+      // 拦的是三类真事故：① 未合并（autostash 回填撞冲突时 git 返回 0！）② rebase 停在半途
+      // ③ 工作区残留冲突标记（vault d404365：标记被 add -A 提交，13 小时后才人工清除）。
+      const g = assessWorktree(path, { rules: guardRules, apply: true });
+      for (const n of g.notes) say(`[GUARD] ${r.id}: ${n}`);
+      if (g.needsGitRm.length) {
+        issues.push(`${r.id}: 机器本地文件已被跟踪（只 unstage 治不了本，下一轮还会出现）→ 应 git rm --cached + 写 .gitignore：${g.needsGitRm.join(', ')}`);
+      }
+      if (!g.ok) {
+        for (const f of g.refuse) {
+          say(`[REFUSE] ${r.id}: ${f.code} — ${f.detail}${f.paths && f.paths.length ? ' :: ' + f.paths.join(', ') : ''}`);
+          issues.push(`${r.id}: 拒绝提交（${f.code}）`);
+        }
+        say(`[SKIP] ${r.id}: 工作区需要人工处理（未合并 / rebase 中 / 冲突标记）→ 本轮不动该仓 git`);
+        continue;
+      }
+      const stagedFiles = git(path, ['diff', '--cached', '--name-only']);
+      if (typeof stagedFiles === 'string' && stagedFiles.trim()) {
+        // 显式带身份：新机器上常常没配 user.name/user.email ⇒ 默认提交会以
+        // `fatal: unable to auto-detect email address` 失败（2026-09-17 TR6 实测：机器生成的提交不该依赖用户先配 git 身份）。
+        const c = git(path, ['-c', `user.name=${machine}`, '-c', `user.email=${machine}@local`, 'commit', '-q', '-m', `sync: ${machine} ${stamp()}`]);
+        if (typeof c === 'object') {
+          issues.push(`${r.id}: commit 失败`);
+          say(`[FAIL] ${r.id}: commit 失败`);
+        } else {
+          stats.committed++;
+          stats.stagedFiles = (stats.stagedFiles || 0) + stagedFiles.trim().split('\n').filter(Boolean).length;
+          say(`[OK] ${r.id}: commit（${stagedFiles.trim().split('\n').filter(Boolean).length} 个文件）`);
+        }
       } else {
-        stats.committed++;
-        say(`[OK] ${r.id}: commit（${dirty.split('\n').filter(Boolean).length} 个文件）`);
+        say(`[--] ${r.id}: 暂存区为空（只剩机器本地文件，已移出）→ 不提交`);
       }
     }
     git(path, ['fetch', '-q', 'origin']);
@@ -187,7 +217,21 @@ async function main() {
       issues.push(`${r.id}: 取分支名失败`);
       continue;
     }
-    const behind = Number(git(path, ['rev-list', '--count', `HEAD..origin/${br}`]) || 0);
+    // 审计 EN-10：detached HEAD 时 br 是字符串 'HEAD'，`HEAD..origin/HEAD` 多半不存在。
+    if (br === 'HEAD') {
+      issues.push(`${r.id}: detached HEAD（rebase 停在半途？）→ 不整合、不 push，需人工处理`);
+      say(`[SKIP] ${r.id}: detached HEAD → 本轮不动该仓 git`);
+      continue;
+    }
+    // 审计 EN-10：git() 失败返回**对象**，`Number(对象)` = NaN，而 `NaN > 0` 恒假
+    // ⇒ 旧代码会静默跳过整合、直接去 push，然后非快进失败（原因埋在最后两行输出里）。
+    const behindNum = Number(git(path, ['rev-list', '--count', `HEAD..origin/${br}`]));
+    if (!Number.isFinite(behindNum)) {
+      issues.push(`${r.id}: 无法判定落后提交数（rev-list 失败：${br} vs origin/${br}）`);
+      say(`[FAIL] ${r.id}: 无法判定落后提交数 → 跳过本轮 push（不盲推）`);
+      continue;
+    }
+    const behind = behindNum;
     if (behind > 0) {
       say(`[INT] ${r.id}: 远端已有 ${behind} 个新提交 → 自动 pull --rebase 整合`);
       const pull = git(path, ['pull', '--rebase']);
@@ -325,7 +369,13 @@ async function main() {
     const repoPaths = [...(mc.mu1 || []).filter((r) => r.repo).map((r) => expand(r.path)), ENGINE]
       .filter((p, i, a) => p && existsSync(join(p, '.git')) && a.indexOf(p) === i);
     if (existsSync(hygieneTool) && repoPaths.length) {
+      // 凭据模式属**实例策略**（与 sync/commit-guard.rules 同类），故从 INSTANCE 读、不从 ENGINE 读
+      //（ENGINE 是公开引擎的克隆，刻意不含模式字面量 —— 否则会被发布门禁的"疑似凭据"规则命中）。
+      const personalPatterns = join(INSTANCE, 'tools', 'secret-patterns.json');
       const args = [hygieneTool, '--json', '--max-detail', '20'];
+      // 审计 XD-2：R5（个人串/凭据）此前只在发布公开仓那一刻跑过一次，**两个私有仓从没被扫过**。
+      if (existsSync(personalPatterns)) args.push('--personal-patterns', personalPatterns);
+      else notes.push('缺少 instance/tools/secret-patterns.json ⇒ 本轮不做个人串/凭据扫描');
       for (const p of repoPaths) args.push('--repo', p);
       const r = spawnSync(process.execPath, args, { encoding: 'utf8', windowsHide: true, timeout: 120 * 1000, maxBuffer: 32 * 1024 * 1024 });
       try {
@@ -426,7 +476,7 @@ async function main() {
     let triCfg = null
     try { triCfg = JSON.parse(readFileSync(join(INSTANCE, 'sync', 'instance.json'), 'utf8')).triage || {} } catch { triCfg = {} }
     const conds = !!(bundle?.out || (hygiene && hygiene.fails) || (migrate && migrate.failed) || (applied && applied.failed))
-    if (triCfg.enabled !== false && conds) {
+    if (triCfg.enabled === true && conds) {
       const tri = join(ENGINE, 'tools', 'sync-triage.mjs')
       if (existsSync(tri)) {
         const r = spawnSync(process.execPath, [tri, '--instance', INSTANCE, '--json'],
