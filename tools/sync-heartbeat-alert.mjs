@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * sync-heartbeat-alert —— 跨机心跳告警（补 Windows 侧；mac 侧原本只有 osascript 一条）
+ * sync-heartbeat-alert —— 跨机心跳告警（补 Windows 侧；对端 侧原本只有 osascript 一条）
  *
  * 为什么需要（审计 XD-5 / §8.2）：`sync/state/tick-<machine>.json` 是**自报**快照，且只由各机的
  * daily（1–2 次/天）写入 ⇒ 光看它无法区分三种完全不同的状态：
@@ -41,7 +41,7 @@ const DRY = has('--dry-run');
 // ★ 阈值必须**从配置推导**，不能硬编码：`sync/state/README.md` 写的是"20 分钟（4× 5 分钟间隔）"，
 // 但 instance.json 的 tick.intervalMinutes 现在是 20 ⇒ 4× 规则应为 80 分钟。硬编码 20 会把
 // "漏跑一轮"误报成"停了"（假红一多，人就开始忽略所有红 —— 项目自述的教训）。
-// 本机 2026-09-18 实测：campus 34 分钟未 tick，按 4×20=80 就不该报。
+// 本机 2026-09-18 实测：对端 34 分钟未 tick，按 4×20=80 就不该报。
 function readIntervalMinutes() {
   try {
     const j = JSON.parse(readFileSync(join(INSTANCE, 'sync', 'instance.json'), 'utf8'));
@@ -79,7 +79,32 @@ const alerts = [];
 const infos = [];
 
 /* ---------- 本机：看本地 tick 日志（新鲜、每轮都写） ---------- */
+// ★ 2026-09-18（对端反馈）：维护/冻结与"停摆"在证据上**同形** —— 我在 本机 做维护冻结期间，
+//   对端 与 对端 各收到一条"本机 tick 疑似已停"，对端 的 daily 还被顶成 rc=10。
+//   所以本机侧先看**冻结标记**：`sync/state/.freeze-<machine>`（人在维护前放下）或活着的 `.sync.lock`
+//   （同步正在跑/被有意持有）⇒ 记 INFO「维护冻结（预期）」，**不**报 ALERT。
+function freezeReason() {
+  const marker = join(STATE, `.freeze-${machine}`);
+  if (existsSync(marker)) {
+    let why = '';
+    try { why = readFileSync(marker, 'utf8').trim().split(/\r?\n/)[0] || ''; } catch {}
+    return `本机维护冻结标记存在（${marker}）${why ? '：' + why : ''}`;
+  }
+  const lock = join(STATE, '.sync.lock');
+  if (existsSync(lock)) {
+    try {
+      const j = JSON.parse(readFileSync(lock, 'utf8'));
+      const ageMin = j?.at ? ageMinFrom(j.at) : null;
+      if (j?.pid && ageMin !== null && ageMin < 30) return `同步锁被持有（pid=${j.pid}，${Math.round(ageMin)} 分钟）⇒ 视为进行中/有意持有`;
+    } catch {}
+  }
+  return '';
+}
+function ageMinFrom(ts) { const t = parseTs(ts); return t === null ? null : ageMin(t); }
+
 function checkSelf() {
+  const frozen = freezeReason();
+  if (frozen) { infos.push(`本机：${frozen} ⇒ 跳过 tick 判活（维护中的停摆是预期的）`); return; }
   const cands = [join(LOGS, `tick-${machine}.log`)];
   const today = new Date();
   const ymd = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, '0')}${String(today.getDate()).padStart(2, '0')}`;
@@ -124,10 +149,11 @@ function checkPeers() {
       continue; // 快照过期时不再对 tick 下结论（避免误报）
     }
     if (tAgeMin !== null && tAgeMin > STALE_MIN && wAgeH <= SNAP_FRESH_H) {
-      alerts.push({ key: `${who}-tick-stale`, who, what: `${who} 的 tick 最后一次是 ${Math.round(tAgeMin)} 分钟前（阈值 ${STALE_MIN} = 4×${TICK_INTERVAL_MIN}）且快照新鲜（${wAgeH.toFixed(1)}h）→ 该机 tick 大概率已停`, ageMin: Math.round(tAgeMin) });
+      // ★ 措辞软化（对端反馈）：对端停摆也可能是**它在做维护冻结** —— 断言"大概率已停"会让对端白跑一趟。
+      alerts.push({ key: `${who}-tick-stale`, who, peer: true, what: `${who} 的 tick 最后一次是 ${Math.round(tAgeMin)} 分钟前（阈值 ${STALE_MIN} = 4×${TICK_INTERVAL_MIN}）且快照新鲜（${wAgeH.toFixed(1)}h）→ 该机 tick 疑似已停**或正在维护**（请到那台机器确认）`, ageMin: Math.round(tAgeMin) });
     }
     if (hAgeH !== null && hAgeH > HEAVY_STALE_H) {
-      alerts.push({ key: `${who}-heavy-stale`, who, what: `${who} 的重活已 ${hAgeH.toFixed(1)}h 未跑（阈值 ${HEAVY_STALE_H}h）`, ageHours: Number(hAgeH.toFixed(1)) });
+      alerts.push({ key: `${who}-heavy-stale`, who, peer: true, what: `${who} 的重活已 ${hAgeH.toFixed(1)}h 未跑（阈值 ${HEAVY_STALE_H}h）`, ageHours: Number(hAgeH.toFixed(1)) });
     }
     // ★ 措辞必须如实：快照不够新鲜时**不能**说"正常"，只能说"只能确认它最后一次 tick 在何时"
     if (!alerts.some((a) => a.who === who)) {
@@ -190,4 +216,11 @@ if (alerts.length > 0 && !DRY && !has('--no-notify') && (changed || reNotify)) {
   notify('同步心跳告警', alerts.map((a) => a.what).join('；'));
   say(`[notify] 已弹通知（${changed ? '状态变化' : '距上次 >' + RENOTIFY_H + 'h'}）：${alerts.map((a) => a.who).join(',')}`);
 }
-if (alerts.length > 0 && has('--rc')) process.exitCode = 1;
+// ★ rc 语义（对端反馈）：**只有本机自己的异常才该让本机 rc 变红**。对端停摆/在维护是"信息"——
+//   它会弹通知、会进日志行，但不该把本机的 daily 顶成 rc=10（实测：本机做维护冻结时，对端的 daily
+//   被这条对端告警顶红过一次）。
+if (has('--rc')) {
+  const selfAlerts = alerts.filter((a) => a.who === machine && !a.peer);
+  if (selfAlerts.length) process.exitCode = 1;
+  else if (alerts.length) say(`[info] 有 ${alerts.length} 条**对端**告警 → 不计入本机 rc（避免把别人的维护/停摆算成本机故障）`);
+}
