@@ -20,6 +20,8 @@
   "_cloudMirror": "云盘镜像（µ2）节拍：默认每天 22:00；也可写成 {\"mode\":\"interval\",\"intervalMinutes\":60}。enabled=false = 纯 git 同步",
   "cloudMirror": { "enabled": true, "schedule": { "mode": "dailyAt", "times": ["22:00"] } },
 
+  "_triage": "免费模型只读分诊（可选，默认关）：条件命中时把诊断包的事实摘要交给模型，它只在固定枚举里选类别、在固定清单里选一条建议，**不执行任何动作**。注意：事实摘要（断言/状态/日志尾/git 状态，可能含路径与机器名）会发给你配置的模型服务；不接受就保持 enabled=false。模型不可用/超时/解析失败一律降级，不影响同步。",
+  "triage": { "enabled": false, "model": "<你的模型 id>", "minIntervalMinutes": 60 },
   "_auth": "凭据来源：auto = Windows 凭据管理器 / macOS 钥匙串 / 回退 0600 文件；file = 指定文件；env = 环境变量",
   "auth": { "mode": "auto", "file": "~/.config/ai-sync/credentials" }
 }

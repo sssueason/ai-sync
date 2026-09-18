@@ -60,6 +60,8 @@
 1. 控制台「总览」里有没有 `FAIL` 行 —— 大部分问题那里直接写了原因。
 2. 控制台「运行记录」最后一行的备注（失败时里面有诊断）。
 3. 还不行：[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)。
+4. 已经有 `FAIL` 想弄清"为什么"：看 `sync/reports/ops-bundle-*.md`（诊断包）；机制见 [`docs/DIAGNOSTICS.md`](docs/DIAGNOSTICS.md)。
+5. "补丁发了但没生效"：看 [`docs/APPLY.md`](docs/APPLY.md) 与 [`docs/MIGRATIONS.md`](docs/MIGRATIONS.md)。
 
 命令行体检（排查时用，平时不需要）：
 
@@ -79,6 +81,8 @@ node tools/sync-status.mjs     # 状态总览（= 控制台「总览」页的内
 | **对齐** | 首次让本机与云端仓库、同步空间对上；之后由自动同步维持 |
 | **同步空间 / 镜像** | 云盘里那份只读副本（可选功能，本文档有时叫它 µ2） |
 | **µ1** | 走 git 的那部分同步（共享源 + 配置） |
+| **迁移 / 应用** | 迁移 = 每端各跑一次的"改本机状态"动作（幂等、可重入）；应用 = 拉下来之后要重编 / 重注册的那类动作 |
+| **诊断包** | 出事时自动生成的一份"判定所依据的全部事实"，可离线阅读 |
 
 ## 它解决什么问题
 
@@ -100,6 +104,11 @@ node tools/sync-status.mjs     # 状态总览（= 控制台「总览」页的内
   tools/sync-schedule.mjs    配置里的节拍 → 平台调度（改了配置自动重排）
   tools/sync-align.mjs       首次对齐（先看后做）
   tools/sync-doctor.mjs      体检
+  tools/sync-hygiene.mjs     文本卫生门禁（BOM/EOL/冲突标记/机器本地文件被提交）
+  tools/sync-migrate.mjs     一次性迁移（每端各跑一次的动作，幂等）
+  tools/sync-apply.mjs       幂等应用（调度对账 / 需要重编的产物）
+  tools/sync-ops-bundle.mjs  诊断包（出事有档案）
+  tools/sync-triage.mjs      只读分诊（可选：免费模型给建议，不执行）
   adapters/{producers,owners}/*.json   声明式接入任意程序
   apps/sync-tray/            托盘 / 菜单栏图标
   apps/sync-console/         本地控制台（就是上面那个网页）
@@ -109,6 +118,8 @@ node tools/sync-status.mjs     # 状态总览（= 控制台「总览」页的内
   sync/instance.json         节拍、控制台、适配器开关
   sync/machines/<机器>.json  本机路径与集合（唯一的绝对路径来源）
   sync/local.machine         本机标识（不进 git）
+  sync/apply-spec.json       幂等应用规格（哪些动作需要"拉下来后真的生效"）
+  sync/migrations/           一次性迁移（每端各跑一次的动作）
 
 平台调度
   Windows 计划任务 ai-sync-tick（每 N 分钟）+ ai-sync-mirror（每晚镜像）
