@@ -23,7 +23,7 @@ import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir, hostname } from 'node:os';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { assessWorktree, loadRules } from './lib/commit-guard.mjs';
+import { assessWorktree, loadRules, loadProtected } from './lib/commit-guard.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const argv = process.argv.slice(2);
@@ -68,6 +68,17 @@ const expand = (p) => (!p ? p : p.startsWith('~/') ? join(homedir(), p.slice(2))
  * 审计 PR-4 / X-5：原先这份"机器本地文件"清单在 .gitignore、R4 正则、各脚本里各写一份，必然漂移。 */
 const guardRulesFile = join(INSTANCE, 'sync', 'commit-guard.rules');
 const { rules: guardRules, source: guardRulesSource } = loadRules(guardRulesFile);
+
+/* 代码面清单（治理门，用户裁决 2026-09-18 / 审计 EN-1）：**只有 home 机器能提交代码**，
+ * 其余机器只允许落地共享文件修改。命中路径会被**移出暂存区**（不阻塞其余文件），并打 `[REVIEW]`。
+ * home 机器名从**实例配置**读（`sync/instance.json` 的 `governance.homeMachine`）——
+ * **绝不硬编码**：本文件会随公开引擎发布，硬编码真实机器名会被发布门禁的"个人串"规则命中（实测被拦过）。
+ * 未配置 ⇒ **不启用**该门（公开引擎用户没有 home 概念），并记一条 NOTE。 */
+const guardProtectedFile = join(INSTANCE, 'sync', 'protected-paths.rules');
+const { rules: guardProtected } = loadProtected(guardProtectedFile);
+const HOME_MACHINE = (() => {
+  try { return String(JSON.parse(readFileSync(join(INSTANCE, 'sync', 'instance.json'), 'utf8'))?.governance?.homeMachine || ''); } catch { return ''; }
+})();
 
 const issues = [];
 const notes = [];
@@ -181,7 +192,13 @@ async function main() {
       // 顺序：先 add -A（守卫才能把机器本地文件移出暂存区）→ 守卫 → 暂存区非空才提交。
       // 拦的是三类真事故：① 未合并（autostash 回填撞冲突时 git 返回 0！）② rebase 停在半途
       // ③ 工作区残留冲突标记（vault d404365：标记被 add -A 提交，13 小时后才人工清除）。
-      const g = assessWorktree(path, { rules: guardRules, apply: true });
+      const g = assessWorktree(path, {
+        rules: guardRules,
+        protected: HOME_MACHINE ? guardProtected : [],
+        machine,
+        homeMachine: HOME_MACHINE,
+        apply: true,
+      });
       for (const n of g.notes) say(`[GUARD] ${r.id}: ${n}`);
       if (g.needsGitRm.length) {
         issues.push(`${r.id}: 机器本地文件已被跟踪（只 unstage 治不了本，下一轮还会出现）→ 应 git rm --cached + 写 .gitignore：${g.needsGitRm.join(', ')}`);
@@ -541,6 +558,29 @@ async function main() {
   else if (triage?.skipped) line += ` | 分诊：跳过（${triage.why}）`;
   else if (triage?.verdict) line += ` | 分诊：${triage.verdict.class} → ${triage.verdict.remedy}（${triage.verdict.confidence}）`;
   else if (triage && triage.ok === false) line += ` | 分诊：不可用（${triage.why || triage.parse || '未知'}）`;
+
+  /* 5g. 跨机心跳告警（审计 XD-5）。Windows 侧原先**没有任何告警通道**（mac 侧只有一条 osascript）；
+     本机用**本地 tick 日志**判活（每轮都新），对端用**已提交快照**，并把三态分开：
+     ① tick 真停了 ② 该机 daily 没跑（快照过期，不敢下结论）③ 重活未跑。
+     阈值从 instance.json 的 tick.intervalMinutes 推导（4×），不硬编码。
+     通知按状态去重、最多 6h 重弹 ⇒ 不刷屏；**不计入 tick 的 rc**（心跳告警不是"这轮同步没跑成"，
+     混进去就是每 20 分钟一次假红 —— 要进 rc 的场景是 daily，那边加 --rc）。 */
+  let hb = null;
+  {
+    const hbTool = join(ENGINE, 'tools', 'sync-heartbeat-alert.mjs');
+    if (existsSync(hbTool)) {
+      const hbArgs = [hbTool, '--instance', INSTANCE, '--json', '--quiet'];
+      if (DRY) hbArgs.push('--dry-run'); // dry-run 时不要写去重状态、也不要弹通知
+      const r = spawnSync(process.execPath, hbArgs, { encoding: 'utf8', windowsHide: true, timeout: 60 * 1000, maxBuffer: 8 * 1024 * 1024 });
+      try { hb = JSON.parse(String(r.stdout || '').trim()); } catch { hb = { broken: true }; }
+      if (hb?.broken) line += ' | 心跳：检查器未返回结果';
+      else if (hb?.alerts?.length) line += ` | 心跳告警 ${hb.alerts.length} 条：${hb.alerts.map((a) => a.key).join(', ')}`;
+      else line += ' | 心跳：正常';
+    } else {
+      notes.push('缺少 tools/sync-heartbeat-alert.mjs ⇒ 本轮跳过心跳告警检查');
+    }
+  }
+
   if (!DRY) {
     try {
       const dir = join(INSTANCE, 'sync', 'logs');

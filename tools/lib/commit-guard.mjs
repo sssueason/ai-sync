@@ -16,7 +16,7 @@
  *   node tools/lib/commit-guard.mjs --repo <dir> [--rules <file>] [--apply] [--json]
  *   node tools/lib/commit-guard.mjs --selftest
  */
-import { readFileSync, existsSync, statSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, existsSync, statSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -65,6 +65,22 @@ export function loadRules(file) {
     out.push({ glob: g, why: rest.join('#').trim() || '机器本地/产物类路径' });
   }
   return out.length ? { rules: out, source: file } : { rules: BUILTIN_RULES, source: 'builtin(空文件)' };
+}
+
+/** 代码面清单（保护路径，见 sync/protected-paths.rules）。与 loadRules 的关键区别：
+ *  **缺失时返回空**（= 不启用该门）—— "代码提交权归 home" 是实例策略；公开引擎用户没有 home 概念，
+ *  不该被误启用（缺失即静默跳过，但调用方会记 NOTE）。 */
+export function loadProtected(file) {
+  if (!file || !existsSync(file)) return { rules: [], source: 'none' };
+  const out = [];
+  for (const raw of readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const [glob, ...rest] = line.split('#');
+    const g = glob.trim();
+    if (g) out.push({ glob: g, why: rest.join('#').trim() || '代码面（需 home 审核）' });
+  }
+  return { rules: out, source: file };
 }
 
 const globToRe = (g) => {
@@ -141,7 +157,7 @@ function scanMarkers(repo, rels) {
  * 评估一个仓库是否可以提交。
  * @returns {{ok:boolean,repo:string,refuse:Array,unstaged:Array,staged:Array,markers:Array,notes:Array}}
  */
-export function assessWorktree(repo, { rules = BUILTIN_RULES, apply = false } = {}) {
+export function assessWorktree(repo, { rules = BUILTIN_RULES, apply = false, protected: protectedRules = [], machine = '', homeMachine = '' } = {}) {
   const isLocal = makeMatcher(rules);
   const refuse = [];
   const notes = [];
@@ -173,12 +189,45 @@ export function assessWorktree(repo, { rules = BUILTIN_RULES, apply = false } = 
 
   // 判据 3：将被提交的文件里有冲突标记
   const markers = scanMarkers(repo, rels);
+  const unstagedOnRefuse = [];
   if (markers.length) {
     refuse.push({
       code: 'conflict-markers',
       detail: `${markers.length} 个文件含行首冲突标记（提交即把标记写进版本库，vault d404365 事故形态）`,
       paths: markers.map((m) => `${m.rel}:${m.line}`).slice(0, 10),
+      restore: '还原用 `git checkout HEAD -- <file>` —— `git checkout -- <file>` 会从**索引**取到含标记的版本（mac 侧 2026-09-18 实测踩到）',
     });
+    // F2（mac 侧反馈）：拒绝时若把带标记的文件留在**暂存区**，人工用 `git checkout -- <file>` 还原会
+    // 从索引取回含标记的版本 ⇒ 看着还原了其实没有。这里把它们移出暂存区（等于回到 add -A 之前）。
+    // 只在**没有未合并条目**时做：unmerged 状态下 `git reset -- <path>` 会把冲突决议成 HEAD，是破坏性的。
+    if (apply && unmerged.length === 0) {
+      for (const m of markers) { if (git(repo, ['reset', '-q', '--', m.rel]).ok) unstagedOnRefuse.push(m.rel); }
+    }
+  }
+
+  // 判据 5（治理，用户裁决 2026-09-18 → 审计 EN-1）：**代码面提交权归 home**。
+  // 非 home 机器提交时把代码路径**移出暂存区**（其余文件照常提交 ⇒ 不阻塞日常同步），并回报 `[REVIEW]`；
+  // home 提交则只记 NOTE（可审计）。真正的强制在平台侧（对端只读凭据），这里是第二道。
+  let codeReviewPaths = [];
+  if (protectedRules.length) {
+    const stagedList = git(repo, ['diff', '--cached', '--name-only']);
+    const stagedPaths = stagedList.ok ? stagedList.out.split(/\r?\n/).filter(Boolean) : [];
+    if (!machine || !homeMachine) {
+      // 机器标识或 home 未配 ⇒ **不启用该门**（公开引擎用户没有 home 概念；硬编码真机名会被发布门禁拦）。
+      // 注意：宁可不启用也不能"把 home 当对端"——那会让 home 自己也提交不了代码，等于自锁。
+      notes.push('[REVIEW] 未启用代码路径审核门（缺 machine 或 homeMachine；由 instance.json 的 governance.homeMachine 提供）');
+    } else if (machine !== homeMachine) {
+      const isProtected = makeMatcher(protectedRules);
+      codeReviewPaths = stagedPaths.filter((p) => isProtected(p));
+      if (codeReviewPaths.length) {
+        if (apply) for (const p of codeReviewPaths) git(repo, ['reset', '-q', '--', p]);
+        notes.push(`[REVIEW] 代码路径已移出暂存区（本机 ${machine} 无提交权，需 ${homeMachine} 审核后落）：${codeReviewPaths.slice(0, 8).join(', ')}${codeReviewPaths.length > 8 ? ' …' : ''}`);
+      }
+    } else {
+      const isProtected = makeMatcher(protectedRules);
+      const hits = stagedPaths.filter((p) => isProtected(p));
+      if (hits.length) notes.push(`[REVIEW] home 正在提交代码路径 ${hits.length} 个（可审计）：${hits.slice(0, 8).join(', ')}${hits.length > 8 ? ' …' : ''}`);
+    }
   }
 
   // 判据 4：机器本地文件 —— 不拒绝提交，但**移出暂存区**（否则本机路径推给对端）。
@@ -201,7 +250,7 @@ export function assessWorktree(repo, { rules = BUILTIN_RULES, apply = false } = 
     }
   }
 
-  return { ok: refuse.length === 0, repo, refuse, machineLocal, needsGitRm, markers, notes, localHits: localHits.length };
+  return { ok: refuse.length === 0, repo, refuse, machineLocal, needsGitRm, markers, notes, unstagedOnRefuse, codeReviewPaths, localHits: localHits.length };
 }
 
 /* ---------------------------------------------------------------- CLI */
@@ -215,12 +264,20 @@ function main() {
 
   const repo = resolve(val('--repo') || '.');
   const rulesFile = val('--rules', null);
+  const protFile = val('--protected', null);
+  const machine = val('--machine', process.env.DSH_MACHINE || '');
+  const homeMachine = val('--home-machine', '');
   const { rules, source } = loadRules(rulesFile);
-  const r = assessWorktree(repo, { rules, apply: has('--apply') });
+  const { rules: protRules, source: protSource } = loadProtected(protFile);
+  const r = assessWorktree(repo, { rules, apply: has('--apply'), protected: protRules, machine, homeMachine });
   if (has('--json')) {
-    console.log(JSON.stringify({ ...r, rulesSource: source, rulesCount: rules.length }, null, 2));
+    console.log(JSON.stringify({ ...r, rulesSource: source, rulesCount: rules.length, protectedSource: protSource, protectedCount: protRules.length, machine, homeMachine }, null, 2));
   } else {
-    if (!r.ok) for (const f of r.refuse) console.log(`[REFUSE] ${f.code}: ${f.detail}${f.paths ? ' :: ' + f.paths.join(', ') : ''}`);
+    if (!r.ok) for (const f of r.refuse) {
+      console.log(`[REFUSE] ${f.code}: ${f.detail}${f.paths ? ' :: ' + f.paths.join(', ') : ''}`);
+      if (f.restore) console.log(`         ${f.restore}`);
+    }
+    for (const p of r.unstagedOnRefuse || []) console.log(`[UNSTAGED] ${p}（已移出暂存区；工作区文件保持不变 = 回到 add -A 之前）`);
     for (const n of r.notes) console.log(`[NOTE] ${n}`);
     if (r.ok) console.log('[OK] 工作区可提交');
   }
@@ -235,6 +292,10 @@ function sh(cwd, args) {
 function scratch() {
   const d = mkdtempSync(join(tmpdir(), 'commit-guard-'));
   sh(d, ['init', '-q', '.']);
+  // F1（mac 侧反馈 2026-09-18）：初始分支名取决于全局 `init.defaultBranch`（mac 上是 main）
+  // ⇒ 自检里写死的 `git checkout master` 会失败 ⇒ 场景根本没建起来却报 FAIL（**假红**）。
+  // 用 symbolic-ref 显式钉住分支名，与全局配置无关（symbolic-ref 比 `init -b` 兼容面更宽）。
+  try { sh(d, ['symbolic-ref', 'HEAD', 'refs/heads/master']); } catch {}
   sh(d, ['config', 'user.email', 't@t']);
   sh(d, ['config', 'user.name', 't']);
   return d;
@@ -345,6 +406,27 @@ export function selftest() {
     assert(!m('sync/state/README.md'), 'state/README.md 是刻意提交的，不应被拦');
     assert(!m('tools/sync-tick.mjs'), '正常源码被误拦');
     return null;
+  });
+
+  // 7) 治理门（用户裁决 2026-09-18 / 审计 EN-1）：非 home 机器不能提交代码面；home 可以
+  t('protected-code-path-gate', () => {
+    const d = scratch();
+    mkdirSync(join(d, 'tools'), { recursive: true });
+    mkdirSync(join(d, 'wiki'), { recursive: true });
+    writeFileSync(join(d, 'tools', 'x.mjs'), 'x\n');
+    writeFileSync(join(d, 'wiki', 'note.md'), 'n\n');
+    sh(d, ['add', '-A']);
+    const prot = [{ glob: 'tools/**', why: '代码面' }, { glob: 'sync/**', why: '代码面' }];
+    const asPeer = assessWorktree(d, { rules: BUILTIN_RULES, protected: prot, machine: 'peer-box', homeMachine: 'home-box', apply: true });
+    assert(asPeer.ok === true, '非 home 提交代码**不应阻塞**其余文件（应只移出代码路径）');
+    assert(asPeer.codeReviewPaths.includes('tools/x.mjs'), '未识别代码路径：' + JSON.stringify(asPeer.codeReviewPaths));
+    const staged = sh(d, ['diff', '--cached', '--name-only']).trim().split(/\r?\n/).filter(Boolean);
+    assert(staged.includes('wiki/note.md'), '共享文件应仍在暂存区：' + staged.join(','));
+    assert(!staged.includes('tools/x.mjs'), '代码路径未移出暂存区：' + staged.join(','));
+    const asHome = assessWorktree(d, { rules: BUILTIN_RULES, protected: prot, machine: 'home-box', homeMachine: 'home-box' });
+    assert(asHome.ok === true, 'home 提交代码被误拦');
+    assert((asHome.codeReviewPaths || []).length === 0, 'home 不该被判为需审核');
+    return d;
   });
 
   const pass = results.filter((r) => r.pass).length;
