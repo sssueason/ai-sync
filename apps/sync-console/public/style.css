@@ -1,6 +1,17 @@
 :root{--bg:#0f1115;--panel:#171a21;--fg:#e8eaf0;--dim:#9aa3b2;--line:#262b36;--ok:#2ecc71;--warn:#f1c40f;--fail:#e74c3c;--accent:#0a84ff}
 @media (prefers-color-scheme:light){:root{--bg:#f6f7f9;--panel:#fff;--fg:#1b1f27;--dim:#5b6472;--line:#e3e6ec}}
+/* 浅色主题的状态色对比度（2026-09-18 实测修复）：--ok/--warn 本是"亮底亮字"配方，
+   在白底上实测只有 **2.1 / 1.66**，远低于 WCAG AA 的 4.5 ⇒ 浅色主题里「正常/提醒」几个字偏淡看不清。
+   深色主题保持原来的亮色（对深底对比足够，实测 7.8）。 */
+@media (prefers-color-scheme:light){
+  :root{--ok:#1a7f37;--warn:#8a5a00;--fail:#c0392b}
+}
 *{box-sizing:border-box}
+/* 布局（2026-09-18 用户实测反馈"太窄 / 不随窗口变动"）：原先固定 `max-width:1100px`，
+   在 1600px 以上的窗口里内容只占 ~69% ⇒ 看起来窄且不跟窗口走。改成 clamp：
+   1100–1680 之间**随窗口伸缩**，更宽时封顶并由 margin:auto 均分留白。
+   main 与 nav 共用同一个变量，保证两者始终对齐。 */
+:root{--page-max:clamp(1100px,94vw,1680px)}
 body{margin:0;font:14px/1.55 -apple-system,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif;background:var(--bg);color:var(--fg)}
 header{display:flex;justify-content:space-between;align-items:center;padding:12px 18px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
 .brand{font-weight:600;display:flex;gap:8px;align-items:center}
@@ -11,7 +22,7 @@ header{display:flex;justify-content:space-between;align-items:center;padding:12p
 nav{display:flex;gap:6px;padding:10px 18px;border-bottom:1px solid var(--line);flex-wrap:wrap}
 .tab{background:none;border:1px solid transparent;color:var(--dim);padding:6px 12px;border-radius:8px;cursor:pointer}
 .tab.active{color:var(--fg);border-color:var(--line);background:var(--panel)}
-main{padding:18px;max-width:1100px;margin:0 auto}
+main{padding:18px;max-width:var(--page-max);margin:0 auto}
 .panel{display:none}.panel.active{display:block}
 h3{margin:18px 0 8px;font-size:14px;color:var(--dim);text-transform:none}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
@@ -66,7 +77,7 @@ header{flex-wrap:wrap;gap:6px}
 .brand{flex-wrap:wrap;min-width:0}
 .head-right{flex-wrap:wrap}
 /* 3) nav 与 main 同宽对齐（main 居中 1100px；nav 原先固定 18px 内边距 ⇒ 宽屏下按钮贴着左边缘） */
-nav{padding-inline:max(18px,calc((100% - 1100px)/2))}
+nav{padding-inline:max(18px,calc((100% - var(--page-max))/2))}
 /* 4) 键盘可达性（原先只有默认 outline，深色底上几乎看不见）与触摸目标 */
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media (pointer:coarse){button{padding:9px 15px}}
