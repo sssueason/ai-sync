@@ -31,7 +31,7 @@
  *                              [--personal-patterns <rules.json>] [--max-detail N]
  * 退出码：0 = 无 FAIL；2 = 有 FAIL；3 = 用法错误
  */
-import { readFileSync, existsSync, statSync } from 'node:fs'
+import { readFileSync, existsSync, statSync, readdirSync } from 'node:fs'
 import { join, resolve, basename } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
@@ -105,9 +105,28 @@ function loadGitattributes(repo) {
     }).filter(Boolean)
 }
 function trackedFiles(repo) {
-  const r = spawnSync('git', ['-C', repo, 'ls-files', '-z'], { encoding: 'buffer', windowsHide: true, maxBuffer: 64 * 1024 * 1024 })
+  // 有 .git ⇒ 跟踪文件 **∪ 未跟踪但未被 ignore 的文件**（`--others --exclude-standard`）。
+  // 为什么必须带 `--others`（2026-09-18 实测踩到）：staging 目录（上次发布留下的 `.git`）里
+  // 只用 `ls-files` 会返回**上一个提交**的文件清单，**看不见刚拷进去的新文件** ⇒ 发布闸门形同虚设。
+  // 无 .git（全新 staging / 临时目录）⇒ 直接走目录树。
+  if (!existsSync(join(repo, '.git'))) return walkFiles(repo)
+  const r = spawnSync('git', ['-C', repo, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'],
+    { encoding: 'buffer', windowsHide: true, maxBuffer: 64 * 1024 * 1024 })
   if (r.status !== 0) return null
   return r.stdout.toString('utf8').split('\0').filter(Boolean)
+}
+/** 无 git 时的兜底：递归列目录（跳过 .git/node_modules/dist —— 与发布器的 SKIP_NAMES 一致）。 */
+function walkFiles(root, prefix = '') {
+  const out = []
+  let entries = []
+  try { entries = readdirSync(join(root, prefix), { withFileTypes: true }) } catch { return out }
+  for (const e of entries) {
+    if (['.git', 'node_modules', 'dist'].includes(e.name)) continue
+    const rel = prefix ? `${prefix}/${e.name}` : e.name
+    if (e.isDirectory()) out.push(...walkFiles(root, rel))
+    else if (e.isFile()) out.push(rel)
+  }
+  return out
 }
 /**
  * 规范 EOL 取自 **git 索引**，不是工作区。
@@ -143,6 +162,8 @@ for (const repo of REPOS) {
   const undeclared = new Set()
   const attrs = loadGitattributes(repo)
   const idx = indexEol(repo)
+  // 无 git 索引（全新 staging / 临时目录）时无法判定"提交形态"，如实说明并跳过 R2 —— 不假装检查过
+  if (idx.size === 0) findings.push({ sev: 'INFO', rule: 'R2', repo: name, rel: '', detail: '无 git 索引：跳过 EOL 判定（仍查 BOM / 冲突标记 / 机器本地文件）' })
   let checked = 0, skipped = 0
   for (const rel of files) {
     if (isIgnored(ignore, rel)) { skipped++; continue }
