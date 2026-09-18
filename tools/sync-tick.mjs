@@ -485,9 +485,11 @@ async function main() {
   // 诊断包：生成了就要在持久日志里留痕（否则"有没有档案"事后无从判断）
   if (bundle?.broken) line += ' | 诊断包：生成器未返回结果';
   else if (bundle?.out) line += ` | 诊断包：已生成 ${String(bundle.out).split(/[\\/]/).pop()}（${bundle.reasons.join(' · ')}）`;
-  // 分诊结果进日志行（它是建议，但"有没有建议"必须可事后追）
-  if (triage?.verdict) line += ` | 分诊：${triage.verdict.class} → ${triage.verdict.remedy}（${triage.verdict.confidence}）`;
+  // 分诊结果进日志行（它是建议，但"有没有建议、是不是刚判的"必须可事后追）
+  // 注意判断顺序：**跳过路径也带 verdict 字段**（沿用上次判定），先看 verdict 会把"没调用"写成"刚判定"（实测踩到）
+  if (triage?.skipped && triage.verdict) line += ` | 分诊：沿用 ${triage.verdict.class} → ${triage.verdict.remedy}（未重复调用：${triage.why}）`;
   else if (triage?.skipped) line += ` | 分诊：跳过（${triage.why}）`;
+  else if (triage?.verdict) line += ` | 分诊：${triage.verdict.class} → ${triage.verdict.remedy}（${triage.verdict.confidence}）`;
   else if (triage && triage.ok === false) line += ` | 分诊：不可用（${triage.why || triage.parse || '未知'}）`;
   if (!DRY) {
     try {

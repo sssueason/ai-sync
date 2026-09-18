@@ -211,8 +211,13 @@ record({ ok, parse, model: MODEL, fingerprint, factsFile: facts.file, elapsedSec
 
 function record(payload) {
   const rec = { machine, at: new Date().toISOString(), ...payload }
-  // 金标集评分（--input）**不写状态文件**：否则每次评分都会把真实分诊状态覆盖成"测试判定"（实测会误导 status）
+  // 一次失败（模型不可用/解析失败）**不该抹掉上一次的有效判定**：保留 lastGood 供人回看
   if (!INPUT) {
+    try {
+      const prevSig = JSON.parse(readFileSync(SIG, 'utf8'))
+      rec.lastGood = rec.verdict ? rec.verdict : (prevSig.lastGood || prevSig.verdict || null)
+      if (rec.lastGood && !rec.verdict) rec.lastGoodFrom = prevSig.lastGoodFrom || prevSig.at || null
+    } catch { rec.lastGood = rec.verdict || null }
     try {
       mkdirSync(STATE_DIR, { recursive: true })
       writeFileSync(SIG, JSON.stringify(rec, null, 2) + '\n', 'utf8')

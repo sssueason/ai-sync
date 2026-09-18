@@ -592,7 +592,7 @@ if (schedule.mirror) {
     if (app && (Object.keys(app.blocked || {}).length || Object.values(app.units || {}).some((u) => u && u.ok === false))) cond.push('应用未生效');
     if (!cond.length) add('免费模型分诊', 'PASS', '无待处理判定', t && t.verdict ? `上次判定 ${t.verdict.class}（条件已清）` : '无触发条件时不调用');
     else if (t && t.verdict) add('免费模型分诊', 'WARN', '有建议可看', `${t.verdict.class} → ${t.verdict.remedy}（置信 ${t.verdict.confidence}）${t.verdict.human_reason || ''} · ${t.at}`);
-    else if (t && t.ok === false) add('免费模型分诊', 'WARN', '有建议可看', `未得到判定（${t.why || t.parse || '未知'}）—— 基线行为不变，看诊断包`);
+    else if (t && t.ok === false) add('免费模型分诊', 'WARN', '有建议可看', `未得到判定（${t.why || t.parse || '未知'}）${t.lastGood ? `；上次判定 ${t.lastGood.class} → ${t.lastGood.remedy}` : ''} —— 基线行为不变，看诊断包`);
     else add('免费模型分诊', 'WARN', '有建议可看', `${cond.join(' · ')} ⇒ 尚未分诊（下一轮 tick 会做，或手动 tools/sync-triage.mjs --force）`);
   }
 }
