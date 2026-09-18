@@ -57,6 +57,9 @@ const R4_RULES = [
   { re: /(^|\/)[^\/]*-cmd\.txt$/i, why: '命令文件：内含本机绝对路径' },
   { re: /(^|\/)\.engine-fetch-stamp$/i, why: '远端比对节流戳：每次 fetch 必变，曾致 4 轮连续冲突' },
   { re: /(^|\/)local\.machine$/i, why: '本机标识文件：各端不同' },
+  // 2026-09-18 实测：新增的「每机状态文件」自己就成了新的「机器本地文件」类别（tick 一提交就把它们带进 git）
+  // ⇒ 每加一类 state 文件，必须**同时**进 .gitignore 与本规则，否则门禁永远追不上。
+  { re: /^sync\/state\/(hygiene|migrations|apply|triage)-[^\/]+\.json$/i, why: '每机状态文件（本机才有意义）：会被各端反复改写 ⇒ 不入 git' },
   { re: /^(settings\.yaml|opencode\.jsonc|cordis\.patch\.yml)$/i, why: '工具自写的 live 配置：各端各写，会 ping-pong（插件源码里的同名文件不受此规则约束）' },
   { re: /\.local-[A-Za-z0-9_.-]+-\d{8}\./i, why: '冲突侧车文件：只应存在于工作区，不应入库' },
 ]
