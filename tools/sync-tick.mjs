@@ -417,6 +417,27 @@ async function main() {
     }
   }
 
+  /* 5f. 免费模型只读分诊（默认开，`sync/instance.json` 的 triage.enabled=false 即关闭）。
+     它是**建议器**：只在固定枚举里选类别、在固定清单里选一条建议 —— 不产生命令、不执行任何东西。
+     条件命中才调用（与诊断包同一组条件）；频控与同事实去重由工具自己管；不可用/超时/解析失败一律
+     降级成"没建议"，**不改 rc**（分诊失败不是同步故障）。 */
+  let triage = null;
+  if (!DRY) {
+    let triCfg = null
+    try { triCfg = JSON.parse(readFileSync(join(INSTANCE, 'sync', 'instance.json'), 'utf8')).triage || {} } catch { triCfg = {} }
+    const conds = !!(bundle?.out || (hygiene && hygiene.fails) || (migrate && migrate.failed) || (applied && applied.failed))
+    if (triCfg.enabled !== false && conds) {
+      const tri = join(ENGINE, 'tools', 'sync-triage.mjs')
+      if (existsSync(tri)) {
+        const r = spawnSync(process.execPath, [tri, '--instance', INSTANCE, '--json'],
+          { encoding: 'utf8', windowsHide: true, timeout: 300 * 1000, maxBuffer: 16 * 1024 * 1024 })
+        try { triage = JSON.parse(String(r.stdout || '').trim()) } catch { triage = { ok: false, parse: 'runner-broken' } }
+      } else {
+        triage = { ok: false, why: '缺少 tools/sync-triage.mjs' }
+      }
+    }
+  }
+
   /* 6. 日志（格式与既有 tick 一致：一行摘要 + 渲染器末行 + 可选 conv 摘要） */
   const elapsed = Math.round((Date.now() - t0) / 1000);
   // 日志行可读性（2026-09-17 用户反馈"日志可读性太差"）：三个渲染器各吐一句 `render done: 0 target(s) written`
@@ -464,6 +485,10 @@ async function main() {
   // 诊断包：生成了就要在持久日志里留痕（否则"有没有档案"事后无从判断）
   if (bundle?.broken) line += ' | 诊断包：生成器未返回结果';
   else if (bundle?.out) line += ` | 诊断包：已生成 ${String(bundle.out).split(/[\\/]/).pop()}（${bundle.reasons.join(' · ')}）`;
+  // 分诊结果进日志行（它是建议，但"有没有建议"必须可事后追）
+  if (triage?.verdict) line += ` | 分诊：${triage.verdict.class} → ${triage.verdict.remedy}（${triage.verdict.confidence}）`;
+  else if (triage?.skipped) line += ` | 分诊：跳过（${triage.why}）`;
+  else if (triage && triage.ok === false) line += ` | 分诊：不可用（${triage.why || triage.parse || '未知'}）`;
   if (!DRY) {
     try {
       const dir = join(INSTANCE, 'sync', 'logs');

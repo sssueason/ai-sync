@@ -574,6 +574,28 @@ if (schedule.mirror) {
   else if (sig && sig.out) add('诊断包', 'WARN', '有档案可看', `${cond.join(' · ')} ⇒ sync/reports/${sig.out}`);
   else add('诊断包', 'WARN', '有档案可看', `${cond.join(' · ')} ⇒ 尚未生成（下一轮 tick 会生成，或手动跑 tools/sync-ops-bundle.mjs --force）`);
 }
+/* 免费模型只读分诊（2026-09-18）：条件命中时 tick 会把诊断包的事实交给免费模型，得到"类别 + 建议 id"。
+   它是**建议**，所以只在"条件仍在 且 有新鲜判定"时显示成 WARN（那才可行动）；条件已清 ⇒ PASS（不长期挂黄）；
+   配置里关掉 ⇒ 直接 PASS 并说明未启用。 */
+{
+  const rd = (p) => { try { return JSON.parse(readFileSync(p, 'utf8')) } catch { return null } };
+  const enabled = (() => { try { return JSON.parse(readFileSync(join(INSTANCE, 'sync', 'instance.json'), 'utf8')).triage?.enabled !== false } catch { return true } })();
+  const t = rd(join(INSTANCE, 'sync', 'state', `triage-${machine}.json`));
+  if (!enabled) add('免费模型分诊', 'PASS', '按配置关闭', 'sync/instance.json 的 triage.enabled=false');
+  else {
+    const hyg = rd(join(INSTANCE, 'sync', 'state', `hygiene-${machine}.json`));
+    const mig = rd(join(INSTANCE, 'sync', 'state', `migrations-${machine}.json`));
+    const app = rd(join(INSTANCE, 'sync', 'state', `apply-${machine}.json`));
+    const cond = [];
+    if (hyg && hyg.fails > 0) cond.push(`卫生 FAIL=${hyg.fails}`);
+    if (mig && Object.keys(mig.blocked || {}).length) cond.push('迁移熔断');
+    if (app && (Object.keys(app.blocked || {}).length || Object.values(app.units || {}).some((u) => u && u.ok === false))) cond.push('应用未生效');
+    if (!cond.length) add('免费模型分诊', 'PASS', '无待处理判定', t && t.verdict ? `上次判定 ${t.verdict.class}（条件已清）` : '无触发条件时不调用');
+    else if (t && t.verdict) add('免费模型分诊', 'WARN', '有建议可看', `${t.verdict.class} → ${t.verdict.remedy}（置信 ${t.verdict.confidence}）${t.verdict.human_reason || ''} · ${t.at}`);
+    else if (t && t.ok === false) add('免费模型分诊', 'WARN', '有建议可看', `未得到判定（${t.why || t.parse || '未知'}）—— 基线行为不变，看诊断包`);
+    else add('免费模型分诊', 'WARN', '有建议可看', `${cond.join(' · ')} ⇒ 尚未分诊（下一轮 tick 会做，或手动 tools/sync-triage.mjs --force）`);
+  }
+}
 // 引擎更新提示：落后 ⇒ WARN（不是 FAIL —— 旧代码照样能跑，但不能装作没这回事）
 const eng = engineFacts();
 const inPlaceNote = eng.inPlace ? '（本机为原地布局：这里报的是已安装引擎的版本）' : '';
