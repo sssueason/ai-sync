@@ -12,7 +12,7 @@
  *   2. machines/<机器>.json：存在、可解析、mu1 的路径真的存在且是 git 仓
  *   3. mu2（云盘镜像，可选）：根存在/是目录/不含 .git；每个集合 id/source/target 合法、target 唯一
  *   4. 适配器：producers/owners 的 JSON 可解析；instance.json 里启用的 id 真的存在
- *   5. 仓库卫生：跟踪集里**不该有** node_modules / *.db / *.pem / *.key / 原始数据扩展名 / .DS_Store
+ *   5. 仓库卫生：跟踪集里**不该有** node_modules / *.db / *.pem / *.key / 原始数据扩展名 / .DS_Store / sync/state 下的机器本地点文件
  *   6. 调度：平台任务是否装了、间隔与配置是否一致（复用 install.mjs 的 detectSchedule）
  *
  * 用法：
@@ -197,6 +197,26 @@ if (isMain) {
     const bad = [];
     for (const f of files) for (const [re, why] of FORBIDDEN) if (re.test(f)) bad.push(`${f}（${why}）`);
     add(`仓库 ${r.id} 无禁同步物`, bad.length ? 'FAIL' : 'PASS', '0 个', bad.length ? bad.slice(0, 5).join(' | ') : '0');
+  }
+
+  /* ---- 机器本地点文件（这一类已经复发 4 次）------------------------------------
+     计划任务命令文件（含绝对路径）、诊断报告（每天新增）、`.last-state-*` 抖动、引擎比对节流戳。
+     后果完全一样：每台机器各自改写这些文件 ⇒ 自动提交 ⇒ 撞 rebase ⇒ integrate 永久失败
+     （对端实测 tick 连续 rc=1、单轮 1019s）。判据：实例仓库 `sync/state/` 下被 git 跟踪的隐藏文件一律 FAIL。
+     为什么单列一节、而不是搭上面 mu1 循环的便车：循环顺带能查到实例仓库只是**巧合**（mu1 是"本机同步的仓库"），
+     一旦清单变了或 doctor 从引擎目录跑，同一份代码就会静默变成永远 PASS 的装饰性断言 —— 那正是假绿。
+     这里直接判 INSTANCE；git 用不了时记 WARN（"未检查"是一个状态），不静默略过。 */
+  {
+    let tracked = null;
+    try {
+      tracked = execFileSync('git', ['-C', INSTANCE, 'ls-files', 'sync/state'], { encoding: 'utf8', windowsHide: true }).split('\n').filter(Boolean);
+    } catch { /* 落到下面的 WARN 分支 */ }
+    if (tracked === null) {
+      add('状态目录无被跟踪的点文件', 'WARN', '0 个（机器本地状态不进 git）', '实例目录不是 git 仓库或 git 不可用 ⇒ 本项未检查');
+    } else {
+      const strays = tracked.filter((x) => basename(x).startsWith('.') && x !== 'sync/state/.gitkeep');
+      add('状态目录无被跟踪的点文件', strays.length ? 'FAIL' : 'PASS', '0 个（机器本地状态不进 git）', strays.length ? strays.join(' | ') : '0');
+    }
   }
 
   // 6. 调度（复用 install.mjs，唯一实现）
