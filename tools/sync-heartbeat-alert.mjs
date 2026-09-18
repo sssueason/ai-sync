@@ -51,6 +51,22 @@ function readIntervalMinutes() {
   return 20;
 }
 const TICK_INTERVAL_MIN = readIntervalMinutes();
+// 宽容同步的机器（移动端/按需同步）：**不预警**，只记录 —— 用户裁决 2026-09-18（mac 作为移动端）。
+// 名单属**实例配置**（instance.json 的 heartbeat.tolerantMachines），刻意不写死在公开引擎里。
+// 语义：本机在名单里 ⇒ 跳过本机判活；对端在名单里 ⇒ 只记 INFO（不 ALERT、不弹通知、不计 rc）。
+function readTolerant() {
+  try {
+    const j = JSON.parse(readFileSync(join(INSTANCE, 'sync', 'instance.json'), 'utf8'));
+    const list = j?.heartbeat?.tolerantMachines;
+    if (Array.isArray(list)) return new Set(list.map((x) => String(x)));
+  } catch {}
+  return new Set();
+}
+const TOLERANT = (() => {
+  const ov = val('--tolerant', null);
+  if (ov !== null) return new Set(String(ov).split(',').map((s) => s.trim()).filter(Boolean));
+  return readTolerant();
+})();
 const WARN_MIN = Number(val('--warn-min', String(TICK_INTERVAL_MIN * 2)));       // 错过一轮（只记 INFO）
 const STALE_MIN = Number(val('--stale-min', String(TICK_INTERVAL_MIN * 4)));     // 4× 间隔 ⇒ ALERT
 const HEAVY_STALE_H = Number(val('--heavy-stale-hours', '26')); // 重活判停阈值（契约值）
@@ -79,8 +95,8 @@ const alerts = [];
 const infos = [];
 
 /* ---------- 本机：看本地 tick 日志（新鲜、每轮都写） ---------- */
-// ★ 2026-09-18（对端反馈）：维护/冻结与"停摆"在证据上**同形** —— 我在 本机 做维护冻结期间，
-//   对端 与 对端 各收到一条"本机 tick 疑似已停"，对端 的 daily 还被顶成 rc=10。
+// ★ 2026-09-18（对端反馈）：维护/冻结与"停摆"在证据上**同形** —— 本机做维护冻结期间，
+//   两台对端各收到一条"本机 tick 疑似已停"，其中一台的 daily 还被顶成 rc=10。
 //   所以本机侧先看**冻结标记**：`sync/state/.freeze-<machine>`（人在维护前放下）或活着的 `.sync.lock`
 //   （同步正在跑/被有意持有）⇒ 记 INFO「维护冻结（预期）」，**不**报 ALERT。
 function freezeReason() {
@@ -103,6 +119,7 @@ function freezeReason() {
 function ageMinFrom(ts) { const t = parseTs(ts); return t === null ? null : ageMin(t); }
 
 function checkSelf() {
+  if (TOLERANT.has(machine)) { infos.push(`本机（${machine}）登记为**宽容同步**（移动端/按需）⇒ 不预警，仅记录`); return; }
   const frozen = freezeReason();
   if (frozen) { infos.push(`本机：${frozen} ⇒ 跳过 tick 判活（维护中的停摆是预期的）`); return; }
   const cands = [join(LOGS, `tick-${machine}.log`)];
@@ -136,6 +153,10 @@ function checkPeers() {
     try { j = JSON.parse(readFileSync(join(STATE, f), 'utf8')); } catch { continue; }
     const who = j.machine || f.replace(/^tick-/, '').replace(/\.json$/, '');
     if (who === machine) continue;
+    if (TOLERANT.has(who)) {
+      infos.push(`${who}: 登记为**宽容同步**（移动端/按需）⇒ 不预警，仅记录（快照 ${j.writtenAt || '?'}，最后 tick ${j.tick?.lastAt || '?'}）`);
+      continue;
+    }
     const writtenAt = parseTs(j.writtenAt);
     const lastTick = parseTs(j.tick?.lastAt);
     const heavyAt = parseTs(j.heavy?.lastStartedAt);
