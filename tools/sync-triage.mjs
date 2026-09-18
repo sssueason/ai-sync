@@ -24,7 +24,7 @@
  *     --input  直接用给定文件作为"指令+事实"（金标集评分用；跳过诊断包提取）
  * 退出码：0 = 已分诊或按策略跳过；3 = 用法错误（模型不可用/解析失败**不**算 3）
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, rmSync, statSync, readdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, rmSync, statSync, readdirSync, realpathSync } from 'node:fs'
 import { join, resolve, dirname } from 'node:path'
 import { homedir, hostname, tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -171,7 +171,20 @@ const promptText = [
 ].join('\n')
 
 const stamp = new Date().toISOString().replace(/[-:T.]/g, '').slice(0, 14)
-const promptPath = join(tmpdir(), `sync-triage-${machine}-${stamp}.md`)
+/**
+ * 附件目录必须用**真实路径**：本机 `os.tmpdir()` 会返回 8.3 短名（`C:\Users\<短名>\AppData\Local\Temp`），
+ * Node 能写进去，但 opencode 那个原生二进制**读不到**（实测：`✗ Read … failed / File not found`），
+ * 表现为"模型没给出判定" —— 极易被误判成模型波动。`realpathSync` 会把 8.3 展开成真实长名。
+ */
+/**
+ * 附件**不放系统临时目录**：本机 `os.tmpdir()` 返回的目录名字面就带波浪号（`…\Local\TEMP_~1`），
+ * 而 opencode 那个原生二进制会把它规范化成 `…\Local\Temp`（不存在的路径）⇒ `✗ Read … failed / File not found`，
+ * 表现为"模型没给出判定"，极易误判成模型波动（实测踩到；`realpathSync` 也救不了——目录真名如此）。
+ * 改为落在**我们自己的目录**（`sync/logs/`，已被 gitignore 与文本卫生门禁覆盖），用完即删。
+ */
+const WORK = join(INSTANCE, 'sync', 'logs')
+try { mkdirSync(WORK, { recursive: true }) } catch { /* 交给后面的写入报错 */ }
+const promptPath = join(WORK, `.triage-prompt-${machine}-${stamp}.md`)
 writeFileSync(promptPath, promptText, 'utf8')
 const MSG = '读附件里的"分诊要求与事实摘要"，按其规定的 JSON 格式给出你的判定。'
 
@@ -185,7 +198,7 @@ if (!BIN) {
 }
 
 const t0 = Date.now()
-const r = spawnSync(BIN, ['run', MSG, '--model', MODEL, '--dir', tmpdir(), '-f', promptPath],
+const r = spawnSync(BIN, ['run', MSG, '--model', MODEL, '--dir', WORK, '-f', promptPath],
   { encoding: 'utf8', windowsHide: true, timeout: 240 * 1000, maxBuffer: 16 * 1024 * 1024 })
 const elapsedSec = Math.round((Date.now() - t0) / 1000)
 try { rmSync(promptPath, { force: true }) } catch { /* 临时文件清理失败无所谓 */ }
@@ -194,8 +207,9 @@ const stdout = String(r.stdout || '')
 const stderr = String(r.stderr || '')
 const m = stdout.match(/\{[\s\S]*?\}/)
 let verdict = null
-let parse = 'ok'
-if (!m) parse = 'no-json'
+// 「附件读不到」必须与「模型没给判定」分开：前者是工具/路径问题，后者才是模型问题（实测踩到过，曾被误判成模型波动）
+let parse = /File not found|Read .*failed/i.test(stdout + stderr) ? 'attach-unreadable' : 'ok'
+if (!m && parse === 'ok') parse = 'no-json'
 else {
   try {
     const j = JSON.parse(m[0])
