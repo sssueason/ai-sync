@@ -1,4 +1,4 @@
-# bootstrap.ps1 — 全新机器一键接入（Windows）
+﻿# bootstrap.ps1 — 全新机器一键接入（Windows）
 #
 # 与 install/bootstrap.sh 一一对应（同三件事，薄封装：取引擎 → 取实例（可选）→ 调引擎自带安装器）。
 #
