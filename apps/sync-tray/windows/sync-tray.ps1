@@ -415,7 +415,8 @@ function Update-Engine([switch]$DryRun) {
   }
   if (& $hit '^apps/sync-tray/') {
     $r.restartTray = $true
-    $r.steps += $(if ($DryRun) { '（dry-run）托盘自身有更新 → 将重启托盘' } else { '托盘自身有更新 → 已重启托盘' })
+    # 措辞必须准：本函数**不重启**托盘（重启是调用方的事 —— 菜单路径会重启，CLI 路径不会）
+  $r.steps += $(if ($DryRun) { '（dry-run）托盘自身有更新 → 将重启托盘' } else { '托盘自身有更新 → 需重启托盘（右键菜单点更新会自动重启；命令行调用不会）' })
   }
   if ($r.pulled -gt 0 -and -not (& $hit '^install/') -and -not (& $hit '^apps/sync-tray/')) {
     $r.steps += '工具/适配器/文档有更新 → 下一轮 tick 自动生效'
@@ -438,7 +439,7 @@ function Format-EngineUpdateLines([object]$r) {
     $lines += ''
     foreach ($s in $r.steps) { $lines += "· $s" }
     if ($r.pulled -gt 0 -and @($r.changed).Count) { $lines += ''; $lines += "本次涉及（前 5）：$((@($r.changed) | Select-Object -First 5) -join '、')" }
-    if ($r.restartTray) { $lines += ''; $lines += '托盘已用新代码重启（图标可能闪一下）。' }
+    if ($r.restartTray) { $lines += ''; $lines += '本次更新含托盘代码：关闭本窗口后将自动重启托盘（图标可能闪一下）。' }
   }
   return $lines
 }
