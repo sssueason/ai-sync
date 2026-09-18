@@ -145,6 +145,11 @@ md.push(`- 镜像最新 tree-sync 报告：${latestTreeSync}`)
 md.push(`- 锁文件：${locks.length ? locks.join(', ') : '无'}`)
 md.push('')
 md.push('## 0. 先看这里（固定映射，不是推测）')
+// 人工强制生成且当前无失败条件时，上面的规则映射可能一条都不命中 ⇒ 必须兜底，否则 §0 是空的（实测踩到）
+if (!nextSteps.length) {
+  nextSteps.push('当前没有失败条件，本包是**人工强制生成**的：先看 §1 sync-status 全文与 §3 tick 日志尾；')
+  nextSteps.push('仍无法解释时，把本包整体交给对端/会话内 agent 一起看 —— 它自带全部依据，不需要再登机器取证。')
+}
 for (const s of nextSteps) md.push(`- ${s}`)
 md.push('')
 md.push('## 1. sync-status 全文（判定所依据的每一条断言）')
