@@ -587,7 +587,7 @@ if (conv.statePush && conv.statePush.ok === false) add('跨端状态已推送', 
 const fleetList = [];
 for (const [id, s] of Object.entries(fleet.machines)) {
   const age = mins(parseStamp(s.at));
-  fleetList.push({ machine: id, at: s.at, ageMin: age, rc: s.tick?.rc ?? null, actions: s.actions || [], intervalMin: s.tick?.intervalMin ?? null, engineRev: s.engineRev ?? null, engineBehind: s.engineBehind ?? null });
+  fleetList.push({ machine: id, at: s.at, ageMin: age, rc: s.tick?.rc ?? null, actions: s.actions || [], intervalMin: s.tick?.intervalMin ?? null, engineRev: s.engineRev ?? null, engineBehind: s.engineBehind ?? null, ops: s.ops ?? null });
   if (age !== null && age > statePushMinutes * 2 && id !== machine) {
     add(`远端 ${id} 状态新鲜`, 'WARN', `≤ ${statePushMinutes * 2} 分钟`, `${age} 分钟前`);
   }
@@ -631,6 +631,27 @@ if (WRITE_STATE) {
   const rc = Number(val('--rc', '0'));
   const elapsed = Number(val('--elapsed', '0'));
   const tickAt = val('--tick-at', tick.lastAt || stamp());
+  // 应用一致性（2026-09-18）：把三件"应用层"的事实一并跨机广播，别的机器才能一眼看出"谁没跟上"。
+  // 缺文件 ⇒ 该项为 null（对端渲染成 `-`）；**不要**把"没跑过"渲染成 0 或 FAIL（那是假红）。
+  const rdState = (n) => { try { return JSON.parse(readFileSync(join(INSTANCE, 'sync', 'state', n), 'utf8')); } catch { return null; } };
+  const hygS = rdState(`hygiene-${machine}.json`);
+  const migS = rdState(`migrations-${machine}.json`);
+  const appS = rdState(`apply-${machine}.json`);
+  const bunS = rdState(`ops-bundle-${machine}.json`);
+  const ops = {
+    hygiene: hygS ? { fails: hygS.fails ?? null, warns: hygS.warns ?? null, at: hygS.at ?? null } : null,
+    migrations: migS ? {
+      applied: Object.keys(migS.applied || {}).filter((k) => migS.applied[k] && migS.applied[k].ok).length,
+      pendingManual: (migS.pendingManual || []).filter((p) => !p.done).length,
+      blocked: Object.keys(migS.blocked || {}).length,
+    } : null,
+    apply: appS ? {
+      ok: Object.values(appS.units || {}).filter((u) => u && u.ok).length,
+      bad: Object.values(appS.units || {}).filter((u) => u && u.ok === false).length,
+      blocked: Object.keys(appS.blocked || {}).length,
+    } : null,
+    bundle: bunS && bunS.out ? bunS.out : null,
+  };
   const compact = {
     machine,
     engine: ENGINE,
@@ -641,6 +662,7 @@ if (WRITE_STATE) {
     repos: repos.map((r) => ({ id: r.id, ahead: r.ahead, behind: r.behind, dirty: r.dirty })),
     converge: payload.converge ? { at: conv.at, changed: conv.changed, pendingOwners: [...new Set(conv.actions.map((a) => a.owner).filter(Boolean))], guard: guard.reachable ? 'ok' : guard.listening ? 'error' : 'down' } : null,
     actions: conv.actions.map((a) => ({ level: a.level || 'warn', text: a.text, owner: a.owner || null })),
+    ops,
     problems,
   };
   const stampFile = join(INSTANCE, 'sync', 'state', `.last-state-push-${machine}`);
@@ -699,7 +721,17 @@ if (OUT) {
   for (const c of checks) console.log(`  [${icon[c.level] || c.level}] ${c.name}  ← 期望 ${c.expected} / 实际 ${c.actual}`);
   if (fleetList.length) {
     console.log('  --- 全队（来自状态分支）---');
-    for (const m of fleetList) console.log(`  ${m.machine.padEnd(12)} ${m.at || '?'}  ${m.ageMin === null ? '' : m.ageMin + ' 分钟前'}  rc=${m.rc}  待办=${(m.actions || []).length}`);
+    // 应用一致性视图（2026-09-18）：每端报出 引擎rev / 卫生 / 迁移 / 应用 四项。
+    // 对端还没升级到带 ops 的版本时显示 `-`（跨版本容忍：字段缺失不是错误，别把它渲染成 0 或 FAIL）。
+    for (const m of fleetList) {
+      const o = m.ops || null;
+      const tok = []
+      tok.push(`引擎=${m.engineRev ? String(m.engineRev).slice(0, 7) : '-'}${Number.isFinite(m.engineBehind) ? `(-${m.engineBehind})` : ''}`)
+      tok.push(`卫生=${o && o.hygiene ? (o.hygiene.fails ? `FAIL${o.hygiene.fails}` : `ok(${o.hygiene.warns ?? 0}W)`) : '-'}`)
+      tok.push(`迁移=${o && o.migrations ? (o.migrations.blocked ? `FAIL${o.migrations.blocked}` : `${o.migrations.applied}条${o.migrations.pendingManual ? `/${o.migrations.pendingManual}待人工` : ''}`) : '-'}`)
+      tok.push(`应用=${o && o.apply ? (o.apply.blocked || o.apply.bad ? `FAIL${(o.apply.blocked || 0) + (o.apply.bad || 0)}` : `ok(${o.apply.ok})`) : '-'}`)
+      console.log(`  ${m.machine.padEnd(12)} ${m.at || '?'}  ${m.ageMin === null ? '' : m.ageMin + ' 分钟前'}  rc=${m.rc}  待办=${(m.actions || []).length}  ${tok.join('  ')}`);
+    }
   }
   if (actions.length) {
     console.log('  --- 待办（悬浮/菜单要显示的）---');
