@@ -24,7 +24,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, readdirSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { spawnSync } from 'node:child_process';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -259,6 +259,9 @@ function mirrorSpecOf(cfg) {
     mode: cm.schedule?.mode || 'dailyAt',
     times: cm.schedule?.times || ['22:00'],
     intervalMinutes: cm.schedule?.intervalMinutes ?? 60,
+    // 2026-09-19（§6）：槽里跑的**脚本**也是"装的是什么"的一部分。以前它不在 spec 里 ⇒ 只改
+    // cloudMirror.script 而不改时间/名字时，对账看不出差异、任务仍指着旧脚本（假绿面）。
+    script: cm.script || '',
   };
 }
 function readMirrorSpec(instance) {
@@ -402,6 +405,15 @@ ${trigger}
     return { ok: true, task: name, via: 'launchd', plist, spec };
   }
   if (process.platform !== 'win32') return { ok: true, skipped: true, task: name, detail: '该平台没有安装器（非失败）' };
+  // 任务改名后的收尾（2026-09-19，§6 退役）：默认名那条**不会自己消失**，而它仍会在每晚跑
+  // **完整 daily.ps1**（doctor 双份 + µ2 老路径 + 一次多余的 pull/push）。只要配置名与默认名不同，
+  // 就顺手把默认名收走 —— 幂等，不存在就不动。
+  const legacyTask = 'ai-sync-mirror';
+  let cleanedLegacy = false;
+  if (name !== legacyTask && taskExists(legacyTask)) {
+    const d = spawnSync('schtasks', ['/delete', '/tn', legacyTask, '/f'], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
+    cleanedLegacy = d.status === 0 || /cannot find|找不到/i.test(`${d.stderr}${d.stdout}`);
+  }
   if (!spec.enabled) {
     const del = unregisterMirror(instance, cfg);
     mkdirSync(dirname(specFile), { recursive: true });
@@ -426,7 +438,297 @@ Write-Output 'registered'
   const r = runPs(ps);
   if (!r.ok) return { ok: false, error: r.error };
   writeFileSync(specFile, JSON.stringify(spec, null, 2) + '\n', 'utf8');
+  return { ok: true, task: name, via: 'run-hidden.vbs', cmdFile, spec, cleanedLegacy };
+}
+
+/* ---------------------------------------------------------------- 备份（restic）调度
+ * 背景（2026-09-19 用户裁决）：传输层改用 Syncthing 后**删除会传播** ⇒ 误删防线必须有 L2 快照层。
+ * 备份与"镜像"是两件事：镜像刷的是云盘里的文档副本，备份是 restic 增量快照到**另一块物理盘**。
+ * 本段只负责把配置落到平台调度（复用与 tick/mirror 同一套 run-hidden.vbs / launchd 机制），
+ * 备份逻辑本身在实例的 tools/backup-run.mjs（`--verify-auto` 会顺带按到期情况跑周检/月演练）。
+ * 语义：`backup` 段缺失或 enabled !== true ⇒ **不注册**（没启用备份的机器不该凭空多一个任务）。
+ * 说明：µ2 退役后 mirror 段会被删除，届时这里就是唯一的"每日作业"实现。 */
+
+export const backupTaskName = (cfg) => cfg?.backup?.taskName || 'ai-sync-backup';
+export const backupLabel = (cfg) => cfg?.backup?.launchdLabel || 'ai-sync.backup';
+
+/** 本机标识（与各工具同一套解析顺序：env → sync/local.machine → hostname） */
+function machineOf(instance) {
+  const env = process.env.AI_SYNC_MACHINE || process.env.DSH_MACHINE;
+  if (env) return String(env).trim();
+  for (const p of [join(instance, 'sync', 'local.machine'), join(ENGINE, 'sync', 'local.machine')]) {
+    try { const s = readFileSync(p, 'utf8').replace(/^\uFEFF/, '').trim(); if (s) return s; } catch { /* 换下一个 */ }
+  }
+  try { return hostname().toLowerCase(); } catch { return 'unknown'; }
+}
+/** 机器级配置（备份的范围/仓库/密码文件都在这里 —— 它天生是"每机"的东西） */
+function machineCfgOf(instance) {
+  try { return JSON.parse(readFileSync(join(instance, 'sync', 'machines', `${machineOf(instance)}.json`), 'utf8').replace(/^\uFEFF/, '')); } catch { return null; }
+}
+/** 合并：机器级覆盖实例级。★ 备份**必须**以机器级为准，否则"只在某一台机器上启用备份"这种意图
+ *  表达不出来（实例级配置是三端共享的，写进去等于三端都注册）。 */
+export function backupConfigOf(instance, cfg = loadInstance(instance)) {
+  const ib = cfg?.backup || {};
+  const mb = machineCfgOf(instance)?.backup || {};
+  return { ...ib, ...mb };
+}
+const backupScript = (instance, cfg) => {
+  const custom = backupConfigOf(instance, cfg).script;
+  return custom ? resolve(instance, custom) : join(instance, 'tools', 'backup-run.mjs');
+};
+function backupSpecOf(instance, cfg) {
+  const b = backupConfigOf(instance, cfg);
+  return {
+    enabled: b.enabled === true,
+    mode: 'dailyAt',
+    times: b.schedule?.times || ['22:00'],
+    verifyAuto: b.verifyAuto !== false,
+  };
+}
+function readBackupSpec(instance) {
+  try { return JSON.parse(readFileSync(join(instance, 'sync', 'state', 'backup-spec.json'), 'utf8')); } catch { return null; }
+}
+
+/** 检测备份调度现状。返回 {platform,task,enabled,installed,inSync,detail} */
+export function detectBackup(instance, cfg = loadInstance(instance)) {
+  const spec = backupSpecOf(instance, cfg);
+  const out = { platform: process.platform, task: process.platform === 'darwin' ? backupLabel(cfg) : backupTaskName(cfg), enabled: spec.enabled, want: spec.enabled ? spec : null, installed: false, inSync: null, detail: '' };
+  if (process.platform === 'darwin') {
+    const plist = join(homedir(), 'Library', 'LaunchAgents', `${out.task}.plist`);
+    out.installed = existsSync(plist);
+    out.plist = plist;
+  } else if (process.platform === 'win32') {
+    out.installed = taskExists(out.task);
+  } else {
+    out.detail = '该平台没有安装器（Linux 请自行接 systemd/cron）';
+    return out;
+  }
+  if (!spec.enabled) {
+    out.inSync = !out.installed;
+    out.detail = out.installed ? 'backup.enabled 未开启但任务还在（应卸下）' : '未启用备份（无任务）';
+    return out;
+  }
+  if (!out.installed) { out.inSync = false; out.detail = '任务不存在'; return out; }
+  const recorded = readBackupSpec(instance);
+  const same = !!recorded && JSON.stringify(recorded) === JSON.stringify(spec);
+  out.inSync = same;
+  out.detail = same ? '与配置一致' : recorded ? `配置已变（上次装的是 ${JSON.stringify(recorded)}）` : '缺少 backup-spec.json（多半是手工任务，应收编）';
+  return out;
+}
+
+export function unregisterBackup(instance, cfg = loadInstance(instance)) {
+  const name = process.platform === 'darwin' ? backupLabel(cfg) : backupTaskName(cfg);
+  if (process.platform === 'darwin') {
+    const plist = join(homedir(), 'Library', 'LaunchAgents', `${name}.plist`);
+    const uid = process.getuid ? process.getuid() : 501;
+    spawnSync('launchctl', ['bootout', `gui/${uid}/${name}`], { encoding: 'utf8' });
+    try { rmSync(plist, { force: true }); } catch (e) { return { ok: false, task: name, error: e.message }; }
+    return { ok: true, task: name };
+  }
+  if (process.platform !== 'win32') return { ok: true, skipped: true, task: name, detail: '该平台没有安装器（非失败）' };
+  const r = spawnSync('schtasks', ['/delete', '/tn', name, '/f'], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
+  const gone = r.status === 0 || /cannot find|找不到/i.test(`${r.stderr}${r.stdout}`);
+  return gone ? { ok: true, task: name } : { ok: false, error: (r.stderr || r.stdout || '').split('\n')[0] || `exit ${r.status}` };
+}
+
+export function registerBackup(instance, cfg = loadInstance(instance)) {
+  const name = process.platform === 'darwin' ? backupLabel(cfg) : backupTaskName(cfg);
+  const spec = backupSpecOf(instance, cfg);
+  const specFile = join(instance, 'sync', 'state', 'backup-spec.json');
+  if (!spec.enabled) {
+    const del = unregisterBackup(instance, cfg);
+    mkdirSync(dirname(specFile), { recursive: true });
+    writeFileSync(specFile, JSON.stringify(spec, null, 2) + '\n', 'utf8');
+    return { ok: del.ok, task: name, disabled: true, detail: 'backup.enabled 未开启 → 未注册备份任务', error: del.error };
+  }
+  const script = backupScript(instance, cfg);
+  if (!existsSync(script)) return { ok: false, error: `找不到备份脚本 ${script}` };
+  const cmdLine = `"${nodeExe()}" "${script}" --instance "${instance}" --rc${spec.verifyAuto ? ' --verify-auto' : ''}`;
+  if (process.platform === 'darwin') {
+    const plist = join(homedir(), 'Library', 'LaunchAgents', `${name}.plist`);
+    mkdirSync(dirname(plist), { recursive: true });
+    const items = spec.times.map((t) => {
+      const m = /^(\d{1,2}):(\d{2})$/.exec(String(t).trim());
+      return m ? `    <dict><key>Hour</key><integer>${Number(m[1])}</integer><key>Minute</key><integer>${Number(m[2])}</integer></dict>` : null;
+    }).filter(Boolean);
+    if (!items.length) return { ok: false, error: `backup.schedule.times 解析不出时刻：${JSON.stringify(spec.times)}` };
+    const args = [`"${nodeExe()}"`, `"${script}"`, '--instance', `"${instance}"`, '--rc'].map((a) => `    <string>${a.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</string>`).join('\n');
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${name}</string>
+  <key>ProgramArguments</key><array>
+${args}${spec.verifyAuto ? '\n    <string>--verify-auto</string>' : ''}
+  </array>
+  <key>StartCalendarInterval</key><array>
+${items.join('\n')}
+  </array>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>/tmp/ai-sync-backup.out.log</string>
+  <key>StandardErrorPath</key><string>/tmp/ai-sync-backup.err.log</string>
+</dict></plist>
+`;
+    writeFileSync(plist, xml, 'utf8');
+    const uid = process.getuid ? process.getuid() : 501;
+    spawnSync('launchctl', ['bootout', `gui/${uid}/${name}`], { encoding: 'utf8' });
+    const b = spawnSync('launchctl', ['bootstrap', `gui/${uid}`, plist], { encoding: 'utf8' });
+    if (b.status !== 0) return { ok: false, error: (b.stderr || '').split('\n')[0] || `bootstrap exit ${b.status}` };
+    writeFileSync(specFile, JSON.stringify(spec, null, 2) + '\n', 'utf8');
+    return { ok: true, task: name, via: 'launchd', plist, spec };
+  }
+  if (process.platform !== 'win32') return { ok: true, skipped: true, task: name, detail: '该平台没有安装器（非失败）' };
+  const cmdFile = writeCmdFile(instance, 'backup-cmd.txt', cmdLine);
+  const triggers = `@(${spec.times.map((t) => `New-ScheduledTaskTrigger -Daily -At '${q(t)}'`).join(', ')})`;
+  const ps = `
+$ErrorActionPreference='Stop'
+$action = New-ScheduledTaskAction -Execute '${q(wscriptPath())}' -Argument '"${q(runnerPath())}" "${q(cmdFile)}"' -WorkingDirectory '${q(ENGINE)}'
+$triggers = ${triggers}
+$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 6)
+Register-ScheduledTask -TaskName '${q(name)}' -Action $action -Trigger $triggers -Settings $settings -Force | Out-Null
+Write-Output 'registered'
+`;
+  const r = runPs(ps);
+  if (!r.ok) return { ok: false, error: r.error };
+  writeFileSync(specFile, JSON.stringify(spec, null, 2) + '\n', 'utf8');
   return { ok: true, task: name, via: 'run-hidden.vbs', cmdFile, spec };
+}
+
+/* ---------------------------------------------------------------- 传输层（Syncthing）自启
+ * 与 tick / mirror / backup 不同：Syncthing 是**常驻进程**，触发条件也不同 ——
+ * 登录时启动、失败自动重启、不设执行时限（定时作业那套 -Daily/-At 与 3–6 小时上限都不适用）。
+ * 同样以**机器级**配置为准（`transport.autostart === true` 才注册），否则三端共享的实例配置
+ * 会让没启用的机器也长出一个任务。 */
+
+export const transportTaskName = (cfg) => cfg?.transport?.taskName || 'ai-sync-syncthing';
+export const transportLabel = (cfg) => cfg?.transport?.launchdLabel || 'ai-sync.syncthing';
+export function transportConfigOf(instance, cfg = loadInstance(instance)) {
+  const ib = cfg?.transport || {};
+  const mb = machineCfgOf(instance)?.transport || {};
+  return { ...ib, ...mb };
+}
+/** Syncthing 可执行文件：配置优先 → PATH → winget shim / brew 前缀（与 backup 的 restic 同一套兜底思路） */
+function syncthingExe(instance, cfg) {
+  const t = transportConfigOf(instance, cfg);
+  if (t.exe) return t.exe;
+  const exe = process.platform === 'win32' ? 'syncthing.exe' : 'syncthing';
+  for (const d of (process.env.PATH || '').split(process.platform === 'win32' ? ';' : ':').filter(Boolean)) {
+    const p = join(d, exe);
+    if (existsSync(p)) return p;
+  }
+  return [
+    process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, 'Microsoft', 'WinGet', 'Links', exe),
+    join(homedir(), 'bin', exe),
+    '/opt/homebrew/bin/syncthing',
+    '/usr/local/bin/syncthing'
+  ].filter(Boolean).find((p) => existsSync(p)) || null;
+}
+/** 配置与数据目录：默认各平台的常规位置，可由 transport.home 覆盖 */
+function syncthingHome(instance, cfg) {
+  const t = transportConfigOf(instance, cfg);
+  if (t.home) return String(t.home).replace(/^~/, homedir());
+  return process.platform === 'win32' ? join(process.env.LOCALAPPDATA || homedir(), 'Syncthing') : join(homedir(), 'Library', 'Application Support', 'Syncthing');
+}
+function transportSpecOf(instance, cfg) {
+  const t = transportConfigOf(instance, cfg);
+  return { enabled: t.autostart === true, exe: syncthingExe(instance, cfg), home: syncthingHome(instance, cfg) };
+}
+function readTransportSpec(instance) {
+  try { return JSON.parse(readFileSync(join(instance, 'sync', 'state', 'transport-spec.json'), 'utf8')); } catch { return null; }
+}
+
+export function detectTransport(instance, cfg = loadInstance(instance)) {
+  const spec = transportSpecOf(instance, cfg);
+  const out = { platform: process.platform, task: process.platform === 'darwin' ? transportLabel(cfg) : transportTaskName(cfg), enabled: spec.enabled, want: spec.enabled ? { exe: spec.exe, home: spec.home } : null, installed: false, inSync: null, detail: '' };
+  if (process.platform === 'darwin') {
+    const plist = join(homedir(), 'Library', 'LaunchAgents', `${out.task}.plist`);
+    out.installed = existsSync(plist);
+    out.plist = plist;
+  } else if (process.platform === 'win32') {
+    out.installed = taskExists(out.task);
+  } else {
+    out.detail = '该平台没有安装器（Linux 请自行接 systemd）';
+    return out;
+  }
+  if (!spec.enabled) {
+    out.inSync = !out.installed;
+    out.detail = out.installed ? 'transport.autostart 未开启但任务还在（应卸下）' : '未启用传输层自启（无任务）';
+    return out;
+  }
+  if (!spec.exe) { out.inSync = false; out.detail = '找不到 syncthing 可执行文件（先安装或配 transport.exe）'; return out; }
+  if (!out.installed) { out.inSync = false; out.detail = '任务不存在'; return out; }
+  const rec = readTransportSpec(instance);
+  const same = !!rec && rec.exe === spec.exe && rec.home === spec.home;
+  out.inSync = same;
+  out.detail = same ? '与配置一致' : rec ? `配置已变（上次装的是 ${rec.exe} / ${rec.home}）` : '缺少 transport-spec.json（多半是手工任务，应收编）';
+  return out;
+}
+
+export function unregisterTransport(instance, cfg = loadInstance(instance)) {
+  const name = process.platform === 'darwin' ? transportLabel(cfg) : transportTaskName(cfg);
+  if (process.platform === 'darwin') {
+    const plist = join(homedir(), 'Library', 'LaunchAgents', `${name}.plist`);
+    const uid = process.getuid ? process.getuid() : 501;
+    spawnSync('launchctl', ['bootout', `gui/${uid}/${name}`], { encoding: 'utf8' });
+    try { rmSync(plist, { force: true }); } catch (e) { return { ok: false, task: name, error: e.message }; }
+    return { ok: true, task: name };
+  }
+  if (process.platform !== 'win32') return { ok: true, skipped: true, task: name, detail: '该平台没有安装器（非失败）' };
+  const r = spawnSync('schtasks', ['/delete', '/tn', name, '/f'], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
+  const gone = r.status === 0 || /cannot find|找不到/i.test(`${r.stderr}${r.stdout}`);
+  return gone ? { ok: true, task: name } : { ok: false, error: (r.stderr || r.stdout || '').split('\n')[0] || `exit ${r.status}` };
+}
+
+export function registerTransport(instance, cfg = loadInstance(instance)) {
+  const name = process.platform === 'darwin' ? transportLabel(cfg) : transportTaskName(cfg);
+  const spec = transportSpecOf(instance, cfg);
+  const specFile = join(instance, 'sync', 'state', 'transport-spec.json');
+  if (!spec.enabled) {
+    const del = unregisterTransport(instance, cfg);
+    mkdirSync(dirname(specFile), { recursive: true });
+    writeFileSync(specFile, JSON.stringify(spec, null, 2) + '\n', 'utf8');
+    return { ok: del.ok, task: name, disabled: true, detail: 'transport.autostart 未开启 → 未注册自启', error: del.error };
+  }
+  if (!spec.exe) return { ok: false, error: '找不到 syncthing 可执行文件：请先安装（winget install Syncthing.Syncthing）或设 transport.exe' };
+  if (process.platform === 'darwin') {
+    const plist = join(homedir(), 'Library', 'LaunchAgents', `${name}.plist`);
+    mkdirSync(dirname(plist), { recursive: true });
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${name}</string>
+  <key>ProgramArguments</key><array>
+    <string>${spec.exe}</string>
+    <string>serve</string>
+    <string>--home=${spec.home}</string>
+    <string>--no-browser</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/ai-sync-syncthing.out.log</string>
+  <key>StandardErrorPath</key><string>/tmp/ai-sync-syncthing.err.log</string>
+</dict></plist>
+`;
+    writeFileSync(plist, xml, 'utf8');
+    const uid = process.getuid ? process.getuid() : 501;
+    spawnSync('launchctl', ['bootout', `gui/${uid}/${name}`], { encoding: 'utf8' });
+    const b = spawnSync('launchctl', ['bootstrap', `gui/${uid}`, plist], { encoding: 'utf8' });
+    if (b.status !== 0) return { ok: false, error: (b.stderr || '').split('\n')[0] || `bootstrap exit ${b.status}` };
+    writeFileSync(specFile, JSON.stringify(spec, null, 2) + '\n', 'utf8');
+    return { ok: true, task: name, via: 'launchd', plist, spec };
+  }
+  if (process.platform !== 'win32') return { ok: true, skipped: true, task: name, detail: '该平台没有安装器（非失败）' };
+  const ps = `
+$ErrorActionPreference='Stop'
+$action = New-ScheduledTaskAction -Execute '${q(spec.exe)}' -Argument 'serve --home="${q(spec.home)}" --no-browser'
+$trigger = New-ScheduledTaskTrigger -AtLogOn
+$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskName '${q(name)}' -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
+Write-Output 'registered'
+`;
+  const r = runPs(ps);
+  if (!r.ok) return { ok: false, error: r.error };
+  writeFileSync(specFile, JSON.stringify(spec, null, 2) + '\n', 'utf8');
+  return { ok: true, task: name, via: 'scheduled-task', spec };
 }
 
 function registerMac(instance, interval) {
@@ -506,43 +808,59 @@ if (isMain) {
   if (argv.includes('--unregister')) {
     const t = unregisterTick(INSTANCE);
     const m = unregisterMirror(INSTANCE, cfg);
-    result = { action: 'unregister', ...t, mirror: m };
+    const b = unregisterBackup(INSTANCE, cfg);
+    const tr = unregisterTransport(INSTANCE, cfg);
+    result = { action: 'unregister', ...t, mirror: m, backup: b, transport: tr };
   } else if (argv.includes('--register')) {
     const r = process.platform === 'win32' ? registerWindows(INSTANCE, interval) : process.platform === 'darwin' ? registerMac(INSTANCE, interval) : { ok: false, error: '该平台未提供安装器' };
     // 镜像调度：enabled=false 时 registerMirror 会主动卸下 —— 装上/卸下都由它一处收敛。
     // macOS 返回 skipped（未实现），不算失败，但 detail 会一路带到 status 里（跳过必须看得见）。
     const m = registerMirror(INSTANCE, cfg);
-    result = { action: 'register', interval, ...r, ok: r.ok !== false && (m.ok !== false || m.skipped === true), mirror: m };
+    // 备份调度（2026-09-19）：同款机制；未启用备份的机器返回 disabled，同样不算失败。
+    const b = registerBackup(INSTANCE, cfg);
+    // 传输层自启（2026-09-19）：常驻进程，触发条件不同（登录 + 失败重启 + 不限时）。
+    const tr = registerTransport(INSTANCE, cfg);
+    result = { action: 'register', interval, ...r, ok: r.ok !== false && (m.ok !== false || m.skipped === true) && (b.ok !== false || b.skipped === true) && (tr.ok !== false || tr.skipped === true), mirror: m, backup: b, transport: tr };
   } else {
     const d = detectSchedule(INSTANCE, cfg);
-    result = { action: 'status', ...d, mirror: detectMirror(INSTANCE, cfg) };
+    result = { action: 'status', ...d, mirror: detectMirror(INSTANCE, cfg), backup: detectBackup(INSTANCE, cfg), transport: detectTransport(INSTANCE, cfg) };
   }
 
   if (json) console.log(JSON.stringify(result, null, 2));
   else {
-    const mirrorLine = (m, mode) => {
-      if (!m) return null;
-      if (m.skipped) return `   [--] 镜像调度：${m.detail || '该平台未实现'}`;
+    /** 作业调度行（mirror / backup 共用一套措辞，避免两处漂移） */
+    const jobLine = (j, mode, label) => {
+      if (!j) return null;
+      if (j.skipped) return `   [--] ${label}调度：${j.detail || '该平台未实现'}`;
       if (mode === 'register') {
-        if (m.disabled) return `   [--] 镜像调度：${m.detail}`;
-        if (m.ok) return `   [OK] 镜像调度：${m.task}（${m.spec ? (m.spec.mode === 'interval' ? `每 ${m.spec.intervalMinutes} 分钟` : m.spec.times.join(' / ')) : ''}）`;
-        return `   [FAIL] 镜像调度：${m.error || m.detail}`;
+        if (j.disabled) return `   [--] ${label}调度：${j.detail}`;
+        if (j.ok) return `   [OK] ${label}调度：${j.task}（${j.spec ? (j.spec.mode === 'interval' ? `每 ${j.spec.intervalMinutes} 分钟` : (j.spec.times || []).join(' / ')) : ''}）`;
+        return `   [FAIL] ${label}调度：${j.error || j.detail}`;
       }
-      const st = m.enabled === false ? '已关闭' : m.inSync === true ? 'OK' : m.inSync === false ? '不一致' : '未实现';
-      return `   镜像：${m.task} → ${st}${m.detail ? ` · ${m.detail}` : ''}`;
+      const st = j.enabled === false ? '已关闭' : j.inSync === true ? 'OK' : j.inSync === false ? '不一致' : '未实现';
+      return `   ${label}：${j.task} → ${st}${j.detail ? ` · ${j.detail}` : ''}`;
     };
     if (result.action === 'status') {
       console.log(`   调度：${result.task ?? '(无)'} → ${result.installed ? (result.inSync ? 'OK' : '间隔不一致') : '未安装'}（配置 ${result.want} 分钟${result.installed ? ` / 实际 ${result.actual}${result.unit === 'sec' ? 's' : ' 分钟'}` : ''}）${result.detail ? ` · ${result.detail}` : ''}`);
-      const ml = mirrorLine(result.mirror, 'status');
+      const ml = jobLine(result.mirror, 'status', '镜像');
       if (ml) console.log(ml);
+      const bl = jobLine(result.backup, 'status', '备份');
+      if (bl) console.log(bl);
+      const tl = jobLine(result.transport, 'status', '传输');
+      if (tl) console.log(tl);
     } else {
       if (result.ok) console.log(`   [OK] ${result.action} 成功${result.task ? `（${result.task}）` : ''}`);
       else console.log(`   [FAIL] ${result.action} 失败：${result.error || result.detail}`);
-      const ml = mirrorLine(result.mirror, 'register');
+      const ml = jobLine(result.mirror, 'register', '镜像');
       if (ml) console.log(ml);
+      const bl = jobLine(result.backup, 'register', '备份');
+      if (bl) console.log(bl);
+      const tl = jobLine(result.transport, 'register', '传输');
+      if (tl) console.log(tl);
     }
   }
-  // 报告模式：调度不一致 → 2；动作模式：真失败 → 3。镜像只有**启用且明确不一致**才算不一致（未实现的平台不冤枉报错）。
-  const mirrorBad = result.mirror && result.mirror.enabled !== false && result.mirror.inSync === false;
-  process.exitCode = result.action === 'status' ? (!result.installed || result.inSync === false || mirrorBad ? 2 : 0) : result.ok ? 0 : 3;
+  // 报告模式：调度不一致 → 2；动作模式：真失败 → 3。作业只有**启用且明确不一致**才算不一致（未实现的平台不冤枉报错）。
+  const bad = (j) => j && j.enabled !== false && j.inSync === false;
+  const jobBad = bad(result.mirror) || bad(result.backup) || bad(result.transport);
+  process.exitCode = result.action === 'status' ? (!result.installed || result.inSync === false || jobBad ? 2 : 0) : result.ok ? 0 : 3;
 }

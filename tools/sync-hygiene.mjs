@@ -61,6 +61,10 @@ const R4_RULES = [
   // ⇒ 每加一类 state 文件，必须**同时**进 .gitignore 与本规则，否则门禁永远追不上。
   { re: /^sync\/state\/(hygiene|migrations|apply|triage|ops-bundle)-[^\/]+\.json$/i, why: '每机状态文件（本机才有意义）：会被各端反复改写 ⇒ 不入 git' },
   { re: /^sync\/state\/\.heartbeat-alert-[^\/]+\.json$/i, why: '每机心跳告警去重状态（2026-09-18 新增）：机器本地，随 R4 三处登记纪律一并加入' },
+  // 2026-09-19：备份层（误删防线）引入的两类新状态 + 一类凭据。凭据类尤其不能入库。
+  { re: /^sync\/state\/backup-[^\/]+\.json(\.tmp)?$/i, why: '每机备份状态（2026-09-19 新增）：含本机绝对路径、快照 ID、删除审计样本 ⇒ 机器本地' },
+  { re: /^sync\/state\/\.backup-[^\/]+\.env$/i, why: '每机 restic 仓库密码（2026-09-19 新增）：★凭据★，入库即等于把备份钥匙交给所有能读仓的人' },
+  { re: /^sync\/state\/transport-[^\/]+\.json$/i, why: '每机传输器健康快照（2026-09-19 预留）：Syncthing REST 抓的本机状态，机器本地' },
   { re: /^(settings\.yaml|opencode\.jsonc|cordis\.patch\.yml)$/i, why: '工具自写的 live 配置：各端各写，会 ping-pong（插件源码里的同名文件不受此规则约束）' },
   { re: /\.local-[A-Za-z0-9_.-]+-\d{8}\./i, why: '冲突侧车文件：只应存在于工作区，不应入库' },
 ]

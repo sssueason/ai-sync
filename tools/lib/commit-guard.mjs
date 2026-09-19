@@ -218,7 +218,16 @@ export function assessWorktree(repo, { rules = BUILTIN_RULES, apply = false, pro
       notes.push('[REVIEW] 未启用代码路径审核门（缺 machine 或 homeMachine；由 instance.json 的 governance.homeMachine 提供）');
     } else if (machine !== homeMachine) {
       const isProtected = makeMatcher(protectedRules);
-      codeReviewPaths = stagedPaths.filter((p) => isProtected(p));
+      // ★ 2026-09-19 收窄（对端反馈：迁移 `--switch` 改本机机器配置，被移出暂存区 ⇒ 紧接着的
+      //   `pull --rebase` 直接失败 "You have unstaged changes"，每次远端有新提交都复现）：
+      //   **本机自己的** sync/machines/<machine>.json 允许提交 —— 它是本机自己的 live 配置，
+      //   与 sync/state/tick-<machine>.json 同一性质（每机唯一写者、被设计成要跨机可见）。
+      //   **别人的**机器配置仍归 home。风险不升：改自己机器配置 ≠ 能执行代码（代码面全拦），
+      //   而"调整自己这台机的同步范围"本机本来就能做。
+      const ownCfg = `sync/machines/${machine}.json`;
+      const protectedHits = stagedPaths.filter((p) => isProtected(p));
+      codeReviewPaths = protectedHits.filter((p) => p !== ownCfg);
+      if (protectedHits.includes(ownCfg)) notes.push(`[REVIEW] 本机自己的机器配置允许提交（每机唯一写者，可审计）：${ownCfg}`);
       if (codeReviewPaths.length) {
         if (apply) for (const p of codeReviewPaths) git(repo, ['reset', '-q', '--', p]);
         notes.push(`[REVIEW] 代码路径已移出暂存区（本机 ${machine} 无提交权，需 ${homeMachine} 审核后落）：${codeReviewPaths.slice(0, 8).join(', ')}${codeReviewPaths.length > 8 ? ' …' : ''}`);

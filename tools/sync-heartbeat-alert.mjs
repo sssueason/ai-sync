@@ -26,6 +26,7 @@ import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir, hostname } from 'node:os';
 import { spawn } from 'node:child_process';
+import { maintenanceOf as maintOf, maintText } from './lib/maintenance.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const argv = process.argv.slice(2);
@@ -72,6 +73,15 @@ const STALE_MIN = Number(val('--stale-min', String(TICK_INTERVAL_MIN * 4)));    
 const HEAVY_STALE_H = Number(val('--heavy-stale-hours', '26')); // 重活判停阈值（契约值）
 const SNAP_STALE_H = Number(val('--snap-stale-hours', '14'));   // 快照自身过期阈值（daily 1–2 次/天 ⇒ 14h 足够宽）
 const SNAP_FRESH_H = Number(val('--snap-fresh-hours', '2'));    // "敢断言对端 tick 停了"的前提：快照足够新鲜
+
+/* ★ 跨端维护登记（2026-09-19 新增，闭掉审计里的"对端维护状态互相不可见"）：
+ *   本机做维护时，对端只能从"它不 tick 了"推断，长得和故障一模一样 —— 实测某台对端按用户指令
+ *   暂停自动化后，本机每轮都判"该机 tick 疑似已停"，并在 6 小时里反复弹。所以维护也要**有登记**。
+ *   与本地 .freeze-<machine> 的分工：本地标记 = 瞬时、不必让对端知道；本文件 = 跨天、要让对端别报。
+ *   到期自动恢复判活（避免"维护"变成永久静默）。
+ *   规则实现在 tools/lib/maintenance.mjs（与传输健康检查共用一份 —— 2026-09-19 实测踩过
+ *   "心跳降级了但健康检查仍判 FAIL"这种同一件事两套判据）。 */
+const maintenanceOf = (who) => maintOf(INSTANCE, who);
 
 const machine =
   process.env.AI_SYNC_MACHINE ||
@@ -120,6 +130,9 @@ function ageMinFrom(ts) { const t = parseTs(ts); return t === null ? null : ageM
 
 function checkSelf() {
   if (TOLERANT.has(machine)) { infos.push(`本机（${machine}）登记为**宽容同步**（移动端/按需）⇒ 不预警，仅记录`); return; }
+  const ms = maintenanceOf(machine);
+  if (ms && !ms.expired) { infos.push(`本机：${maintText(ms)} ⇒ 跳过 tick 判活`); return; }
+  if (ms && ms.expired) infos.push(`本机：维护登记已于 ${ms.until} 到期 ⇒ 恢复判活（若仍在维护请续期，否则删掉该条）`);
   const frozen = freezeReason();
   if (frozen) { infos.push(`本机：${frozen} ⇒ 跳过 tick 判活（维护中的停摆是预期的）`); return; }
   const cands = [join(LOGS, `tick-${machine}.log`)];
@@ -157,6 +170,12 @@ function checkPeers() {
       infos.push(`${who}: 登记为**宽容同步**（移动端/按需）⇒ 不预警，仅记录（快照 ${j.writtenAt || '?'}，最后 tick ${j.tick?.lastAt || '?'}）`);
       continue;
     }
+    const mm = maintenanceOf(who);
+    if (mm && !mm.expired) {
+      infos.push(`${who}: ${maintText(mm)} ⇒ 不预警，仅记录（快照 ${j.writtenAt || '?'}，最后 tick ${j.tick?.lastAt || '?'}）`);
+      continue;
+    }
+    if (mm && mm.expired) infos.push(`${who}: 维护登记已于 ${mm.until} 到期 ⇒ 恢复判活（若仍在维护请续期，否则删掉该条）`);
     const writtenAt = parseTs(j.writtenAt);
     const lastTick = parseTs(j.tick?.lastAt);
     const heavyAt = parseTs(j.heavy?.lastStartedAt);

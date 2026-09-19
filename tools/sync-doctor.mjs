@@ -308,6 +308,57 @@ if (isMain) {
     }
   }
 
+  /* ---------------------------------------------------------------- 7) 备份层（restic）
+   * 只读**状态文件**，不重跑备份（doctor 每 20 分钟跑一次，重跑一次备份等于每轮走 19 万文件）。
+   * 阈值全部从 sync/backup/policy.json 派生，不硬编码（本项目的规矩：阈值必须能追溯到配置）。
+   * 只在机器**确实声明启用**时才检查 —— 否则没装备份的机器会被每轮判红。 */
+  const mcfg = (() => { try { return JSON.parse(readFileSync(join(INSTANCE, 'sync', 'machines', `${machine}.json`), 'utf8')); } catch { return null; } })();
+  if (mcfg?.backup?.enabled === true) {
+    const pol = (() => { try { return JSON.parse(readFileSync(join(INSTANCE, 'sync', 'backup', 'policy.json'), 'utf8')); } catch { return {}; } })();
+    const bstate = (() => { try { return JSON.parse(readFileSync(join(INSTANCE, 'sync', 'state', `backup-${machine}.json`), 'utf8')); } catch { return null; } })();
+    const parseTs = (s) => { const m = String(s || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/); return m ? new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime() : null; };
+    const ageH = (s) => { const t = parseTs(s); return t === null ? null : (Date.now() - t) / 3600000; };
+    const ageD = (s) => { const h = ageH(s); return h === null ? null : h / 24; };
+    const fresh = ageH(bstate?.lastRunAt);
+    add('备份新鲜度', fresh === null ? 'FAIL' : fresh <= 36 ? 'PASS' : 'FAIL', '≤ 36 小时内有成功快照',
+      bstate ? `${fresh === null ? '时间戳解析失败' : fresh.toFixed(1) + ' 小时前'}（${bstate.snapshot?.shortId || '无快照'}）` : '没有状态文件（备份任务还没跑过？）');
+    if (bstate) {
+      add('备份无待处理信号', bstate.attention ? 'FAIL' : 'PASS', 'attention=false',
+        bstate.attention ? `需要人看一眼：${(bstate.flags || []).join('、') || '见状态文件'}` : `${(bstate.flags || []).join('、') || '无'}`);
+      const cEvery = pol.verify?.checkEveryDays ?? 7, dEvery = pol.verify?.drillEveryDays ?? 30;
+      // 演练红线按**已批准方案**写死为 35 天（方案 §6：超过 35 天没跑演练 ⇒ doctor FAIL）；
+      // 30–35 天之间只 WARN（还没到方案红线，但该做了）。
+      const dFail = pol.verify?.drillFailDays ?? 35;
+      const cAge = ageD(bstate.verify?.check?.at), dAge = ageD(bstate.verify?.drill?.at);
+      const lvl = (a, every) => (a === null ? 'FAIL' : a <= every ? 'PASS' : a <= every * 2 ? 'WARN' : 'FAIL');
+      add('备份数据校验时效', lvl(cAge, cEvery), `≤ ${cEvery} 天跑一次 restic check（超 ${cEvery * 2} 天判红）`,
+        cAge === null ? '从未跑过' : `${cAge.toFixed(1)} 天前${bstate.verify?.check?.ok === false ? '（上次失败）' : ''}`);
+      add('恢复演练时效', dAge === null ? 'FAIL' : dAge <= dEvery ? 'PASS' : dAge <= dFail ? 'WARN' : 'FAIL',
+        `≤ ${dEvery} 天做一次恢复演练（超 ${dFail} 天判红，按方案 §6）`,
+        dAge === null ? '从未做过' : `${dAge.toFixed(1)} 天前，上次 ${bstate.verify?.drill ? `${bstate.verify.drill.samples - bstate.verify.drill.failed}/${bstate.verify.drill.samples} 通过` : '无记录'}`);
+      const cap = bstate.verify?.capacity?.freePercent;
+      if (typeof cap === 'number') add('备份盘余量', cap < (pol.capacity?.diskFreeAlertPercent ?? 20) ? 'FAIL' : 'PASS', `≥ ${pol.capacity?.diskFreeAlertPercent ?? 20}%`, `${cap}%`);
+    }
+  }
+
+  /* ---------------------------------------------------------------- 8) 传输层（Syncthing）
+   * 只调 tools/syncthing-health.mjs（判据的单一源），把它的结论映射成 doctor 的检查项；
+   * 同样只在机器声明了自启（transport.autostart=true）时才查，避免给"还没装"的机器每轮判红。 */
+  if (mcfg?.transport?.autostart === true) {
+    const declared = (mcfg.transport.folders || []).length;
+    const r = spawnSync(process.execPath, [join(ENGINE, 'tools', 'syncthing-health.mjs'), '--instance', INSTANCE, '--json', '--no-write'], { encoding: 'utf8', timeout: 30000, windowsHide: true });
+    let h = null; try { h = JSON.parse(r.stdout || ''); } catch { /* 没输出 */ }
+    if (!h) add('传输层可检查', 'FAIL', 'syncthing-health 给出 JSON', `rc=${r.status} ${(r.stderr || '').slice(0, 120)}`);
+    else {
+      add('传输层 REST 可达', h.reachable ? 'PASS' : 'FAIL', '本机 Syncthing 在跑且能连', h.reachable ? String(h.version || '已连上') : (h.problems || []).join('；') || '连不上');
+      add('传输层无问题项', (h.problems || []).length ? 'FAIL' : 'PASS', '0 个问题', (h.problems || []).length ? h.problems.join('；') : '0');
+      if (declared && !(h.folders || []).length) add('传输层 folder 已落', 'WARN', `配置声明 ${declared} 个 folder`, 'Syncthing 里 0 个（还没 --provision？未迁到的集合归 µ2 管，属正常）');
+      else if (declared) add('传输层 folder 已落', 'PASS', `配置声明 ${declared} 个 folder`, `已落 ${(h.folders || []).length} 个`);
+      const unreg = (h.connections || []).length === 0 && (h.knownPeers || []).length === 0;
+      if (unreg) add('传输层对端登记', 'WARN', '至少登记一个对端 device ID', 'devices.json 里还没有对端');
+    }
+  }
+
   const fails = checks.filter((c) => c.level === 'FAIL');
   if (JSON_OUT) console.log(JSON.stringify({ instance: INSTANCE, machine, checks, fails: fails.length }, null, 2));
   else if (!QUIET) {

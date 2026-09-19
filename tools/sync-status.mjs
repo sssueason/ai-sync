@@ -451,35 +451,50 @@ else add('tick 间隔与配置一致', 'PASS', `配置 ${schedule.want} 分钟`,
 // 镜像调度：这条断言的存在意义就是不让 cloudMirror.schedule 重新变成死旋钮
 if (schedule.mirror) {
   const m = schedule.mirror;
-  if (m.enabled === false) add('镜像调度按配置关闭', m.installed ? 'FAIL' : 'PASS', 'enabled=false ⇒ 无任务', m.installed ? `${m.task} 仍存在（应卸下）` : '已关闭（无任务）');
-  else if (m.skipped || m.inSync === null) add('镜像调度', 'WARN', '该平台应有镜像调度', m.detail || '未实现/未知');
-  else if (m.installed && m.inSync === true) add('镜像调度与配置一致', 'PASS', `${m.task} 已按配置注册`, m.detail || '一致');
-  else add('镜像调度与配置一致', 'FAIL', `${m.task} 与 cloudMirror.schedule 一致`, m.installed ? m.detail || '时间/模式不一致' : `${m.task} 不存在`);
+  if (m.enabled === false) add('夜间任务调度按配置关闭', m.installed ? 'FAIL' : 'PASS', 'enabled=false ⇒ 无任务', m.installed ? `${m.task} 仍存在（应卸下）` : '已关闭（无任务）');
+  else if (m.skipped || m.inSync === null) add('夜间任务调度', 'WARN', '该平台应有夜间调度', m.detail || '未实现/未知');
+  else if (m.installed && m.inSync === true) add('夜间任务调度与配置一致', 'PASS', `${m.task} 已按配置注册`, m.detail || '一致');
+  else add('夜间任务调度与配置一致', 'FAIL', `${m.task} 与 cloudMirror.schedule 一致`, m.installed ? m.detail || '时间/模式不一致' : `${m.task} 不存在`);
 }
 
 /* 镜像"真的跑过"（2026-09-18 新增）：调度注册 ≠ 跑过。实测两种误判都会发生 ——
    ① 假红：重新注册会把 LastRunTime 重置成"从未运行"（本次就见到 267011），任务看着从没跑过；
    ② 假绿：任务在、但每晚静默失败时没人会去看那份 transcript。
-   所以判据用**产物**：tree-sync 报告是镜像每轮写一个的文件（sync/reports/tree-sync-*.md）。 */
+
+   2026-09-19 改判据（§6 退役）：原判据"≤36h 内有 tree-sync 报告"在 µ2 退役后**必然假红** ——
+   夜间槽改成只跑 doctor、不再写 tree-sync 报告（campus 09-19 预判 09-20 11:26 转红：判据本身失效了）。
+   新判据 = **夜间槽自己的产物**：sync/logs/daily-*.log 末尾那条 `=== daily end ... rc=N ===`。
+   · 与"槽里跑什么"无关（跑完整 daily 还是只跑 doctor，都写这一行）⇒ 职责再变也不会失效；
+   · 直接回答"跑过没有、成没成"，比 tree-sync 报告这个**副产物**更贴近问题本身；
+   · 未配置夜间槽（enabled=false 且没给 script）时按"按配置关闭"处理，不给红。 */
 {
   const mirrorCfg = cfg.cloudMirror || {};
-  const rdir = join(INSTANCE, 'sync', 'reports');
+  const MIRROR_MAX_H = 36;
+  const nightlyConfigured = mirrorCfg.enabled !== false || !!mirrorCfg.script;
+  const ldir = join(INSTANCE, 'sync', 'logs');
   let newest = null;
   try {
-    for (const f of readdirSync(rdir)) {
-      if (!/^tree-sync-.*\.md$/.test(f)) continue;
-      const st = statSync(join(rdir, f));
-      if (!newest || st.mtimeMs > newest.mtimeMs) newest = { f, mtimeMs: st.mtimeMs };
+    for (const f of readdirSync(ldir)) {
+      if (!/^daily-.*\.log$/.test(f)) continue;
+      const st = statSync(join(ldir, f));
+      if (!newest || st.mtimeMs > newest.mtimeMs) newest = { f, mtimeMs: st.mtimeMs, path: join(ldir, f) };
     }
   } catch {}
-  const MIRROR_MAX_H = 36;
-  if (mirrorCfg.enabled === false) add('镜像实际运行', 'PASS', '按配置关闭', 'cloudMirror.enabled=false');
-  else if (!newest) add('镜像实际运行', 'WARN', `≤ ${MIRROR_MAX_H} 小时内有 tree-sync 报告`, '本机没有 tree-sync 报告（首次注册？或该机镜像由对侧代跑）');
+  if (!nightlyConfigured) add('夜间任务实际运行', 'PASS', '按配置关闭', 'cloudMirror.enabled=false 且未配置 script ⇒ 无夜间任务');
+  else if (!newest) add('夜间任务实际运行', 'WARN', `≤ ${MIRROR_MAX_H} 小时内有 daily 日志`, '本机没有 sync/logs/daily-*.log（首次注册？）');
   else {
     const ageH = (Date.now() - newest.mtimeMs) / 3600000;
-    const detail = `${newest.f}（${ageH.toFixed(1)} 小时前）`;
-    if (ageH <= MIRROR_MAX_H) add('镜像实际运行', 'PASS', `≤ ${MIRROR_MAX_H} 小时内有 tree-sync 报告`, detail);
-    else add('镜像实际运行', 'FAIL', `≤ ${MIRROR_MAX_H} 小时内有 tree-sync 报告`, `${detail} —— 镜像可能没在跑：查 sync/logs/daily-*.log 的 seed/tree-sync 段，或手动跑 seed-mu2.ps1`);
+    let rc = null;
+    try {
+      const txt = readFileSync(newest.path, 'utf8');
+      const ms = [...txt.matchAll(/^=== daily end .*?rc=(-?\d+) ===$/gm)];
+      if (ms.length) rc = Number(ms[ms.length - 1][1]);
+    } catch {}
+    const detail = `${newest.f}（${ageH.toFixed(1)} 小时前${rc === null ? '' : `，末次 rc=${rc}`}）`;
+    if (ageH > MIRROR_MAX_H) add('夜间任务实际运行', 'FAIL', `≤ ${MIRROR_MAX_H} 小时内有 daily 日志`, `${detail} —— 夜间任务可能没在跑：查计划任务/launchd 的 ${mirrorCfg.taskName || 'ai-sync-mirror'}，或手动跑 sync/daily.ps1`);
+    else if (rc === null) add('夜间任务实际运行', 'WARN', '末次运行有 rc 记录', `${detail} —— 找不到 '=== daily end ... rc=N ===' 行（旧版脚本？）`);
+    else if (rc !== 0) add('夜间任务实际运行', 'FAIL', '末次运行 rc=0', `${detail} —— 失败阶段见该日志的 'failed stages' 行`);
+    else add('夜间任务实际运行', 'PASS', `≤ ${MIRROR_MAX_H} 小时内跑过且 rc=0`, detail);
   }
 }
 
@@ -616,6 +631,79 @@ for (const [id, s] of Object.entries(fleet.machines)) {
 }
 if (fleet.note && !JSON_OUT && !QUIET) checks.push({ name: '状态分支', level: 'INFO', expected: cfg.state.branch, actual: fleet.note });
 
+/* ---- 备份层与传输层（P7 观测）----
+ * 数据来自 tools/backup-run.mjs 与 tools/syncthing-health.mjs 写的**状态文件**；此处只做展示，
+ * 判据一律**引用它们已给出的结论**（例如 audit.tripped），不在这里重算一遍 —— 否则又是两套判据。 */
+const tCfg = (() => { try { return JSON.parse(readFileSync(join(INSTANCE, 'sync', 'machines', `${machine}.json`), 'utf8')); } catch { return null; } })();
+const ageMinOf = (s) => { const t = parseStamp(s); return t === null ? null : mins(t); };
+let backup = null, transport = null;
+
+if (tCfg?.backup?.enabled === true) {
+  const bs = (() => { try { return JSON.parse(readFileSync(join(INSTANCE, 'sync', 'state', `backup-${machine}.json`), 'utf8')); } catch { return null; } })();
+  if (!bs) add('备份已跑过', 'FAIL', `有 backup-${machine}.json`, '没有状态文件（备份任务还没跑过？）');
+  else {
+    const ageMin = ageMinOf(bs.lastRunAt);
+    backup = {
+      at: bs.lastRunAt, snapshot: bs.snapshot?.shortId || null, ageMin, ok: bs.ok !== false,
+      attention: !!bs.attention, flags: bs.flags || [], scopeFiles: bs.scope?.files ?? null,
+      scopeBytes: bs.scope?.bytes ?? null, removed: bs.removed || null, added: bs.added || null,
+      unreadable: (bs.unreadable || []).length, verify: bs.verify || null,
+      capacity: bs.verify?.capacity || bs.capacity || null
+    };
+    add('备份新鲜度', ageMin === null ? 'FAIL' : ageMin <= 36 * 60 ? 'PASS' : 'FAIL', '≤ 36 小时',
+      ageMin === null ? '时间戳异常' : `${(ageMin / 60).toFixed(1)} 小时前（${backup.snapshot || '无快照'}）`);
+    if (backup.attention) add('备份待处理信号', 'FAIL', 'attention=false', (backup.flags || []).join('、') || '见状态文件');
+    if (backup.unreadable) add('备份读不到的文件', 'WARN', '0 个', `${backup.unreadable} 个（清单变化才升级，见 backup-restic.md §6）`);
+    if (backup.removed) {
+      add('误删审计', bs.audit?.tripped ? 'FAIL' : 'PASS', `≤ ${bs.audit?.thresholds?.files ?? 20} 个 · ≤ ${Math.round((bs.audit?.thresholds?.bytes ?? 209715200) / 1048576)} MB`,
+        `上次比对：删除 ${backup.removed.files} 个 / ${(backup.removed.bytes / 1048576).toFixed(1)} MB，新增 ${backup.added?.files ?? 0} 个`);
+    }
+    const d = backup.verify?.drill, c = backup.verify?.check;
+    if (c) add('备份数据校验', c.ok ? 'PASS' : 'FAIL', 'restic check 通过', c.ok ? `OK（抽样 ${c.subset}，${c.durationSec}s）` : `上次失败：${c.detail || ''}`);
+    if (d) add('恢复演练', d.failed ? 'FAIL' : 'PASS', '样本全部恢复且哈希一致', `${d.samples - d.failed}/${d.samples} 通过（${d.at || '?'}）`);
+    if (backup.capacity?.freePercent != null) add('备份盘余量', backup.capacity.freePercent < 20 ? 'FAIL' : 'PASS', '≥ 20%', `${backup.capacity.freePercent}%`);
+  }
+}
+
+if (tCfg?.transport?.autostart === true || (tCfg?.transport?.folders || []).length) {
+  const tstate = (() => { try { return JSON.parse(readFileSync(join(INSTANCE, 'sync', 'state', `transport-${machine}.json`), 'utf8')); } catch { return null; } })();
+  const h = tstate?.health || null;
+  if (!h) add('传输层健康快照', 'WARN', `有 transport-${machine}.json 的 health 段`, '没有快照 —— 跑一次 node tools/syncthing-health.mjs');
+  else {
+    const ageMin = ageMinOf(h.at);
+    transport = {
+      at: h.at, ageMin, reachable: !!h.reachable, version: h.version || null,
+      folders: (h.folders || []).map((f) => ({ id: f.id, state: f.state, paused: f.paused, needFiles: f.needFiles, localFiles: f.localFiles, globalFiles: f.globalFiles, versioning: f.versioning, peersDone: f.peersDone || [] })),
+      connections: (h.connections || []).map((c) => ({ machine: c.machine, connected: c.connected, viaRelay: c.viaRelay, type: c.type, tolerated: c.tolerated })),
+      problems: h.problems || [], foldersDeclared: (tCfg.transport.folders || []).length
+    };
+    add('传输层健康快照', ageMin !== null && ageMin <= statePushMinutes * 2 ? 'PASS' : 'WARN', `≤ ${statePushMinutes * 2} 分钟`,
+      ageMin === null ? '时间戳异常' : `${ageMin} 分钟前`);
+    add('传输层 REST 可达', h.reachable ? 'PASS' : 'FAIL', '本机 Syncthing 在跑且能连', h.reachable ? String(h.version || '已连上') : (h.problems || []).join('；'));
+    add('传输层无问题项', (h.problems || []).length ? 'FAIL' : 'PASS', '0 个', (h.problems || []).length ? h.problems.join('；') : '0');
+    if (transport.connections.length) {
+      add('传输层对端连接', transport.connections.some((c) => c.connected) ? 'PASS' : 'WARN', '至少一个对端连上',
+        transport.connections.map((c) => `${c.machine}:${c.connected ? (c.viaRelay ? '中继' : '直连') : '未连'}`).join(' '));
+    }
+    add('传输层 folder 已落', transport.folders.length === 0 && transport.foldersDeclared > 0 ? 'WARN' : 'PASS',
+      `配置声明 ${transport.foldersDeclared} 个`, `Syncthing 里 ${transport.folders.length} 个（未迁到的集合归 µ2 管，属正常）`);
+    /* 每 folder 一行 —— **只报不健康的那些**（A9 要"一屏看到每 folder 状态"，但 14 个健康的行会把表淹掉：
+     * 健康的用上面的汇总行代表，异常的才单独列出，这是"信号 vs 噪音"的取舍）。 */
+    for (const f of transport.folders) {
+      const bad = f.paused || (f.state && f.state !== 'idle') || (f.needFiles ?? 0) > 0 || (f.versioning && f.versioning !== 'staggered');
+      if (!bad) continue;
+      const why = [
+        f.paused ? '已暂停' : null,
+        f.state && f.state !== 'idle' ? `state=${f.state}` : null,
+        (f.needFiles ?? 0) > 0 ? `待同步 ${f.needFiles} 个` : null,
+        f.versioning && f.versioning !== 'staggered' ? `版本化=${f.versioning}（应为 staggered，误删防线 L1 缺失）` : null
+      ].filter(Boolean).join(' · ');
+      add(`传输层 folder ${f.id}`, f.versioning && f.versioning !== 'staggered' ? 'FAIL' : 'WARN',
+        'idle · 待同步 0 · staggered', `${why}（本地 ${f.localFiles ?? '?'} / 全局 ${f.globalFiles ?? '?'}；对端 ${(f.peersDone || []).map((p) => `${p.machine}=${p.completion}%`).join(' ') || '无' }）`);
+    }
+  }
+}
+
 const actions = [
   ...conv.actions.map((a) => ({ source: machine, level: a.level || 'warn', text: a.text })),
   ...fleetList.flatMap((m) => (m.actions || []).map((a) => ({ source: m.machine, level: a.level || 'warn', text: a.text }))),
@@ -637,6 +725,8 @@ const payload = {
   lastSyncAgoMin: tickAge,
   intervalMinutes: cfg.tick.intervalMinutes,
   checks,
+  backup,
+  transport,
   problems,
   warnings: warns,
   actions,
