@@ -707,12 +707,21 @@ else {
 
 if (conv.statePush && conv.statePush.ok === false) add('跨端状态已推送', 'WARN', '推送成功', conv.statePush.error || '上轮推送失败');
 
+/* 宽容同步的机器（instance.json 的 heartbeat.tolerantMachines，用户 2026-09-18 裁决）：
+   移动端 / 按需同步的机器**不预警**，只记 INFO。判据必须与 tools/sync-heartbeat-alert.mjs **同一处** ——
+   否则同一个名单"一个工具认、另一个不认"（2026-09-19 实测：心跳工具对同一台机器说"仅记录、不预警"，
+   状态页却按 40 分钟阈值每天挂黄；而笔记本合盖本就是它的正常状态）⇒ 又是一条会训练人忽略黄色的假红。 */
+const tolerantMachines = new Set((cfg.heartbeat?.tolerantMachines || []).map((x) => String(x)));
 const fleetList = [];
 for (const [id, s] of Object.entries(fleet.machines)) {
   const age = mins(parseStamp(s.at));
   fleetList.push({ machine: id, at: s.at, ageMin: age, rc: s.tick?.rc ?? null, actions: s.actions || [], intervalMin: s.tick?.intervalMin ?? null, engineRev: s.engineRev ?? null, engineBehind: s.engineBehind ?? null, engineCompared: s.engineCompared ?? null, ops: s.ops ?? null });
   if (age !== null && age > statePushMinutes * 2 && id !== machine) {
-    add(`远端 ${id} 状态新鲜`, 'WARN', `≤ ${statePushMinutes * 2} 分钟`, `${age} 分钟前`);
+    if (tolerantMachines.has(id)) {
+      checks.push({ name: `远端 ${id} 状态新鲜`, level: 'INFO', expected: `≤ ${statePushMinutes * 2} 分钟（宽容同步机仅记录）`, actual: `${age} 分钟前 · 登记为宽容同步（移动端/按需）⇒ 不预警` });
+    } else {
+      add(`远端 ${id} 状态新鲜`, 'WARN', `≤ ${statePushMinutes * 2} 分钟`, `${age} 分钟前`);
+    }
   }
 }
 if (fleet.note && !JSON_OUT && !QUIET) checks.push({ name: '状态分支', level: 'INFO', expected: cfg.state.branch, actual: fleet.note });
