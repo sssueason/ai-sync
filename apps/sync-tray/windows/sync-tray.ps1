@@ -237,7 +237,7 @@ function Invoke-Tick {
   if (Test-Path $nodeTick) {
     $node = (Get-Command node -ErrorAction SilentlyContinue).Source
     if (-not $node) { [System.Windows.Forms.MessageBox]::Show('找不到 node（引擎 tick 需要它）', '立即同步') | Out-Null; return $null }
-    try { return (Start-Process -FilePath $node -ArgumentList @($nodeTick, '--instance', $instanceRoot, '--no-jitter') -WindowStyle Hidden -PassThru) }
+    try { return (Start-Process -FilePath $node -ArgumentList @($nodeTick, '--instance', $instanceRoot, '--no-jitter', '--trigger=tray') -WindowStyle Hidden -PassThru) }
     catch { [System.Windows.Forms.MessageBox]::Show("无法启动同步：$($_.Exception.Message)", '立即同步') | Out-Null; return $null }
   }
   $tick = Join-Path $instanceRoot 'sync/sync-lite.ps1'

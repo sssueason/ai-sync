@@ -113,7 +113,9 @@ function loadGitattributes(repo) {
       // 行尾政策"（`* -text`、`dsh/plugins/** -text` 这类例外）。以前用 filter(Boolean) 把它们丢掉
       // ⇒ "通用规则 + 更具体例外"这种正常写法在门禁眼里等于不存在，会拿前面那条通用规则去判，
       // 结论与 git 相反（假红）。
-      return { re: globToRe(parts[0].includes('/') ? parts[0] : '**/' + parts[0]), eol: m ? m.split('=')[1].toLowerCase() : null }
+      // pat 也留着：区分"没政策"（命中兜底 `*`）与"有意豁免"（具体例外，如 `dsh/plugins/** -text !eol`）
+      // 要用它 —— 只有前者才算"这个扩展名没人管"（2026-09-19 修那条误导性 INFO）。
+      return { re: globToRe(parts[0].includes('/') ? parts[0] : '**/' + parts[0]), eol: m ? m.split('=')[1].toLowerCase() : null, pat: parts[0] }
     })
 }
 function trackedFiles(repo) {
@@ -172,6 +174,7 @@ for (const repo of REPOS) {
   if (!files) { add('FAIL', 'R0', name, '(repo)', 'git ls-files 失败 —— 不是 git 仓库或 git 不可用'); continue }
   const ignore = loadIgnore(repo)
   const undeclared = new Set()
+  const exempted = new Set()   // 命中**具体例外**规则（如 vendored `-text !eol`）的扩展名 —— 这与"没政策"是两件事
   const attrs = loadGitattributes(repo)
   const idx = indexEol(repo)
   // 无 git 索引（全新 staging / 临时目录）时无法判定"提交形态"，如实说明并跳过 R2 —— 不假装检查过
@@ -225,11 +228,21 @@ for (const repo of REPOS) {
     } else if (eolInfo.i === 'mixed') {
       add('WARN', 'R2', name, rel, '索引里 LF/CRLF 混排（提交噪声）')
     } else if (ext && !declEol) {
-      undeclared.add(ext)
+      /* 两类完全不同的东西（2026-09-19 修）：
+       *   · 命中**兜底规则 `*`**（或压根没有 .gitattributes）⇒ 这个扩展名确实**没有行尾政策** ⇒ undeclared；
+       *   · 命中**具体例外**（`dsh/plugins/** -text !eol` 这类）⇒ 是"政策里明确写了这一处不套用" ⇒ exempted。
+       * 以前两者混在一个集合里 ⇒ 只要仓里有**一处** vendored 例外，整个扩展名就被报成
+       * "未声明 eol（已跳过 EOL 检查）"：把"我查了"说成"我跳过了"。这不是假红也不是假绿，是**误导** ——
+       * 比前两者更隐蔽，因为它会让人以为有整类文件没人管，从而去"修"一个不存在的问题。 */
+      if (!attr || attr.pat === '*') undeclared.add(ext)
+      else exempted.add(ext)
     }
   }
   const un = [...undeclared].filter((e) => /^\.(cmd|bat|ps1|psm1|vbs|mjs|js|json|md|swift)$/i.test(e)).sort()
-  if (un.length) findings.push({ sev: 'INFO', rule: 'R2', repo: name, rel: '', detail: `未声明 eol（已跳过 EOL 检查）：${un.join(' ')}；如需强制，请在 .gitattributes 里声明后本工具自动生效` })
+  if (un.length) findings.push({ sev: 'INFO', rule: 'R2', repo: name, rel: '', detail: `未声明 eol（这些扩展名**没有**做 EOL 检查）：${un.join(' ')}；如需强制，请在 .gitattributes 里声明后本工具自动生效` })
+  // 具体例外单独说清楚：不是"没政策"，是政策写了"这一处不套用"。混进上面那条 INFO 会读成"整类没人管"。
+  const ex = [...exempted].filter((e) => /^\.(cmd|bat|ps1|psm1|vbs|mjs|js|json|md|swift)$/i.test(e)).sort()
+  if (ex.length) findings.push({ sev: 'INFO', rule: 'R2', repo: name, rel: '', detail: `按**具体例外规则**豁免 EOL 检查：${ex.join(' ')}（如 vendored 目录的 \`-text !eol\`）—— 其余同类文件照查不误` })
   findings.push({ sev: 'INFO', rule: 'SUM', repo: name, rel: '', detail: `跟踪文件 ${files.length}，检查 ${checked}，豁免/跳过 ${skipped}，豁免规则 ${ignore.length} 条` })
 }
 

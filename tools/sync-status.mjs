@@ -28,13 +28,16 @@ import { readFleet, writeMachine, isGitRepo } from './sync-state.mjs';
 import { pathToFileURL } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const ENGINE = resolve(process.env.AI_SYNC_ENGINE || join(HERE, '..'));
+// 参数解析必须在 ENGINE/INSTANCE 之前（TDZ：这些是 const，后面的代码不能提前引用 —— 本轮真踩了一次）
 const argv = process.argv.slice(2);
 const has = (f) => argv.includes(f);
 const val = (f, d = null) => {
   const i = argv.indexOf(f);
   return i !== -1 && argv[i + 1] ? argv[i + 1] : d;
 };
+// `--engine` 与 `--instance` 对称（2026-09-19 补）：sync-tick 一直支持 --engine，这里却只认环境变量，
+// 结果就是"我以为在测夹具、其实在测真仓"（本轮真踩：A/B 的对照两版都 PASS，因为都在看真仓）。
+const ENGINE = resolve(val('--engine') || process.env.AI_SYNC_ENGINE || join(HERE, '..'));
 const INSTANCE = resolve(val('--instance') || process.env.AI_SYNC_INSTANCE || ENGINE);
 
 // 调度现状的"真值"只有一处实现（install.mjs）；这里复用，避免第二份漂移。
@@ -81,10 +84,12 @@ function loadInstance() {
   }
 }
 const { cfg, file: cfgFile, error: cfgError } = loadInstance();
-const machine =
-  process.env.AI_SYNC_MACHINE ||
-  process.env.DSH_MACHINE ||
-  (existsSync(join(INSTANCE, 'sync', 'local.machine')) ? readFileSync(join(INSTANCE, 'sync', 'local.machine'), 'utf8').trim() : hostname().toLowerCase());
+const MACHINE_ENV = process.env.AI_SYNC_MACHINE || process.env.DSH_MACHINE || '';
+const MACHINE_FILE = existsSync(join(INSTANCE, 'sync', 'local.machine'))
+  ? readFileSync(join(INSTANCE, 'sync', 'local.machine'), 'utf8').trim()
+  : '';
+const MACHINE_SOURCE = MACHINE_ENV ? 'AI_SYNC_MACHINE / DSH_MACHINE 环境变量' : MACHINE_FILE ? 'sync/local.machine' : '**主机名（回退值，最不可信）**';
+const machine = MACHINE_ENV || MACHINE_FILE || hostname().toLowerCase();
 
 /* ---------------------------------------------------------------- 本机：仓库 */
 
@@ -98,6 +103,37 @@ function machineCfg() {
   }
 }
 const expand = (p) => (!p ? p : p === '~' ? homedir() : p.startsWith('~/') ? join(homedir(), p.slice(2)) : p);
+
+/* 机器卡缺失 ⇒ **硬失败**（2026-09-19 采纳对端建议）。
+ * 原先的行为：machineCfg() 返回 null ⇒ repoFacts() 空 ⇒ 后面**每一条**断言各自 FAIL 一屏。
+ * 那不是报错、是**稳定造假红**：每天固定一屏红，人就不再看红了 —— 假红的代价与假绿一样，
+ * 都是让告警失去意义。判据很简单：连"我是哪台机器、我有哪些仓库"都不知道，就不可能有可信结论，
+ * 所以这里只给**一个明确的失败 + 怎么办**，不再往下算。
+ * 退出码 4：与 0（无问题）/ 2（有 FAIL）/ 3（写 --out 失败）区分开，便于脚本/托盘单独识别。 */
+(function guardMachineCard() {
+  const cardPath = join(INSTANCE, 'sync', 'machines', `${machine}.json`);
+  if (existsSync(cardPath)) return;
+  const dir = join(INSTANCE, 'sync', 'machines');
+  const cards = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith('.json')).map((f) => f.replace(/\.json$/, '')) : [];
+  const isInstance = existsSync(join(INSTANCE, 'sync', 'instance.json')) || cards.length > 0;
+  const lines = [
+    `[FAIL] 找不到本机机器卡：${cardPath}`,
+    `       实例根：${INSTANCE}`,
+    `       判定本机为：${machine}（来源：${MACHINE_SOURCE}）`,
+  ];
+  if (!isInstance) {
+    lines.push('       ★ 这个目录看起来**根本不是实例**（既没有 sync/instance.json，也没有 sync/machines/）。');
+    lines.push('         请用 `--instance <实例根>` 指定，或设 AI_SYNC_INSTANCE。');
+  } else if (cards.length) {
+    lines.push(`       这个实例里有这些机器卡：${cards.join(' / ')}。本机该用哪一个？用 DSH_MACHINE 指对（或确认 --instance 指向本机实例）。`);
+  } else {
+    lines.push('       这个实例里一张机器卡都没有 ⇒ 还没配过（新机上手见 docs/sync-runbook.md）。');
+  }
+  lines.push('       为什么直接失败而不是继续算：机器卡决定"本机有哪些仓库/路径"，缺了它后面每条断言都会各自亮红 ——');
+  lines.push('       一屏稳定假红比一句明确的失败更糟：它会训练人忽略红色。');
+  console.error(lines.join('\n'));
+  process.exit(4);
+})();
 
 function repoFacts() {
   const mc = machineCfg();
@@ -353,12 +389,54 @@ function engineFacts() {
   }
   // 注意方向：`HEAD..origin/<branch>` 才是"远端有、本地没有"= 落后。
   // （2026-09-17 故障注入抓到：写成 `origin/<branch>..HEAD` 数的是领先，落后永远算成 0 ⇒ 假绿。）
+  //
+  // 2026-09-19（采纳对端洞见）：**方向对了还不够** —— `rev-list HEAD..origin/x` 比的是**本地那份
+  // origin/x 引用**，而它只有在 fetch 成功之后才更新。远端不可达 / fetch 静默失败时，这个引用是旧的，
+  // 于是 rev-list 照样输出 0 ⇒ 被渲染成"与远端一致（0 落后）"，而真相是"根本没比过"。
+  // 判据改成两条**独立**的事实：① 这份远端引用有多新（能不能信）；② 远端此刻可不可达（ls-remote 的 rc/用时）。
+  // 不可信就不给落后数，明说"未比对"——**不许把"没比过"渲染成"没落后"**。
   const n = git(['rev-list', '--count', `HEAD..${ref}`], dir);
-  out.behind = n === '' ? null : Number(n);
+  const rawBehind = n === '' ? null : Number(n);
   const ageMin = lastFetch ? Math.round((Date.now() - lastFetch) / 60000) : null;
-  const howFresh = out.fetched ? '刚刚刷新' : ageMin === null ? '尚未刷新过' : `${ageMin} 分钟前刷新的远端信息`;
-  const head = out.behind === 0 ? `与 ${ref} 一致` : `落后 ${ref} ${out.behind} 个提交`;
-  out.detail = `${head}（${howFresh}${out.fetchError ? `；上次刷新失败：${out.fetchError}` : ''}）`;
+  // 引用可信窗口：刷新节流是 fetchMinutes，取它两倍（且不少于 90 分钟）当"还能信"的上限。
+  const trustMinutes = Math.max(fetchMinutes * 2, 90);
+  out.freshness = out.fetched ? 'just-fetched'
+    : ageMin === null ? 'never'
+    : ageMin <= trustMinutes ? `recent(${ageMin}min)`
+    : `stale(${ageMin}min)`;
+  out.trusted = out.freshness === 'just-fetched' || String(out.freshness).startsWith('recent');
+  if (has('--no-fetch')) out.trusted = false;
+  // 远端可达性探针（只在"引用不可信"时打一次网络：这是唯一能区分"远端真的不可达"与"只是没到点刷新"的办法）
+  out.reachable = null;
+  let probeMs = null;
+  if (!out.trusted && !has('--no-fetch')) {
+    const t0 = Date.now();
+    try {
+      execFileSync('git', ['-C', dir, 'ls-remote', '--exit-code', 'origin', 'HEAD'], {
+        encoding: 'utf8', windowsHide: true, timeout: 25000,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'Never' },
+      });
+      out.reachable = true;
+    } catch (e) {
+      out.reachable = false;
+      out.probeError = String(e.message || e).split('\n')[0];
+    }
+    probeMs = Date.now() - t0;
+    out.probeMs = probeMs;
+  }
+  if (out.trusted) {
+    out.behind = rawBehind;
+    const howFresh = out.fetched ? '刚刚刷新' : `${ageMin} 分钟前刷新的远端信息`;
+    const head = out.behind === 0 ? `与 ${ref} 一致` : `落后 ${ref} ${out.behind} 个提交`;
+    out.detail = `${head}（${howFresh}${out.fetchError ? `；上次刷新失败：${out.fetchError}` : ''}）`;
+  } else {
+    out.behind = null;
+    out.detail = out.reachable === false
+      ? `**未比对**：远端不可达（ls-remote 失败，${probeMs} ms；${out.probeError || '无 stderr'}）⇒ 落后多少**不可知**（本地引用 ${out.freshness}）`
+      : out.reachable === true
+        ? `**未比对**：远端可达但本地引用过旧（${out.freshness}，超过可信窗口 ${trustMinutes} 分钟）⇒ 下一轮刷新后再判`
+        : `**未比对**：本轮不联网（--no-fetch），本地引用 ${out.freshness} ⇒ 落后多少不可知`;
+  }
   return out;
 }
 
@@ -614,17 +692,25 @@ if (schedule.mirror) {
 // 引擎更新提示：落后 ⇒ WARN（不是 FAIL —— 旧代码照样能跑，但不能装作没这回事）
 const eng = engineFacts();
 const inPlaceNote = eng.inPlace ? '（本机为原地布局：这里报的是已安装引擎的版本）' : '';
-if (eng.behind === null) add('引擎代码与远端一致', 'INFO', '与远端一致', (eng.detail || '未检查') + inPlaceNote);
-else if (eng.behind > 0)
+if (eng.trusted && eng.behind === null) add('引擎代码与远端一致', 'INFO', '与远端一致', (eng.detail || '未检查') + inPlaceNote);
+else if (eng.trusted && eng.behind > 0)
   add('引擎代码与远端一致', 'WARN', `与 origin/${eng.branch} 一致`, `落后 ${eng.behind} 个提交（当前 ${eng.rev}）—— 更新：git -C "${eng.path}" pull${inPlaceNote}`);
-else add('引擎代码与远端一致', 'PASS', `与 origin/${eng.branch} 一致`, `0 落后（${eng.rev}）${inPlaceNote}`);
+else if (eng.trusted) add('引擎代码与远端一致', 'PASS', `与 origin/${eng.branch} 一致`, `0 落后（${eng.rev}）${inPlaceNote}`);
+else {
+  /* 未比对（2026-09-19 修假绿）：以前这种情形会走进 `behind===0` 的 PASS 分支 —— 因为比的是**本地那份
+     过旧的 origin 引用**。远端不可达时它照样输出 0，于是"根本没比过"被渲染成"和远端一致"。
+     现在：远端不可达 = 需要人处理（FAIL）；引用过旧 / 不联网但引擎正常 = 下一轮自愈（WARN）；
+     其余（游离 HEAD、没有远端引用等）= INFO 说明原因。**任何分支都不许出现"0 落后"。** */
+  const lvl = eng.reachable === false ? 'FAIL' : eng.rev ? 'WARN' : 'INFO';
+  add('引擎代码与远端一致', lvl, '与 origin/' + (eng.branch || 'x') + ' 一致，或明确“未比对”', (eng.detail || '未检查') + inPlaceNote);
+}
 
 if (conv.statePush && conv.statePush.ok === false) add('跨端状态已推送', 'WARN', '推送成功', conv.statePush.error || '上轮推送失败');
 
 const fleetList = [];
 for (const [id, s] of Object.entries(fleet.machines)) {
   const age = mins(parseStamp(s.at));
-  fleetList.push({ machine: id, at: s.at, ageMin: age, rc: s.tick?.rc ?? null, actions: s.actions || [], intervalMin: s.tick?.intervalMin ?? null, engineRev: s.engineRev ?? null, engineBehind: s.engineBehind ?? null, ops: s.ops ?? null });
+  fleetList.push({ machine: id, at: s.at, ageMin: age, rc: s.tick?.rc ?? null, actions: s.actions || [], intervalMin: s.tick?.intervalMin ?? null, engineRev: s.engineRev ?? null, engineBehind: s.engineBehind ?? null, engineCompared: s.engineCompared ?? null, ops: s.ops ?? null });
   if (age !== null && age > statePushMinutes * 2 && id !== machine) {
     add(`远端 ${id} 状态新鲜`, 'WARN', `≤ ${statePushMinutes * 2} 分钟`, `${age} 分钟前`);
   }
@@ -747,6 +833,11 @@ const payload = {
   engine: ENGINE,
   engineRev: eng.rev,
   engineBehind: eng.behind,
+  // 2026-09-19：`engineBehind` 为 null 时，消费方必须知道是"没比过"而不是"没落后"。
+  // compared=false ⇒ behind 不可信（远端不可达 / 本地引用过旧 / 本轮不联网）；freshness 说明原因。
+  engineCompared: !!eng.trusted,
+  engineFreshness: eng.freshness ?? null,
+  engineReachable: eng.reachable ?? null,
   instance: INSTANCE,
   instanceRepo: isGitRepo(INSTANCE),
   lastSyncAt: tick.lastAt,
@@ -797,6 +888,9 @@ if (WRITE_STATE) {
     engine: ENGINE,
     engineRev: eng.rev,
     engineBehind: eng.behind,
+    // 对端要能区分"落后 0"与"没比过"（2026-09-19 修假绿）：把可比性一起推上去，否则对端只能看到 null 并自己猜。
+    engineCompared: !!eng.trusted,
+    engineFreshness: eng.freshness ?? null,
     at: payload.at,
     tick: { intervalMin: cfg.tick.intervalMinutes, lastAt: tickAt, rc: Number.isFinite(rc) ? rc : null, elapsedSec: Number.isFinite(elapsed) ? elapsed : null },
     repos: repos.map((r) => ({ id: r.id, ahead: r.ahead, behind: r.behind, dirty: r.dirty })),
@@ -866,7 +960,8 @@ if (OUT) {
     for (const m of fleetList) {
       const o = m.ops || null;
       const tok = []
-      tok.push(`引擎=${m.engineRev ? String(m.engineRev).slice(0, 7) : '-'}${Number.isFinite(m.engineBehind) ? `(-${m.engineBehind})` : ''}`)
+      // 对端报 (-0) = 真的与远端一致；(-?) = 它明确说了"没比过"（远端不可达/引用过旧）—— 不许把后者显示成 0。
+      tok.push(`引擎=${m.engineRev ? String(m.engineRev).slice(0, 7) : '-'}${Number.isFinite(m.engineBehind) ? `(-${m.engineBehind})` : m.engineCompared === false ? '(-?)' : ''}`)
       tok.push(`卫生=${o && o.hygiene ? (o.hygiene.fails ? `FAIL${o.hygiene.fails}` : `ok(${o.hygiene.warns ?? 0}W)`) : '-'}`)
       tok.push(`迁移=${o && o.migrations ? (o.migrations.blocked ? `FAIL${o.migrations.blocked}` : `${o.migrations.applied}条${o.migrations.pendingManual ? `/${o.migrations.pendingManual}待人工` : ''}`) : '-'}`)
       tok.push(`应用=${o && o.apply ? (o.apply.blocked || o.apply.bad ? `FAIL${(o.apply.blocked || 0) + (o.apply.bad || 0)}` : `ok(${o.apply.ok})`) : '-'}`)

@@ -16,6 +16,9 @@
  *
  * 用法：
  *   node tools/sync-tick.mjs [--instance <dir>] [--engine <dir>] [--dry-run] [--no-jitter] [--quiet] [--json]
+ *                            [--trigger=<scheduler|console|tray|…>]
+ *   · --trigger 记进日志行（`触发=…`）与 --json 输出：**日志是证据，就得能回答"这轮是谁做的"**。
+ *     安装器给计划任务/launchd 写 scheduler、控制台写 console、托盘写 tray；不传 = unspecified。
  * 退出码：0 = 无问题；1 = 有 issues（与既有 tick 一致，便于计划任务/launchd 直接反映）
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rmSync, openSync, closeSync } from 'node:fs';
@@ -38,6 +41,24 @@ const DRY = has('--dry-run');
 const QUIET = has('--quiet');
 const JSON_OUT = has('--json');
 const NO_JITTER = has('--no-jitter');
+/* 触发来源（2026-09-19）：**谁跑了这一轮必须能从持久日志看出来**。
+ * 起因：19:11:35 / 19:12:12 / 19:13:10 三轮 tick 挤在 95 秒内，而计划任务上次 18:56、下次 19:16
+ * （即不是它跑的），日志里却**没有任何字段能归因** —— 只能靠"全仓搜谁调用 tick"再排除，查了四条命令。
+ * 日志是证据，证据就得能回答"这是谁做的"。
+ * 取值：scheduler（安装器写进计划任务 / launchd）· console（控制台「立即同步一次」）·
+ *      tray（托盘「立即同步」）· unspecified（调用方没给：旧版调用方、mac 托盘重建前）。
+ * 注意 unspecified 不是"无害的默认值"：**没人在点、它却自己跑了**的 tick 也会落在这里 ——
+ * 那正是"应用未经许可地同步"这种要抓的形态。 */
+const TRIGGER_RAW = String(
+  // 两种写法都要认：`--trigger=console`（安装器/托盘/控制台用的）与 `--trigger console`（手敲常用的）。
+  // 只认后者会让调用方写 `=` 时**静默**落回 unspecified —— 自检当场抓到过一次（2026-09-19），
+  // 而"静默降级"正是这套体系最不该有的形态。
+  (argv.find((a) => a.startsWith('--trigger=')) || '').slice('--trigger='.length)
+    || val('--trigger')
+    || process.env.AI_SYNC_TRIGGER
+    || '',
+).trim();
+const TRIGGER = /^[a-z0-9._-]{1,24}$/i.test(TRIGGER_RAW) ? TRIGGER_RAW.toLowerCase() : 'unspecified';
 
 const say = (m) => {
   if (!QUIET && !JSON_OUT) console.log('   ' + m);
@@ -131,7 +152,7 @@ function releaseLock() {
 
 const lock = acquireLock();
 if (!lock.ok) {
-  const line = `tick ${machine} ${stamp()} pull=0 commit=0 push=0 skip=1 elapsed=0s rc=0 | lock=busy（另一同步进程持锁 pid=${lock.holder?.pid}，本轮让路）`;
+  const line = `tick ${machine} ${stamp()} 触发=${TRIGGER} pull=0 commit=0 push=0 skip=1 elapsed=0s rc=0 | lock=busy（另一同步进程持锁 pid=${lock.holder?.pid}，本轮让路）`;
   if (!DRY) {
     const dir = join(INSTANCE, 'sync', 'logs');
     mkdirSync(dir, { recursive: true });
@@ -542,7 +563,7 @@ async function main() {
     }
     return parts.join(' | ');
   })();
-  let line = `tick ${machine} ${stamp()} 拉取=${stats.pulled} 提交=${stats.committed} 推送=${stats.pushed} 整合失败=${stats.skipped} 耗时=${elapsed}s ${issues.length ? `rc=${issues.length}` : 'rc=0'} | ${notes3}`;
+  let line = `tick ${machine} ${stamp()} 触发=${TRIGGER} 拉取=${stats.pulled} 提交=${stats.committed} 推送=${stats.pushed} 整合失败=${stats.skipped} 耗时=${elapsed}s ${issues.length ? `rc=${issues.length}` : 'rc=0'} | ${notes3}`;
   // 「只读机器」的跳过必须进**日志行**（2026-09-17 实测发现：它原先只打印在 stdout，而 stdout 是瞬时的、日志才是持久证据）
   if (stats.readOnly) line += ' | read-only（本机标记为只读：已本地提交，未推送）';
   if (stats.convNote) line += ` | 收敛：${String(stats.convNote).replace(/^converge done: /, '')}`;
@@ -630,7 +651,7 @@ async function main() {
   for (const i of issues) say(`[FAIL] ${i}`);
 
   if (JSON_OUT) {
-    console.log(JSON.stringify({ machine, at: stamp(), elapsed, issues, notes, stats, line }, null, 2));
+    console.log(JSON.stringify({ machine, at: stamp(), trigger: TRIGGER, elapsed, issues, notes, stats, line }, null, 2));
   }
   process.exitCode = issues.length ? 1 : 0;
 }

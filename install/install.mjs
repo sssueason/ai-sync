@@ -261,7 +261,7 @@ function nodeExe() {
 function registerWindows(instance, interval) {
   const name = tickTaskName(loadInstance(instance));
   const tick = join(ENGINE, 'tools', 'sync-tick.mjs');
-  const cmdFile = writeCmdFile(instance, 'tick-cmd.txt', `"${nodeExe()}" "${tick}" --instance "${instance}"`);
+  const cmdFile = writeCmdFile(instance, 'tick-cmd.txt', `"${nodeExe()}" "${tick}" --instance "${instance}" --trigger=scheduler`);
   const ps = `
 $ErrorActionPreference='Stop'
 $action = New-ScheduledTaskAction -Execute '${q(wscriptPath())}' -Argument '"${q(runnerPath())}" "${q(cmdFile)}"' -WorkingDirectory '${q(ENGINE)}'
@@ -768,6 +768,7 @@ function registerMac(instance, interval) {
     <string>${join(ENGINE, 'tools', 'sync-tick.mjs')}</string>
     <string>--instance</string>
     <string>${instance}</string>
+    <string>--trigger=scheduler</string>
   </array>
   <key>StartInterval</key><integer>${interval * 60}</integer>
   <key>RunAtLoad</key><true/>

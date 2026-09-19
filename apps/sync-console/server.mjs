@@ -365,7 +365,7 @@ const server = createServer(async (req, res) => {
       // 旧实例里的 sync-lite.ps1 只作回退 —— 同一动作两套实现会各自漂。
       const nodeTick = join(ENGINE, 'tools', 'sync-tick.mjs');
       if (existsSync(nodeTick)) {
-        const r = await node('sync-tick.mjs', ['--no-jitter'], { timeout: 15 * 60 * 1000 });
+        const r = await node('sync-tick.mjs', ['--no-jitter', '--trigger=console'], { timeout: 15 * 60 * 1000 });
         return sendJson(res, 200, { code: r.code, stdout: r.stdout, stderr: r.stderr, via: 'tools/sync-tick.mjs' });
       }
       const tick = join(INSTANCE, 'sync', 'sync-lite.ps1');

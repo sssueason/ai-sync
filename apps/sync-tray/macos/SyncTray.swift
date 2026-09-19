@@ -347,7 +347,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let tick = (engineRoot as NSString).appendingPathComponent("tools/sync-tick.mjs")
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        p.arguments = ["-lc", "node '\(tick)' --instance '\(instanceRoot)' --no-jitter"]
+        p.arguments = ["-lc", "node '\(tick)' --instance '\(instanceRoot)' --no-jitter --trigger=tray"]
         try? p.run()
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { self.refresh(balloon: false, fetch: false) }
     }
