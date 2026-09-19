@@ -405,7 +405,13 @@ function engineFacts() {
     : ageMin <= trustMinutes ? `recent(${ageMin}min)`
     : `stale(${ageMin}min)`;
   out.trusted = out.freshness === 'just-fetched' || String(out.freshness).startsWith('recent');
-  if (has('--no-fetch')) out.trusted = false;
+  /* 2026-09-19 真回归（我自己引入，当晚被用户当场看破：托盘图标变黄但状态页全绿）：
+     这里原本还有一句 `if (has('--no-fetch')) out.trusted = false;` —— 把"调用方**主动要求不联网**"
+     当成了"没法比对"。而托盘刷新**就是**用 `--no-fetch` 调的（其注释写明"不为了刷新去联网"），
+     于是它每次刷新都拿到一条 WARN ⇒ state=warn ⇒ 图标常驻黄色，而真实问题是零。
+     判据应该是**引用本身有多新**，不是"这轮联没联网"：引用还在可信窗口内就照样给落后数。
+     引擎引用由 tick 每轮刷新（节流 fetchMinutes=30）⇒ 正常情况下永远落在窗口内。
+     ⇒ 不要恢复这一句；要区分"没比过"和"没联网"（后者见下面 untrusted 分支的措辞）。 */
   // 远端可达性探针（只在"引用不可信"时打一次网络：这是唯一能区分"远端真的不可达"与"只是没到点刷新"的办法）
   out.reachable = null;
   let probeMs = null;
@@ -435,7 +441,9 @@ function engineFacts() {
       ? `**未比对**：远端不可达（ls-remote 失败，${probeMs} ms；${out.probeError || '无 stderr'}）⇒ 落后多少**不可知**（本地引用 ${out.freshness}）`
       : out.reachable === true
         ? `**未比对**：远端可达但本地引用过旧（${out.freshness}，超过可信窗口 ${trustMinutes} 分钟）⇒ 下一轮刷新后再判`
-        : `**未比对**：本轮不联网（--no-fetch），本地引用 ${out.freshness} ⇒ 落后多少不可知`;
+        : has('--no-fetch')
+          ? `**未比对**：本轮不联网（--no-fetch）且本地引用已过旧（${out.freshness}，可信窗口 ${trustMinutes} 分钟）⇒ 落后多少不可知；下一次联网的 tick/status 会刷新`
+          : `**未比对**：本地引用 ${out.freshness} ⇒ 落后多少不可知`;
   }
   return out;
 }
