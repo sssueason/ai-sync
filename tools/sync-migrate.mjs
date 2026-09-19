@@ -25,6 +25,7 @@
  *
  * 用法：
  *   node tools/sync-migrate.mjs [--instance <dir>] [--machine <id>] [--dry-run] [--json] [--quiet] [--only <id>] [--list]
+ *   node tools/sync-migrate.mjs --manual-done <id>   # 人工做完 manual 条目后记账（只有 manual 能用）
  * 退出码：0 = 无失败（可含待人工）；2 = 有 safe 迁移失败/blocked；3 = 用法或清单错误
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs'
@@ -72,6 +73,34 @@ const state = readJSON(STATE_FILE) || { machine, applied: {}, blocked: {}, pendi
 state.machine = machine
 state.applied = state.applied || {}
 state.blocked = state.blocked || {}
+
+/* ---- 人工确认（2026-09-19 补）：`manual` 迁移的"做完怎么记账" ----
+ * 背景：`manual` 条目**永不执行** —— 执行器在写状态之前就 continue 了 ⇒ 人按 reason/ref 做完之后
+ * `state.applied[id].ok` 永远是 false ⇒ `sync-status` 那条"待人工"永远挂着，而且**没有任何命令能清**。
+ * 结果就是"照做了、账一直不清"，久了这条断言就没人看了（假红疲劳）。
+ * 这里补一条**显式**的人工确认：只有 `manual` 条目能用 —— `safe` 的账必须由 check() 说了算，
+ * 手工标"已完成"就是把假绿写进账本。
+ * 它是一次**声明**（attestation），不是自动判定：判据写在条目的 reason/ref 里，由人核对。 */
+const MANUAL_DONE = val('--manual-done', null)
+if (MANUAL_DONE) {
+  const m = manifest.migrations.find((x) => x.id === MANUAL_DONE)
+  if (!m) { console.error(`[FAIL] 清单里没有这条迁移：${MANUAL_DONE}`); process.exit(3) }
+  if (m.danger !== 'manual') {
+    console.error(`[FAIL] ${MANUAL_DONE} 的 danger=${m.danger} —— 只有 manual 条目允许人工记账（safe 的生效与否由 check() 判定）`)
+    process.exit(3)
+  }
+  const prev = state.applied[m.id]
+  say(`  [manual-done] ${m.id}${prev && prev.ok ? '（此前已记为完成，本次是重申）' : ''} → ${DRY ? 'dry-run，不写' : '记为已完成'}`)
+  if (!DRY) {
+    state.applied[m.id] = { ok: true, at: new Date().toISOString(), detail: '人工确认完成（--manual-done）', tries: (prev && prev.tries) || 0 }
+    delete state.blocked[m.id]
+    state.at = new Date().toISOString()
+    mkdirSync(STATE_DIR, { recursive: true })
+    writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + '\n', 'utf8')
+    say(`  [OK] 已写入状态文件（机器本地、不进 git）：${STATE_FILE.replace(INSTANCE, '.')}`)
+  }
+  process.exit(0)
+}
 
 if (LIST) {
   for (const m of manifest.migrations) {

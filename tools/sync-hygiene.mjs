@@ -109,8 +109,12 @@ function loadGitattributes(repo) {
       const m = parts.find((x) => /^eol=(lf|crlf)$/i.test(x))
       // gitattributes 语义：**不含斜杠**的模式匹配任意层级（像 .gitignore）——
       // 少了这一步，`*.ps1 text eol=crlf` 对 `install/bootstrap.ps1` 不生效（实测踩到：整仓声明被判"未声明"）
-      return m ? { re: globToRe(parts[0].includes('/') ? parts[0] : '**/' + parts[0]), eol: m.split('=')[1].toLowerCase() } : null
-    }).filter(Boolean)
+      // 2026-09-19 修：**没有 eol= 的行也必须留下**（eol: null）。它们的语义是"这条路径不套用
+      // 行尾政策"（`* -text`、`dsh/plugins/** -text` 这类例外）。以前用 filter(Boolean) 把它们丢掉
+      // ⇒ "通用规则 + 更具体例外"这种正常写法在门禁眼里等于不存在，会拿前面那条通用规则去判，
+      // 结论与 git 相反（假红）。
+      return { re: globToRe(parts[0].includes('/') ? parts[0] : '**/' + parts[0]), eol: m ? m.split('=')[1].toLowerCase() : null }
+    })
 }
 function trackedFiles(repo) {
   // 有 .git ⇒ 跟踪文件 **∪ 未跟踪但未被 ignore 的文件**（`--others --exclude-standard`）。
@@ -209,16 +213,18 @@ for (const repo of REPOS) {
     //   · 索引 mixed ⇒ WARN（提交噪声）
     //   · 未声明 eol 的扩展名 ⇒ 跳过 + 记 INFO（不替仓库单方面加政策）
     const eolInfo = idx.get(rel) || { i: '', attr: '' }
-    const attr = attrs.find((a) => a.re.test(rel))
+    // gitattributes 是**最后一条匹配生效**。早先这里用 find()（第一条匹配），与 git 相反 ——
+    // 一旦仓库里出现"通用规则 + 更具体例外"的写法，门禁与 git 就会得出不同结论（实测踩到）。
+    const attr = [...attrs].reverse().find((a) => a.re.test(rel)) || null
+    const declEol = attr && attr.eol ? attr.eol : null // null = 这条路径没有行尾政策
     const ext = (rel.match(/\.[a-z0-9]+$/i) || [''])[0].toLowerCase()
-    const declaredLf = attr && attr.eol === 'lf'
     if (/\.sh$/i.test(rel)) {
       if (eolInfo.i === 'crlf' || eolInfo.i === 'mixed') add('FAIL', 'R2', name, rel, `索引里是 ${eolInfo.i}，应 lf —— 别的机器 checkout 后会拿到 CRLF，bash 会把 \\r 当命令的一部分（必然报错）`)
-    } else if (declaredLf) {
+    } else if (declEol === 'lf') {
       if (eolInfo.i && eolInfo.i !== 'lf' && eolInfo.i !== 'none') add('FAIL', 'R2', name, rel, `索引里是 ${eolInfo.i}，.gitattributes 声明 eol=lf（与声明矛盾）`)
     } else if (eolInfo.i === 'mixed') {
       add('WARN', 'R2', name, rel, '索引里 LF/CRLF 混排（提交噪声）')
-    } else if (ext && !attr) {
+    } else if (ext && !declEol) {
       undeclared.add(ext)
     }
   }
