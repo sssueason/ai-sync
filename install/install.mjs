@@ -121,6 +121,34 @@ function taskExists(name) {
   return r.status === 0;
 }
 
+/** 幂等卸载：**先查再删**。
+ *  2026-09-19 修（对端实测假红）：原先靠匹配本地化错误文本（`/cannot find|找不到/`）判断"任务不存在"，
+ *  而 schtasks 在中文 Windows 上按 **GBK** 写 stderr、Node 按 **UTF-8** 解码 ⇒ 中文匹配时灵时不灵
+ *  （campus 实测：`ai-sync-backup` 本就不存在，却拿到 ok:false + "系统找不到指定的文件。" ⇒ 注册流程 rc=3）。
+ *  改成先查再删后，不依赖任何语言/编码的文本，语义也更准：本就不存在 = 目标已达成。 */
+function deleteTaskIdempotent(name) {
+  if (!taskExists(name)) return { ok: true, task: name, detail: '任务本就不存在（幂等）' };
+  const r = spawnSync('schtasks', ['/delete', '/tn', name, '/f'], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
+  if (r.status === 0) return { ok: true, task: name };
+  const why = (r.stderr || r.stdout || '').split('\n').map((s) => s.trim()).filter(Boolean)[0] || `schtasks exit ${r.status}`;
+  return { ok: false, task: name, error: why };
+}
+
+/** launchd 的 bootout 是**异步**的：紧接着 bootstrap 常撞上 "Bootstrap failed: 5: Input/output error"
+ *  （2026-09-19 在 macOS 节点实测：重注册首跑必失败，要等下一轮 --reconcile 自愈才好）。
+ *  给 3 次重试 + 递增退避；Node 没有同步 sleep，用 Atomics.wait 同步等。 */
+function sleepMs(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* 环境不支持就跳过等待 */ }
+}
+function bootstrapLaunchd(uid, plist) {
+  let b = spawnSync('launchctl', ['bootstrap', `gui/${uid}`, plist], { encoding: 'utf8' });
+  for (let i = 1; i <= 2 && b.status !== 0; i++) {
+    sleepMs(400 * i);
+    b = spawnSync('launchctl', ['bootstrap', `gui/${uid}`, plist], { encoding: 'utf8' });
+  }
+  return b;
+}
+
 /** 检测平台调度现状。返回 {platform,task,installed,want,actual,unit,inSync,detail} */
 /* ---------------------------------------------------------------- 调度动作是否真的可用
  * 2026-09-18（某台机器指出，结构性假绿）：原先只比 `<Interval>` / `StartInterval`，
@@ -342,9 +370,7 @@ export function unregisterMirror(instance, cfg = loadInstance(instance)) {
   }
   const name = mirrorTaskName(cfg);
   if (process.platform !== 'win32') return { ok: true, skipped: true, task: name, detail: '该平台没有安装器（非失败）' };
-  const r = spawnSync('schtasks', ['/delete', '/tn', name, '/f'], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
-  const gone = r.status === 0 || /cannot find|找不到/i.test(`${r.stderr}${r.stdout}`);
-  return gone ? { ok: true, task: name } : { ok: false, error: (r.stderr || r.stdout || '').split('\n')[0] || `exit ${r.status}` };
+  return deleteTaskIdempotent(name);
 }
 
 export function registerMirror(instance, cfg = loadInstance(instance)) {
@@ -399,7 +425,7 @@ ${trigger}
     writeFileSync(plist, xml, 'utf8');
     const uid = process.getuid ? process.getuid() : 501;
     spawnSync('launchctl', ['bootout', `gui/${uid}/${name}`], { encoding: 'utf8' }); // 先卸旧的（不存在也无妨）
-    const b = spawnSync('launchctl', ['bootstrap', `gui/${uid}`, plist], { encoding: 'utf8' });
+    const b = bootstrapLaunchd(uid, plist);
     if (b.status !== 0) return { ok: false, error: (b.stderr || '').split('\n')[0] || `bootstrap exit ${b.status}` };
     writeFileSync(specFile, JSON.stringify(spec, null, 2) + '\n', 'utf8');
     return { ok: true, task: name, via: 'launchd', plist, spec };
@@ -526,9 +552,7 @@ export function unregisterBackup(instance, cfg = loadInstance(instance)) {
     return { ok: true, task: name };
   }
   if (process.platform !== 'win32') return { ok: true, skipped: true, task: name, detail: '该平台没有安装器（非失败）' };
-  const r = spawnSync('schtasks', ['/delete', '/tn', name, '/f'], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
-  const gone = r.status === 0 || /cannot find|找不到/i.test(`${r.stderr}${r.stdout}`);
-  return gone ? { ok: true, task: name } : { ok: false, error: (r.stderr || r.stdout || '').split('\n')[0] || `exit ${r.status}` };
+  return deleteTaskIdempotent(name);
 }
 
 export function registerBackup(instance, cfg = loadInstance(instance)) {
@@ -571,7 +595,7 @@ ${items.join('\n')}
     writeFileSync(plist, xml, 'utf8');
     const uid = process.getuid ? process.getuid() : 501;
     spawnSync('launchctl', ['bootout', `gui/${uid}/${name}`], { encoding: 'utf8' });
-    const b = spawnSync('launchctl', ['bootstrap', `gui/${uid}`, plist], { encoding: 'utf8' });
+    const b = bootstrapLaunchd(uid, plist);
     if (b.status !== 0) return { ok: false, error: (b.stderr || '').split('\n')[0] || `bootstrap exit ${b.status}` };
     writeFileSync(specFile, JSON.stringify(spec, null, 2) + '\n', 'utf8');
     return { ok: true, task: name, via: 'launchd', plist, spec };
@@ -673,9 +697,7 @@ export function unregisterTransport(instance, cfg = loadInstance(instance)) {
     return { ok: true, task: name };
   }
   if (process.platform !== 'win32') return { ok: true, skipped: true, task: name, detail: '该平台没有安装器（非失败）' };
-  const r = spawnSync('schtasks', ['/delete', '/tn', name, '/f'], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
-  const gone = r.status === 0 || /cannot find|找不到/i.test(`${r.stderr}${r.stdout}`);
-  return gone ? { ok: true, task: name } : { ok: false, error: (r.stderr || r.stdout || '').split('\n')[0] || `exit ${r.status}` };
+  return deleteTaskIdempotent(name);
 }
 
 export function registerTransport(instance, cfg = loadInstance(instance)) {
@@ -711,7 +733,7 @@ export function registerTransport(instance, cfg = loadInstance(instance)) {
     writeFileSync(plist, xml, 'utf8');
     const uid = process.getuid ? process.getuid() : 501;
     spawnSync('launchctl', ['bootout', `gui/${uid}/${name}`], { encoding: 'utf8' });
-    const b = spawnSync('launchctl', ['bootstrap', `gui/${uid}`, plist], { encoding: 'utf8' });
+    const b = bootstrapLaunchd(uid, plist);
     if (b.status !== 0) return { ok: false, error: (b.stderr || '').split('\n')[0] || `bootstrap exit ${b.status}` };
     writeFileSync(specFile, JSON.stringify(spec, null, 2) + '\n', 'utf8');
     return { ok: true, task: name, via: 'launchd', plist, spec };
@@ -759,7 +781,7 @@ function registerMac(instance, interval) {
   writeFileSync(plist, xml, 'utf8');
   const uid = process.getuid ? process.getuid() : 501;
   spawnSync('launchctl', ['bootout', `gui/${uid}/${label}`], { encoding: 'utf8' });
-  const b = spawnSync('launchctl', ['bootstrap', `gui/${uid}`, plist], { encoding: 'utf8' });
+  const b = bootstrapLaunchd(uid, plist);
   if (b.status !== 0) return { ok: false, error: (b.stderr || '').split('\n')[0] || `bootstrap exit ${b.status}` };
   return { ok: true, task: label, plist };
 }
@@ -805,12 +827,25 @@ if (isMain) {
   const json = argv.includes('--json');
 
   let result;
+  /** 复合结果：主任务 + 三个作业槽。**失败必须带原因**。
+   *  2026-09-19 修（对端实测假红）：以前只把 ok 置 false、却不写 error，而打印端是
+   *  `result.error || result.detail` ⇒ 输出 "register 失败：undefined" —— 看起来像注册坏了，
+   *  实际只是 backup 那个任务本就不存在。假红与假绿一样贵：多了就没人看红了。 */
+  const jobOk = (x) => !x || x.ok !== false || x.skipped === true;
+  const reasonsOf = (main, jobs) => {
+    const why = [];
+    if (main && main.ok === false) why.push(main.error || '主任务失败（未给出原因）');
+    for (const [label, x] of jobs) if (x && x.ok === false && x.skipped !== true) why.push(`${label}：${x.error || x.detail || '未给出原因'}`);
+    return why;
+  };
+
   if (argv.includes('--unregister')) {
     const t = unregisterTick(INSTANCE);
     const m = unregisterMirror(INSTANCE, cfg);
     const b = unregisterBackup(INSTANCE, cfg);
     const tr = unregisterTransport(INSTANCE, cfg);
-    result = { action: 'unregister', ...t, mirror: m, backup: b, transport: tr };
+    result = { action: 'unregister', ...t, mirror: m, backup: b, transport: tr, ok: t.ok !== false && jobOk(m) && jobOk(b) && jobOk(tr) };
+    if (!result.ok) result.error = reasonsOf(t, [['镜像', m], ['备份', b], ['传输', tr]]).join('；') || '未给出原因（这是 bug：失败必须带原因）';
   } else if (argv.includes('--register')) {
     const r = process.platform === 'win32' ? registerWindows(INSTANCE, interval) : process.platform === 'darwin' ? registerMac(INSTANCE, interval) : { ok: false, error: '该平台未提供安装器' };
     // 镜像调度：enabled=false 时 registerMirror 会主动卸下 —— 装上/卸下都由它一处收敛。
@@ -820,7 +855,8 @@ if (isMain) {
     const b = registerBackup(INSTANCE, cfg);
     // 传输层自启（2026-09-19）：常驻进程，触发条件不同（登录 + 失败重启 + 不限时）。
     const tr = registerTransport(INSTANCE, cfg);
-    result = { action: 'register', interval, ...r, ok: r.ok !== false && (m.ok !== false || m.skipped === true) && (b.ok !== false || b.skipped === true) && (tr.ok !== false || tr.skipped === true), mirror: m, backup: b, transport: tr };
+    result = { action: 'register', interval, ...r, ok: r.ok !== false && jobOk(m) && jobOk(b) && jobOk(tr), mirror: m, backup: b, transport: tr };
+    if (!result.ok) result.error = reasonsOf(r, [['镜像', m], ['备份', b], ['传输', tr]]).join('；') || '未给出原因（这是 bug：失败必须带原因）';
   } else {
     const d = detectSchedule(INSTANCE, cfg);
     result = { action: 'status', ...d, mirror: detectMirror(INSTANCE, cfg), backup: detectBackup(INSTANCE, cfg), transport: detectTransport(INSTANCE, cfg) };
@@ -850,7 +886,7 @@ if (isMain) {
       if (tl) console.log(tl);
     } else {
       if (result.ok) console.log(`   [OK] ${result.action} 成功${result.task ? `（${result.task}）` : ''}`);
-      else console.log(`   [FAIL] ${result.action} 失败：${result.error || result.detail}`);
+      else console.log(`   [FAIL] ${result.action} 失败：${result.error || result.detail || '未给出原因（这是 bug：失败必须带原因）'}`);
       const ml = jobLine(result.mirror, 'register', '镜像');
       if (ml) console.log(ml);
       const bl = jobLine(result.backup, 'register', '备份');
