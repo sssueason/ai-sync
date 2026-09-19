@@ -413,6 +413,28 @@ async function main() {
     }
   }
 
+  /* 5b2. 传输层健康快照（2026-09-19 补）：控制台与 `sync-status` 的「传输层健康快照 ≤40 分钟」判据，
+      原先**只有渲染器会刷新**它，而没有任何东西定期跑渲染器 ⇒ 那条断言恒 WARN（实测曾达 187 分钟，
+      也就是说：这条观测一旦没人记得手动跑，就等于不存在）。
+      放这里是因为 **tick 是唯一每轮都跑的东西**，而它只是一次本地 REST 查询（代价可忽略）。
+      **不改 tick 的 rc**：同卫生/迁移/应用 —— 它是观测，不是同步动作；失败由 sync-status 的
+      「传输层 REST 可达 / 无问题项」断言暴露。 */
+  let transportHealth = null;
+  if (!DRY) {
+    const hTool = join(ENGINE, 'tools', 'syncthing-health.mjs');
+    const hasTransport = !!(mc.transport && (mc.transport.autostart || (mc.transport.folders || []).length || mc.transport.exe));
+    if (!hasTransport) transportHealth = { skipped: true, why: '本机未配置传输层' };
+    else if (!existsSync(hTool)) transportHealth = { missing: true };
+    else {
+      const r = spawnSync(process.execPath, [hTool, '--instance', INSTANCE, '--json'],
+        { encoding: 'utf8', windowsHide: true, timeout: 60 * 1000, maxBuffer: 16 * 1024 * 1024 });
+      try {
+        const j = JSON.parse(String(r.stdout || '').trim());
+        transportHealth = { ok: j.ok !== false, reachable: !!j.reachable, problems: (j.problems || []).length };
+      } catch { transportHealth = { broken: true, rc: r.status }; }
+    }
+  }
+
   /* 5c. 一次性迁移（引擎 tools/sync-migrate.mjs）：只跑 danger=safe 的；manual-only 只登记待人工。
      与卫生门禁同理 —— **不改 tick 的 rc**：迁移失败是"某台机器没跟上"，不是"这轮同步没跑成"；
      它由 sync-status 的「迁移」断言暴露（失败 ⇒ FAIL，待人工 ⇒ WARN）。 */
@@ -539,6 +561,11 @@ async function main() {
   else if (hygiene?.missing) line += ' | 卫生：缺少 tools/sync-hygiene.mjs（本轮未检查）';
   else if (hygiene && hygiene.fails) line += ` | 卫生：FAIL=${hygiene.fails} WARN=${hygiene.warns}（明细见 sync/state/hygiene-${machine}.json）`;
   else if (hygiene) line += ` | 卫生：通过${hygiene.warns ? `（WARN=${hygiene.warns}）` : ''}`;
+  // 传输层健康快照：刷新失败/跳过必须留痕（否则"没刷"和"不需要刷"在日志里长得一模一样）
+  if (transportHealth?.broken) line += ` | 传输层：健康快照刷新失败（rc=${transportHealth.rc}）`;
+  else if (transportHealth?.missing) line += ' | 传输层：缺少 tools/syncthing-health.mjs（未刷新快照）';
+  else if (transportHealth?.skipped) line += ` | 传输层：${transportHealth.why}（未刷新快照）`;
+  else if (transportHealth) line += ` | 传输层：快照 OK（${transportHealth.reachable ? 'REST 可达' : 'REST 不可达'}${transportHealth.problems ? ` · 问题 ${transportHealth.problems}` : ''}）`;
   // 迁移同理：跑了什么、有没有待人工，都要在持久日志里留痕
   if (migrate?.broken) line += ' | 迁移：运行器未返回结果（本轮未检查）';
   else if (migrate?.missing) line += ' | 迁移：缺少 tools/sync-migrate.mjs（本轮未检查）';
