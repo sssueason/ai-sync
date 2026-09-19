@@ -687,6 +687,34 @@ if (tCfg?.transport?.autostart === true || (tCfg?.transport?.folders || []).leng
     }
     add('传输层 folder 已落', transport.folders.length === 0 && transport.foldersDeclared > 0 ? 'WARN' : 'PASS',
       `配置声明 ${transport.foldersDeclared} 个`, `Syncthing 里 ${transport.folders.length} 个（未迁到的集合归 µ2 管，属正常）`);
+    /* 同步冲突副本（2026-09-19 补）：Syncthing 遇到"两端同时改同一文件"时**故意保留两版**
+       （`<原名>.sync-conflict-<日期>-<id>.<扩展>`），系统**不替人判断内容谁对**。
+       此前工具链里**零引用** ⇒ 没有任何东西会告诉你它们存在 —— 属于"要你眼尖"的盲区
+       （实测：本机曾有 12 个躺了整天没人知道，其中 4 个 PDF 是真的内容不同）。
+       代价控制：只 `readdir` 看文件名（不 stat 内容），跳过 `.stversions` 等目录，并有文件数上限；
+       路径直接用 **Syncthing 自己报的 folder 路径**（避免 `~` 展开等第二套实现）。 */
+    {
+      const SKIP = new Set(['.stversions', '.git', 'node_modules', '$RECYCLE.BIN', 'System Volume Information']);
+      const re = /\.sync-conflict-\d{8}-\d{6}-[A-Z0-9]+\./i;
+      const found = [];
+      let scanned = 0, capped = false;
+      const walk = (dir, depth) => {
+        if (capped || depth > 12) return;
+        let ents; try { ents = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+        for (const e of ents) {
+          if (found.length >= 200 || scanned > 300000) { capped = true; return; }
+          if (e.isDirectory()) { if (!SKIP.has(e.name)) walk(join(dir, e.name), depth + 1); continue; }
+          scanned++;
+          if (re.test(e.name)) found.push(`${dir}${process.platform === 'win32' ? '\\' : '/'}${e.name}`);
+        }
+      };
+      for (const f of (h.folders || [])) if (f.path) walk(resolve(f.path), 0);
+      if (transport) transport.conflictCopies = found;
+      add('同步冲突副本', found.length ? 'WARN' : 'PASS', '0 个（有则需要人裁决留哪版）',
+        found.length
+          ? `${found.length} 个待裁决${capped ? '（已截断）' : ''}（扫 ${scanned} 个文件）：` + found.slice(0, 3).map((p) => p.split(/[\\/]/).pop()).join('、')
+          : `0 个（扫 ${scanned} 个文件）`);
+    }
     /* 每 folder 一行 —— **只报不健康的那些**（A9 要"一屏看到每 folder 状态"，但 14 个健康的行会把表淹掉：
      * 健康的用上面的汇总行代表，异常的才单独列出，这是"信号 vs 噪音"的取舍）。 */
     for (const f of transport.folders) {
