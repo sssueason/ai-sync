@@ -174,6 +174,9 @@ function winActionProblems(taskXml) {
       const script = inner.find((f) => /\.(mjs|ps1)$/i.test(f));
       if (!script) problems.push(`命令文件里没有脚本路径：${line.trim().slice(0, 80)}`);
       else if (!existsSync(script)) problems.push(`命令文件指向不存在的脚本：${script}`);
+      // 2026-09-19：命令文件必须带 `--trigger=scheduler`，否则**调度器跑的那一轮在日志里归因不了**
+      // （会落成 unspecified，看起来像"没人点它却自己跑了"）。这属于调度漂移，靠现成的对账机制自愈。
+      if (!line.includes('--trigger=scheduler')) problems.push('命令文件缺 --trigger=scheduler（调度器触发的轮次将无法归因）');
     } catch (e) {
       problems.push(`命令文件读不出来：${e.message}`);
     }
@@ -241,6 +244,8 @@ export function detectSchedule(instance, cfg = loadInstance(instance)) {
     const probs = [];
     if (!script) probs.push('plist 里没有脚本路径');
     else if (!existsSync(script)) probs.push(`plist 指向不存在的脚本：${script}`);
+    // 与 Windows 同一条判据：调度器触发的轮次要能归因（见 winActionProblems 里的同名检查）
+    if (!xml.includes('--trigger=scheduler')) probs.push('plist 缺 --trigger=scheduler（调度器触发的轮次将无法归因）');
     out.actionOk = probs.length === 0;
     if (probs.length) out.actionProblems = probs;
     out.inSync = out.actual === wantSec && out.actionOk;
