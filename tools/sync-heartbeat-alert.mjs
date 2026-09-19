@@ -9,12 +9,16 @@
  *
  * 判据（与 sync/state/README.md 的契约对齐，并补两条）：
  *   · 本机（self）：看**本地 tick 日志**（每轮都写 ⇒ 新鲜）→ 末行时间 > staleMin*3 视为停
- *   · 对端（peer）：看**已提交快照**
- *       - heavy.lastStartedAt  > heavyStaleHours(26h)          → ALERT 重活未跑
- *       - writtenAt            > snapStaleHours(14h)           → ALERT 快照过期（该机 daily 没跑）
- *       - tick.lastAt          > staleMin(20min) 且 writtenAt 新鲜(<2h) → ALERT tick 停
- *     ★ 关键：只有"快照本身新鲜"时才敢断言"对端 tick 停了"；否则只报"快照过期"。
- *       否则一个 9 小时前的快照会被误读成"tick 停了"（本机 2026-09-18 实测正是这个形态）。
+ *   · 对端（peer）分两个数据源，**各问各的**（2026-09-19 修，理由见下方 ★）：
+ *       - **tick 在跑吗？** ← 每轮推上来的状态（`sync-state` 分支 `state/<machine>.json`）里的
+ *                              `tick.lastAt` > 4×该机 intervalMin → ALERT tick 停；
+ *                              读不到同源状态 ⇒ 只报"无法判定"，**不**拿照片告警
+ *       - **夜间重活跑了吗？** ← 已提交快照：`heavy.lastStartedAt` > 26h / `writtenAt` > 14h → ALERT
+ *     ★ 为什么必须分开（2026-09-19 实测假红）：快照里的 `tick.lastAt` 是**一次性照片**、冻在写入那一刻，
+ *       而 `tAge ≈ 快照龄` ⇒ 只要快照龄落在 80 分钟~2 小时之间，就**必然**判对端 tick 停了
+ *       （实测：campus 快照 13:40 写、里面记的 tick 是 13:32，14:56/15:17/15:36 连续三轮被误报）。
+ *       代价：**每台机器每晚跑完重活，对端都会必然假报一次**，并天天把"连续 72h 零告警"的退役门禁
+ *       顶回去（门禁因此永远过不去）。照片只能用来看"照片里那一刻"，不能用它判"现在在不在跑"。
  *
  * 用法：node tools/sync-heartbeat-alert.mjs [--instance <dir>] [--no-notify] [--rc] [--json] [--quiet]
  *   --rc      有告警时 exit 1（给 daily 用；**不要**放进 tick 的 rc，避免每 20 分钟一次假红）
@@ -27,6 +31,9 @@ import { fileURLToPath } from 'node:url';
 import { homedir, hostname } from 'node:os';
 import { spawn } from 'node:child_process';
 import { maintenanceOf as maintOf, maintText } from './lib/maintenance.mjs';
+// 2026-09-19：对端"tick 还在跑吗"的判据改用**每轮推上来的状态**（sync-state 分支），
+// 不再用快照里那个冻结的 tick.lastAt（详见 checkPeers() 的函数头注释）。
+import { readFleet } from './sync-state.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const argv = process.argv.slice(2);
@@ -72,7 +79,9 @@ const WARN_MIN = Number(val('--warn-min', String(TICK_INTERVAL_MIN * 2)));      
 const STALE_MIN = Number(val('--stale-min', String(TICK_INTERVAL_MIN * 4)));     // 4× 间隔 ⇒ ALERT
 const HEAVY_STALE_H = Number(val('--heavy-stale-hours', '26')); // 重活判停阈值（契约值）
 const SNAP_STALE_H = Number(val('--snap-stale-hours', '14'));   // 快照自身过期阈值（daily 1–2 次/天 ⇒ 14h 足够宽）
-const SNAP_FRESH_H = Number(val('--snap-fresh-hours', '2'));    // "敢断言对端 tick 停了"的前提：快照足够新鲜
+// 注：原先这里还有一个 SNAP_FRESH_H(2h)——"敢断言对端 tick 停了"的前提。2026-09-19 取消：
+//     对端 tick 的判据已改用**每轮状态**（同源），不再依赖"快照够不够新鲜"这个代理条件。
+//     （保留这个说明是因为它正是那条假红的根源：用照片的新鲜度去担保一个它回答不了的问题。）
 
 /* ★ 跨端维护登记（2026-09-19 新增，闭掉审计里的"对端维护状态互相不可见"）：
  *   本机做维护时，对端只能从"它不 tick 了"推断，长得和故障一模一样 —— 实测某台对端按用户指令
@@ -161,6 +170,16 @@ function checkSelf() {
 function checkPeers() {
   let files = [];
   try { files = readdirSync(STATE).filter((f) => /^tick-.+\.json$/.test(f)); } catch { /* 目录不存在 */ }
+  /* ★ 2026-09-19 修：回答"对端 tick 还在跑吗"必须用**每轮推上来的状态**（`sync-state` 分支的
+     `state/<machine>.json`），**不能**用快照里那个 `tick.lastAt` —— 那是**一次性照片**，冻在快照写入的
+     那一刻。拿它去比 80 分钟阈值，等价于在测"这份快照多久前写的"：因为 `tAge ≈ 快照龄`，所以只要快照龄
+     落在 80 分钟 ~ 2 小时之间，就**必然**判对端 tick 停了。
+     实测代价（2026-09-19）：某对端快照写于 13:40、里面记的最后一次 tick 是 13:32（写的时候只差
+     7.3 分钟，完全健康），而 14:56 / 15:17 / 15:36 连续三轮被报成 `<该机>-tick-stale`；直到 15:56
+     快照超过 2h，工具才改口说"无法判定"。⇒ **每台机器每晚跑完重活，都会让对端必然假报一次**，而且天天把
+     "连续 72h 零告警"的退役门禁顶回去 ⇒ 门禁永远过不去。
+     两件事各有各的同源判据：**"tick 在跑吗" ← 每轮状态；"夜间重活跑了吗" ← 快照的 writtenAt / heavy**。 */
+  const fleet = (() => { try { return readFleet(INSTANCE, { fetch: true }); } catch { return { ok: false, machines: {} }; } })();
   for (const f of files) {
     let j = null;
     try { j = JSON.parse(readFileSync(join(STATE, f), 'utf8')); } catch { continue; }
@@ -188,21 +207,25 @@ function checkPeers() {
       alerts.push({ key: `${who}-snapshot-stale`, who, what: `${who} 的心跳快照已过期 ${wAgeH.toFixed(1)}h（阈值 ${SNAP_STALE_H}h）→ 该机 daily 没在跑；**不能据此判定其 tick 停了**`, ageHours: Number(wAgeH.toFixed(1)) });
       continue; // 快照过期时不再对 tick 下结论（避免误报）
     }
-    if (tAgeMin !== null && tAgeMin > STALE_MIN && wAgeH <= SNAP_FRESH_H) {
+    /* tick 是否在跑：用**每轮状态**判（同源），不用快照里那个冻结值（见函数头注释） */
+    const st = fleet.machines?.[who] || null;
+    const stAt = parseTs(st?.tick?.lastAt || st?.at);
+    const stAgeMin = stAt ? ageMin(stAt) : null;
+    const stInterval = Number(st?.tick?.intervalMin) || TICK_INTERVAL_MIN;
+    const stThr = stInterval * 4;
+    if (stAgeMin !== null && stAgeMin > stThr) {
       // ★ 措辞软化（对端反馈）：对端停摆也可能是**它在做维护冻结** —— 断言"大概率已停"会让对端白跑一趟。
-      alerts.push({ key: `${who}-tick-stale`, who, peer: true, what: `${who} 的 tick 最后一次是 ${Math.round(tAgeMin)} 分钟前（阈值 ${STALE_MIN} = 4×${TICK_INTERVAL_MIN}）且快照新鲜（${wAgeH.toFixed(1)}h）→ 该机 tick 疑似已停**或正在维护**（请到那台机器确认）`, ageMin: Math.round(tAgeMin) });
+      alerts.push({ key: `${who}-tick-stale`, who, peer: true, what: `${who} 的 tick 最后一次是 ${Math.round(stAgeMin)} 分钟前（阈值 ${stThr} = 4×${stInterval}），依据 = **它每轮推上来的状态**；该机 tick 疑似已停**或正在维护**（请到那台机器确认）`, ageMin: Math.round(stAgeMin) });
     }
     if (hAgeH !== null && hAgeH > HEAVY_STALE_H) {
       alerts.push({ key: `${who}-heavy-stale`, who, peer: true, what: `${who} 的重活已 ${hAgeH.toFixed(1)}h 未跑（阈值 ${HEAVY_STALE_H}h）`, ageHours: Number(hAgeH.toFixed(1)) });
     }
-    // ★ 措辞必须如实：快照不够新鲜时**不能**说"正常"，只能说"只能确认它最后一次 tick 在何时"
+    // ★ 措辞必须如实：读不到同源数据时**不能**说"正常"，也不能拿照片当判据
     if (!alerts.some((a) => a.who === who)) {
-      const tTxt = tAgeMin === null ? '未知' : `${Math.round(tAgeMin)} 分钟前`;
-      if (wAgeH > SNAP_FRESH_H) {
-        infos.push(`${who}: 快照 ${wAgeH.toFixed(1)}h（该机 daily 未跑）⇒ 只能确认它最后一次 tick 在 ${tTxt}；**它现在是否在跑，本机无法判定**`);
-        if (tAgeMin !== null && tAgeMin > WARN_MIN) infos.push(`${who}: 按快照口径已落后 ${Math.round(tAgeMin)} 分钟（>${WARN_MIN}），但快照不新鲜 ⇒ 先不计告警`);
+      if (stAgeMin !== null) {
+        infos.push(`${who}: 正常（tick ${Math.round(stAgeMin)} 分钟前〔按每轮状态〕；心跳快照 ${wAgeH.toFixed(1)}h）`);
       } else {
-        infos.push(`${who}: 正常（tick ${tTxt}，快照 ${wAgeH.toFixed(1)}h）`);
+        infos.push(`${who}: 读不到它每轮推的状态（sync-state 分支）⇒ **无法判定 tick 是否在跑**（不据此告警）；快照里记的最后一次 tick 是 ${tAgeMin === null ? '未知' : `${Math.round(tAgeMin)} 分钟前`}，但那是照片、不作判据`);
       }
     }
   }
