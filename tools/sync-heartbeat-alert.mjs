@@ -13,7 +13,9 @@
  *       - **tick 在跑吗？** ← 每轮推上来的状态（`sync-state` 分支 `state/<machine>.json`）里的
  *                              `tick.lastAt` > 4×该机 intervalMin → ALERT tick 停；
  *                              读不到同源状态 ⇒ 只报"无法判定"，**不**拿照片告警
- *       - **夜间重活跑了吗？** ← 已提交快照：`heavy.lastStartedAt` > 26h / `writtenAt` > 14h → ALERT
+ *       - **夜间重活跑了吗？** ← 已提交快照：`heavy.lastStartedAt` > 26h / `writtenAt` > 26h → ALERT
+ *         （`writtenAt` 阈值原为 14h，2026-09-20 修为 26h：快照每天 22:00 才写一次，
+ *           14h 会让每天 12:00–22:00 必然假红，理由见 SNAP_STALE_H 处的注释）
  *     ★ 为什么必须分开（2026-09-19 实测假红）：快照里的 `tick.lastAt` 是**一次性照片**、冻在写入那一刻，
  *       而 `tAge ≈ 快照龄` ⇒ 只要快照龄落在 80 分钟~2 小时之间，就**必然**判对端 tick 停了
  *       （实测：campus 快照 13:40 写、里面记的 tick 是 13:32，14:56/15:17/15:36 连续三轮被误报）。
@@ -78,7 +80,20 @@ const TOLERANT = (() => {
 const WARN_MIN = Number(val('--warn-min', String(TICK_INTERVAL_MIN * 2)));       // 错过一轮（只记 INFO）
 const STALE_MIN = Number(val('--stale-min', String(TICK_INTERVAL_MIN * 4)));     // 4× 间隔 ⇒ ALERT
 const HEAVY_STALE_H = Number(val('--heavy-stale-hours', '26')); // 重活判停阈值（契约值）
-const SNAP_STALE_H = Number(val('--snap-stale-hours', '14'));   // 快照自身过期阈值（daily 1–2 次/天 ⇒ 14h 足够宽）
+// [2026-09-20 修] 14 → 26。原注释写"daily 1–2 次/天 ⇒ 14h 足够宽"，**这句是错的**：
+//   实测两台机器都是**每天 1 次、都写在 22:00**（各自 22:00:0x，见 sync/state/tick-*.json 的 writtenAt）。
+//   写一次/天 ⇒ 快照龄在次日 22:00 前单调涨到 ~24h：
+//     跨过 14h 的时刻 = 12:00，复位时刻 = 22:00 ⇒ **每天必然有 ~10 小时是假红**。
+//   实测吻合：对端 09-20 从 **12:08** 起每 20 分钟一条 `<对端>-snapshot-stale`，共 32 条，
+//   而同期本机 `writtenAt` 一直新鲜、且 commit 2469cef 已推到远端（git `0 0`）。
+//   同一误报是**互相的**：两台机器各自 22:00 的心跳里都记了对方 `-snapshot-stale`。
+//   26h = 一整天 + 2h 余量 ⇒ 只有"整晚真没跑"才会报，与 `HEAVY_STALE_H` 同量级。
+//   ⚠️ 代价（明说）：抓"夜间槽停止写快照"的延迟从 14h 变成 ~26h —— 09-19 那次真回归
+//   （改 doctor-only 后没人写心跳，见 docs/peer-feedback.md L178）会在 26h 而非 14h 被抓到。
+//   这是 1 次/天节律作业的合理代价。若希望恢复"14h 内发现"，正确做法不是调回 14，
+//   而是**让心跳的写入频率高于判据周期**（例如让 tick 也调 write-heartbeat.ps1），
+//   届时 SNAP_STALE_H=14 才成立。这一改动会动到跨机心跳契约，留给用户决策。
+const SNAP_STALE_H = Number(val('--snap-stale-hours', '26'));
 // 注：原先这里还有一个 SNAP_FRESH_H(2h)——"敢断言对端 tick 停了"的前提。2026-09-19 取消：
 //     对端 tick 的判据已改用**每轮状态**（同源），不再依赖"快照够不够新鲜"这个代理条件。
 //     （保留这个说明是因为它正是那条假红的根源：用照片的新鲜度去担保一个它回答不了的问题。）
