@@ -723,7 +723,26 @@ const tolerantMachines = new Set((cfg.heartbeat?.tolerantMachines || []).map((x)
 const fleetList = [];
 for (const [id, s] of Object.entries(fleet.machines)) {
   const age = mins(parseStamp(s.at));
-  fleetList.push({ machine: id, at: s.at, ageMin: age, rc: s.tick?.rc ?? null, actions: s.actions || [], intervalMin: s.tick?.intervalMin ?? null, engineRev: s.engineRev ?? null, engineBehind: s.engineBehind ?? null, engineCompared: s.engineCompared ?? null, ops: s.ops ?? null });
+  fleetList.push({ machine: id, at: s.at, ageMin: age, rc: s.tick?.rc ?? null, actions: s.actions || [], intervalMin: s.tick?.intervalMin ?? null, engineRev: s.engineRev ?? null, engineBehind: s.engineBehind ?? null, engineCompared: s.engineCompared ?? null, state: s.state ?? null, warnings: s.warnings ?? null, transport: s.transport ?? null, ops: s.ops ?? null });
+  /* 对端可见性（2026-09-20 加，用户点单）：**任何一端的问题，在任一端都看得见**。
+     为什么需要：某一端曾因删掉同步根目录而每轮挂 3 条 `传输层 folder … state=error`，
+     而**别的端当时什么都看不到**（只有"文件总数没变"，那不是信号）⇒ 只能靠人到那台机器上截图。
+     分级刻意不对等（避免把对端的黄变成全队红）：
+       · 对端 problems（FAIL 级）与传输层异常 ⇒ 本机 WARN：看得见、且让本机图表变黄，但不冒充"本机故障"；
+       · 对端的普通 warnings ⇒ 本机 INFO：能看到它在黄什么，不重复报警。 */
+  if (id !== machine) {
+    const peerProblems = s.problems || [];
+    if (peerProblems.length) add(`对端 ${id} 报错`, 'WARN', '该端 problems=0', `${peerProblems.length} 项：${peerProblems.slice(0, 3).join('、')}${peerProblems.length > 3 ? ' …' : ''}`);
+    const tpProblems = s.transport?.problems || [];
+    if (tpProblems.length) add(`对端 ${id} 传输层有问题`, 'WARN', '该端传输层无问题项', `${tpProblems.length} 项：${tpProblems.slice(0, 2).join('；')}`);
+    const badFolders = (s.transport?.folders || []).filter((f) => f.paused || (f.state && f.state !== 'idle') || (f.needFiles ?? 0) > 0);
+    if (badFolders.length) {
+      add(`对端 ${id} 传输层 folder 异常`, 'WARN', '该端每 folder idle / 待同步 0', badFolders.slice(0, 3)
+        .map((f) => `${String(f.id).replace(/^projects--/, '文档集/')}(state=${f.state || '?'}${(f.needFiles ?? 0) > 0 ? `,待同步${f.needFiles}` : ''}${f.paused ? ',已暂停' : ''})`).join(' '));
+    }
+    const peerWarns = s.warnings || [];
+    if (peerWarns.length) checks.push({ name: `对端 ${id} 的告警`, level: 'INFO', expected: '该端 warnings 为空', actual: `${peerWarns.length} 条：${peerWarns.slice(0, 3).join('、')}${peerWarns.length > 3 ? ' …' : ''}` });
+  }
   if (age !== null && age > statePushMinutes * 2 && id !== machine) {
     if (tolerantMachines.has(id)) {
       checks.push({ name: `远端 ${id} 状态新鲜`, level: 'INFO', expected: `≤ ${statePushMinutes * 2} 分钟（宽容同步机仅记录）`, actual: `${age} 分钟前 · 登记为宽容同步（移动端/按需）⇒ 不预警` });
@@ -751,6 +770,8 @@ if (tCfg?.backup?.enabled === true) {
       attention: !!bs.attention, flags: bs.flags || [], scopeFiles: bs.scope?.files ?? null,
       scopeBytes: bs.scope?.bytes ?? null, removed: bs.removed || null, added: bs.added || null,
       unreadable: (bs.unreadable || []).length, verify: bs.verify || null,
+      audit: bs.audit || null,          // 含 ack：人工确认过的那次删除（2026-09-20）
+      alertSig: bs.alert?.sig || null,  // 本次告警签名；ack 必须与它**相符**才算"已确认这次"
       capacity: bs.verify?.capacity || bs.capacity || null
     };
     add('备份新鲜度', ageMin === null ? 'FAIL' : ageMin <= 36 * 60 ? 'PASS' : 'FAIL', '≤ 36 小时',
@@ -758,8 +779,16 @@ if (tCfg?.backup?.enabled === true) {
     if (backup.attention) add('备份待处理信号', 'FAIL', 'attention=false', (backup.flags || []).join('、') || '见状态文件');
     if (backup.unreadable) add('备份读不到的文件', 'WARN', '0 个', `${backup.unreadable} 个（清单变化才升级，见 backup-restic.md §6）`);
     if (backup.removed) {
-      add('误删审计', bs.audit?.tripped ? 'FAIL' : 'PASS', `≤ ${bs.audit?.thresholds?.files ?? 20} 个 · ≤ ${Math.round((bs.audit?.thresholds?.bytes ?? 209715200) / 1048576)} MB`,
-        `上次比对：删除 ${backup.removed.files} 个 / ${(backup.removed.bytes / 1048576).toFixed(1)} MB，新增 ${backup.added?.files ?? 0} 个`);
+      /* 人工确认过的那次删除（`backup-run.mjs --ack-audit` 写的 ack，绑定告警签名）⇒ 降为 INFO：
+         删除仍然**显示出来**（不是"没发生"），只是不再判红 —— 而且只有签名相符才降级，
+         新的一次异常删除仍是 FAIL。 */
+      const ack = backup.audit?.ack || null;
+      const ackMatches = !!(ack && backup.alertSig && ack.sig === backup.alertSig);
+      const exp = `≤ ${backup.audit?.thresholds?.files ?? 20} 个 · ≤ ${Math.round((backup.audit?.thresholds?.bytes ?? 209715200) / 1048576)} MB`;
+      const act = `上次比对：删除 ${backup.removed.files} 个 / ${(backup.removed.bytes / 1048576).toFixed(1)} MB，新增 ${backup.added?.files ?? 0} 个`
+        + (ackMatches ? `　⇒ **已人工确认**（${ack.at}，${ack.by}：${ack.note}）`
+          : ack ? `　⇒ 已确认过的是**另一次**删除（${ack.sig}，${ack.at}）⇒ 这次仍需人确认（--ack-audit）` : '');
+      add('误删审计', backup.audit?.tripped ? (ackMatches ? 'INFO' : 'FAIL') : 'PASS', exp, act);
     }
     const d = backup.verify?.drill, c = backup.verify?.check;
     if (c) add('备份数据校验', c.ok ? 'PASS' : 'FAIL', 'restic check 通过', c.ok ? `OK（抽样 ${c.subset}，${c.durationSec}s）` : `上次失败：${c.detail || ''}`);
@@ -915,6 +944,19 @@ if (WRITE_STATE) {
     actions: conv.actions.map((a) => ({ level: a.level || 'warn', text: a.text, owner: a.owner || null })),
     ops,
     problems,
+    /* 对端可见性（2026-09-20 加，用户点单）：把**本机的判定 / 告警 / 传输层状态**一起推上去。
+       起因：某一端曾有 3 个 folder 报 `state=error`（= 3 条 WARN + 托盘黄），而**别的端完全看不见** ——
+       只能靠人在那台机器上看截图。现在任何一端出问题，在任一端的状态页/托盘都能看到。
+       体积控制：传输层只推**摘要**（每 folder 的 id/state/errors/needFiles/paused + problems），不推连接明细。
+       语义边界：对端的 problems（FAIL 级）与传输层异常 ⇒ 本机记 WARN（看得见但不冒充本机故障）；
+       对端的普通 warnings ⇒ 本机记 INFO（"能看到它在黄什么"，不重复报警）。 */
+    state,
+    warnings: warns,
+    transport: transport ? {
+      ok: transport.ok !== false,
+      problems: transport.problems || [],
+      folders: (transport.folders || []).map((f) => ({ id: f.id, state: f.state || null, errors: f.errors ?? null, needFiles: f.needFiles ?? null, paused: !!f.paused })),
+    } : null,
   };
   const stampFile = join(INSTANCE, 'sync', 'state', `.last-state-push-${machine}`);
   const prevFile = join(INSTANCE, 'sync', 'state', `.last-state-${machine}.json`);
@@ -982,6 +1024,11 @@ if (OUT) {
       tok.push(`卫生=${o && o.hygiene ? (o.hygiene.fails ? `FAIL${o.hygiene.fails}` : `ok(${o.hygiene.warns ?? 0}W)`) : '-'}`)
       tok.push(`迁移=${o && o.migrations ? (o.migrations.blocked ? `FAIL${o.migrations.blocked}` : `${o.migrations.applied}条${o.migrations.pendingManual ? `/${o.migrations.pendingManual}待人工` : ''}`) : '-'}`)
       tok.push(`应用=${o && o.apply ? (o.apply.blocked || o.apply.bad ? `FAIL${(o.apply.blocked || 0) + (o.apply.bad || 0)}` : `ok(${o.apply.ok})`) : '-'}`)
+      // 对端可见性：判定 / 告警数 / 传输层异常 三项（没有就不显示，避免把 14 个健康项淹进表里）
+      if (m.state) tok.push(`状态=${m.state}`)
+      if ((m.warnings || []).length) tok.push(`告警=${m.warnings.length}`)
+      const peerTpBad = (m.transport?.problems || []).length + (m.transport?.folders || []).filter((f) => f.paused || (f.state && f.state !== 'idle') || (f.needFiles ?? 0) > 0).length
+      if (peerTpBad) tok.push(`传输异常=${peerTpBad}`)
       console.log(`  ${m.machine.padEnd(12)} ${m.at || '?'}  ${m.ageMin === null ? '' : m.ageMin + ' 分钟前'}  rc=${m.rc}  待办=${(m.actions || []).length}  ${tok.join('  ')}`);
     }
   }
