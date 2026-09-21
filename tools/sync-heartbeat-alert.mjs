@@ -9,6 +9,8 @@
  *
  * 判据（与 sync/state/README.md 的契约对齐，并补两条）：
  *   · 本机（self）：看**本地 tick 日志**（每轮都写 ⇒ 新鲜）→ 末行时间 > staleMin*3 视为停
+ *   · 本机传输层（2026-09-21 加）：tick 每轮把 syncthing-health 的观测传进来（--transport-*）⇒
+ *     刷新失败 / 缺工具 / 有问题项 = 本机告警（"运输层静默停摆 44 分钟没人知道"那次的漏报面）
  *   · 对端（peer）分两个数据源，**各问各的**（2026-09-19 修，理由见下方 ★）：
  *       - **tick 在跑吗？** ← 每轮推上来的状态（`sync-state` 分支 `state/<machine>.json`）里的
  *                              `tick.lastAt` > 4×该机 intervalMin → ALERT tick 停；
@@ -246,6 +248,47 @@ function checkPeers() {
   }
 }
 
+/* ---------- 本机传输层（2026-09-21 batch 18 加） ----------
+ * 事实由 **tick 每轮**传进来（`--transport-broken=rc` / `--transport-missing` / `--transport-problems=N`）：
+ * 它那一轮刚跑过 syncthing-health，手上的观测是最新的、且与它自己的日志行同源。为什么必须进这条通道：
+ * 2026-09-21 本机 Syncthing 干净退出后没人拉起（任务缺保活触发器），运输层停了 **44 分钟**，而告警账的
+ * sig 一直是空 —— 那次失败只活在 tick 的日志行里，**没有任何推送**，最后是对端报「没有任何对端连上」
+ * 才暴露。凡"静默停摆几十分钟以上"的形态都该有推送，这是本项目最贵的一类漏报。
+ * 维护登记 / 冻结标记 / 宽容机器照旧豁免（维护中的停摆是预期的）—— 门与 checkSelf 同一套。 */
+/** 取 `--transport-*` 的值：**`--flag=值` 与 `--flag 值` 两种写法都认**。
+ *  为什么单列一个解析器：tick 用 `=` 形式传（见 sync-tick.mjs 的 `--transport-broken=${rc}`），
+ *  而本文件其它开关走 `val()`（只认空格形式）—— 2026-09-21 首次注入测试就吃到了这个不一致：
+ *  参数传进来了、解析拿不到 ⇒ **告警静默不产生**（rc 还是 0，看起来"一切正常"）。
+ *  这类"传了却什么都没发生"的静默降级是本项目最贵的一类 bug，必须堵死。 */
+function transportFlags() {
+  const pick = (flag) => {
+    const eq = argv.find((a) => a.startsWith(flag + '='));
+    if (eq) return eq.slice(flag.length + 1);
+    return val(flag, null);
+  };
+  const missing = pick('--transport-missing');
+  return { broken: pick('--transport-broken'), missing: missing !== null, probs: pick('--transport-problems') };
+}
+
+function checkSelfTransport() {
+  const { broken, missing, probs } = transportFlags();
+  if (broken === null && !missing && probs === null) return; // 没有本轮事实（独立运行 / 未配置传输层）⇒ 不下结论
+  if (TOLERANT.has(machine)) { infos.push('本机传输层：登记为**宽容同步**（移动端/按需）⇒ 不预警，仅记录'); return; }
+  const ms = maintenanceOf(machine);
+  if (ms && !ms.expired) { infos.push(`本机传输层：${maintText(ms)} ⇒ 不预警，仅记录`); return; }
+  const frozen = freezeReason();
+  if (frozen) { infos.push(`本机传输层：${frozen} ⇒ 不预警，仅记录`); return; }
+  if (broken !== null) {
+    alerts.push({ key: 'self-transport-down', who: machine, what: `本机传输层健康检查没跑成（rc=${broken}）⇒ Syncthing 可能已退出/没在跑，同步实际已停（2026-09-21 实测：静默 44 分钟才被发现）。先查任务有没有**保活触发器**（实例仓 docs/transport-syncthing.md 附录 C）` });
+  } else if (missing) {
+    alerts.push({ key: 'self-transport-tool-missing', who: machine, what: '本机缺少 tools/syncthing-health.mjs ⇒ 传输层状态无从判定（tick 每轮都会跳过刷新）' });
+  } else if (Number(probs) > 0) {
+    alerts.push({ key: 'self-transport-problems', who: machine, what: `本机传输层有 ${probs} 个问题项（REST/对端连接/文件夹）⇒ 同步可能已停或落后；跑 node tools/syncthing-health.mjs 看明细` });
+  } else {
+    infos.push('本机传输层：本轮刷新 OK（REST 可达、无问题项）');
+  }
+}
+
 /* ---------- 通知（状态变化去重 + 最多 6h 重弹一次） ---------- */
 function loadAlertState() {
   try { return JSON.parse(readFileSync(ALERT_STATE, 'utf8')); } catch { return { sig: '', at: 0 }; }
@@ -275,6 +318,7 @@ function notify(title, body) {
 
 /* ---------- 主流程 ---------- */
 checkSelf();
+checkSelfTransport();
 checkPeers();
 
 const sig = alerts.map((a) => a.key).sort().join('|');

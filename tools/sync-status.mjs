@@ -534,6 +534,20 @@ if (!schedule.installed) add('tick 调度已安装', 'FAIL', '有平台任务', 
 else if (schedule.inSync === false) add('tick 间隔与配置一致', 'FAIL', `配置 ${schedule.want} 分钟`, `实际 ${schedule.actualMin ?? schedule.actualSec}${schedule.actualMin ? ' 分钟' : ' 秒'}`);
 else add('tick 间隔与配置一致', 'PASS', `配置 ${schedule.want} 分钟`, '一致');
 
+/* 传输层自启的**形态**（2026-09-21 batch 18 加）：判据只有一处实现（install.mjs 的 detectTransport
+   → transportTaskProblems）。为什么值得一条断言：本机任务曾被写成「裸 exe + 只有 AtLogOn」，代价是
+   ① 屏幕上弹一个控制台窗口 ② 关掉它之后**没人拉起**，运输层静默停 44 分钟（还是对端先报的红）。
+   分级 WARN 而不是 FAIL：形态不对 ≠ 这轮同步没跑成，但它会让**下一次**退出变成静默停摆。
+   ★ 只在 Windows 判：mac 侧的载体是 brew services（那台是宽容移动端，不是本引擎注册的 launchd），
+     这里没有它的判据 ⇒ 不写"看不见却会误报"的断言（宁可明说不判，也不制造假红）。 */
+if (process.platform === 'win32' && installMod?.detectTransport) {
+  const t = installMod.detectTransport(INSTANCE, cfg);
+  if (t.enabled === false) add('传输层自启按配置关闭', t.installed ? 'WARN' : 'PASS', 'transport.autostart=false ⇒ 无任务', t.installed ? `${t.task} 仍存在（应卸下）` : '已关闭（无任务）');
+  else if (!t.installed) add('传输层自启已安装', 'WARN', `${t.task} 存在`, t.detail || '任务不存在（运输层既不自启也不自愈）');
+  else if (t.inSync === false) add('传输层任务形态与配置一致', 'WARN', '隐藏运行器 + 保活触发器 + 命令内容与配置一致', t.detail);
+  else add('传输层任务形态与配置一致', 'PASS', '隐藏运行器 + 保活触发器 + 命令内容与配置一致', t.detail || '一致');
+}
+
 // 镜像调度：这条断言的存在意义就是不让 cloudMirror.schedule 重新变成死旋钮
 if (schedule.mirror) {
   const m = schedule.mirror;

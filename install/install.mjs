@@ -665,6 +665,55 @@ function readTransportSpec(instance) {
   try { return JSON.parse(readFileSync(join(instance, 'sync', 'state', 'transport-spec.json'), 'utf8')); } catch { return null; }
 }
 
+/* ---------------------------------------------------------------- 传输层任务形态（能失败的判据）
+ * 2026-09-21（batch 18，代价 = 44 分钟静默断链）：原先 `detectTransport` 只比对 transport-spec.json 的
+ * exe/home ⇒ 任务被写成「裸 exe 动作 + 只有 AtLogOn」时它照样报「与配置一致」。那个形态有两条真实代价：
+ *   ① 动作是裸 exe ⇒ Task Scheduler 给它开一个控制台窗口（用户实测：屏幕上多一个黑框，顺手把它关了）；
+ *   ② 没有保活触发器 ⇒ Syncthing 干净退出/被关掉后**没人把它拉回来**（`-RestartCount` 只对**失败**生效），
+ *      本机运输层因此静默停了 44 分钟，直到对端报「没有任何对端连上」才暴露。
+ * 所以这里把**形态本身**变成判据（隐藏运行器 / 保活触发器 / IgnoreNew / 命令文件链），每一条都能被构造
+ * 出来 ⇒ 每一条都能用故障注入证明它会失败（`sync/tests/transport-task-selftest.mjs`）。
+ * ★ 命令文件放哪里**不参与判定**：实例仓 `docs/transport-syncthing.md` 附录 C 的手工范式放仓库外
+ *   （%LOCALAPPDATA%），引擎注册器放实例内 sync/state/ —— 两种都真在跑，判位置只会给对端制造假红。
+ *   判据盯的是"链通不通、内容跟配置对不对"。 */
+export function transportTaskProblems(taskXml, spec = null) {
+  const problems = [];
+  const args = (/<Arguments>([\s\S]*?)<\/Arguments>/.exec(taskXml) || [])[1] || '';
+  const command = ((/<Command>([\s\S]*?)<\/Command>/.exec(taskXml) || [])[1] || '').trim();
+  const quoted = [...args.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+  const runner = quoted.find((f) => /run-hidden\.vbs$/i.test(f));
+  const cmdFile = quoted.find((f) => /\.(cmd|txt)$/i.test(f));
+  if (!/wscript\.exe$/i.test(command)) problems.push(`动作不是 wscript.exe（实际 ${command || '空'}）⇒ 交互式身份下会弹控制台窗口`);
+  if (!runner) problems.push('动作里没有 run-hidden.vbs（隐藏运行器）⇒ 会弹控制台窗口');
+  else if (!existsSync(runner)) problems.push(`隐藏运行器不存在：${runner}`);
+  if (!cmdFile) problems.push('动作里没有命令文件（*.cmd / *-cmd.txt）');
+  else if (!existsSync(cmdFile)) problems.push(`命令文件不存在：${cmdFile}`);
+  else {
+    try {
+      const line = readFileSync(cmdFile, 'utf16le').replace(/^\uFEFF/, '').trim();
+      if (!line) problems.push(`命令文件是空的：${cmdFile}`);
+      if (spec?.exe) {
+        const exe = (/^"([^"]+)"/.exec(line) || [])[1];
+        if (!exe) problems.push(`命令文件第一段不是带引号的可执行文件路径：${line.slice(0, 80)}`);
+        else if (resolve(exe).toLowerCase() !== resolve(spec.exe).toLowerCase()) problems.push(`命令文件跑的不是配置里的可执行文件（装的 ${exe}，配置 ${spec.exe}）`);
+      }
+      if (spec?.home) {
+        const home = (/--home="?([^"\s]+)"?/.exec(line) || [])[1];
+        if (!home) problems.push('命令文件缺 --home=<配置的数据目录>');
+        else if (resolve(home).toLowerCase() !== resolve(spec.home).toLowerCase()) problems.push(`--home 与配置不一致（装的 ${home}，配置 ${spec.home}）`);
+      }
+    } catch (e) {
+      problems.push(`命令文件读不出来：${e.message}`);
+    }
+  }
+  /* 保活触发器：Syncthing 会"干净退出"，而 `-RestartCount` 只对失败生效 ⇒ 没有这一条就没人把它拉回来。 */
+  const rep = /<Repetition>([\s\S]*?)<\/Repetition>/.exec(taskXml);
+  if (!(rep && /<Interval>PT[^<]+<\/Interval>/.test(rep[1]))) problems.push('没有保活触发器（干净退出后不会自己回来）');
+  /* 保活到点时进程还在跑 ⇒ 这一跳必须被忽略，否则每 15 分钟起一个抢锁的第二实例。 */
+  if (!/<MultipleInstancesPolicy>\s*IgnoreNew\s*<\/MultipleInstancesPolicy>/.test(taskXml)) problems.push('MultipleInstancesPolicy 不是 IgnoreNew（保活的每一跳都可能起第二个实例抢锁）');
+  return problems;
+}
+
 export function detectTransport(instance, cfg = loadInstance(instance)) {
   const spec = transportSpecOf(instance, cfg);
   const out = { platform: process.platform, task: process.platform === 'darwin' ? transportLabel(cfg) : transportTaskName(cfg), enabled: spec.enabled, want: spec.enabled ? { exe: spec.exe, home: spec.home } : null, installed: false, inSync: null, detail: '' };
@@ -673,7 +722,11 @@ export function detectTransport(instance, cfg = loadInstance(instance)) {
     out.installed = existsSync(plist);
     out.plist = plist;
   } else if (process.platform === 'win32') {
-    out.installed = taskExists(out.task);
+    /* 2026-09-21（batch 18）：不只看"任务在不在"，而是读 XML 判**形态**（见 transportTaskProblems）。
+       任务不存在时 readTaskXml 返回 null —— 与 detectSchedule 同一套判据与措辞。 */
+    const xml = readTaskXml(out.task);
+    out.installed = xml !== null;
+    out.shapeProblems = xml ? transportTaskProblems(xml, spec.exe ? { exe: spec.exe, home: spec.home } : null) : [];
   } else {
     out.detail = '该平台没有安装器（Linux 请自行接 systemd）';
     return out;
@@ -687,8 +740,13 @@ export function detectTransport(instance, cfg = loadInstance(instance)) {
   if (!out.installed) { out.inSync = false; out.detail = '任务不存在'; return out; }
   const rec = readTransportSpec(instance);
   const same = !!rec && rec.exe === spec.exe && rec.home === spec.home;
-  out.inSync = same;
-  out.detail = same ? '与配置一致' : rec ? `配置已变（上次装的是 ${rec.exe} / ${rec.home}）` : '缺少 transport-spec.json（多半是手工任务，应收编）';
+  /* 形态（batch 18）：结构不对时**不许**报"与配置一致" —— 那正是 2026-09-21 那次 44 分钟静默断链
+     能藏住的写法（spec 文件记的是"上次按什么装的"，它管不了任务现在被改成了什么样）。 */
+  const shape = out.shapeProblems || [];
+  out.inSync = same && shape.length === 0;
+  out.detail = shape.length
+    ? `任务形态不对：${shape.join('；')}　修：用**引擎里的** install/install.mjs --register（命令与形态见实例仓 docs/transport-syncthing.md 附录 C）`
+    : same ? '与配置一致' : rec ? `配置已变（上次装的是 ${rec.exe} / ${rec.home}）` : '缺少 transport-spec.json（多半是手工任务，应收编）';
   return out;
 }
 
@@ -744,18 +802,27 @@ export function registerTransport(instance, cfg = loadInstance(instance)) {
     return { ok: true, task: name, via: 'launchd', plist, spec };
   }
   if (process.platform !== 'win32') return { ok: true, skipped: true, task: name, detail: '该平台没有安装器（非失败）' };
+  /* 2026-09-21（batch 18）：改成实例仓 `docs/transport-syncthing.md` 附录 C 的形态 —— 原先这里是
+     `-Execute syncthing.exe`（裸 exe）+ 只有 AtLogOn，两条真代价都实测发生过：
+       ① 裸 exe 动作 ⇒ Task Scheduler 给它开控制台窗口（用户 2026-09-21 看到黑框，顺手关了它）；
+       ② 没有保活触发器 ⇒ 干净退出后没人拉起（`-RestartCount` 只对失败生效），运输层静默停 44 分钟。
+     现在：走 run-hidden.vbs（无窗口）+ `-AtLogOn` 与「每 15 分钟一跳」两个触发器（保活）+ IgnoreNew
+     （进程还在跑时这一跳被忽略 ⇒ 不会起第二个实例抢锁）。命令文件用实例内 sync/state/（本函数的
+     上层 writeCmdFile 统一写着 UTF-16LE+BOM；.gitignore 早已登记该文件名）。 */
+  const cmdFile = writeCmdFile(instance, 'syncthing-cmd.txt', `"${spec.exe}" serve --home="${spec.home}" --no-browser`);
   const ps = `
 $ErrorActionPreference='Stop'
-$action = New-ScheduledTaskAction -Execute '${q(spec.exe)}' -Argument 'serve --home="${q(spec.home)}" --no-browser'
-$trigger = New-ScheduledTaskTrigger -AtLogOn
+$action = New-ScheduledTaskAction -Execute '${q(wscriptPath())}' -Argument '"${q(runnerPath())}" "${q(cmdFile)}"' -WorkingDirectory '${q(dirname(spec.exe))}'
+$t1 = New-ScheduledTaskTrigger -AtLogOn
+$t2 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Minutes 15) -RepetitionDuration (New-TimeSpan -Days 3650)
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-Register-ScheduledTask -TaskName '${q(name)}' -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
+Register-ScheduledTask -TaskName '${q(name)}' -Action $action -Trigger @($t1,$t2) -Settings $settings -Force | Out-Null
 Write-Output 'registered'
 `;
   const r = runPs(ps);
   if (!r.ok) return { ok: false, error: r.error };
   writeFileSync(specFile, JSON.stringify(spec, null, 2) + '\n', 'utf8');
-  return { ok: true, task: name, via: 'scheduled-task', spec };
+  return { ok: true, task: name, via: 'run-hidden.vbs', cmdFile, spec };
 }
 
 function registerMac(instance, interval) {

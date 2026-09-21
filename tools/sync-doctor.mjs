@@ -273,6 +273,17 @@ if (isMain) {
     if (!d.installed) add('调度已安装', 'FAIL', d.task || 'ai-sync-tick', d.detail || '未安装');
     else if (d.inSync === false) add('调度间隔与配置一致', 'FAIL', `${d.want} 分钟`, `实际 ${d.actual}${d.unit === 'sec' ? 's' : ' 分钟'}`);
     else add('调度已安装', 'PASS', d.task, `间隔 ${d.want} 分钟一致`);
+    /* 传输层自启的**形态**（2026-09-21 batch 18）：判据与 sync-status 同一处（install.mjs 的
+       detectTransport → transportTaskProblems），不另写第二份。WARN 不进 rc：形态不对 ≠ 今晚这轮
+       体检失败，但它是"下次退出就静默停摆"的隐患 —— 本机 2026-09-21 的 44 分钟断链就是这个形态
+       （裸 exe 动作 + 只有 AtLogOn、没有保活触发器）。mac 侧载体是 brew services，故只判 Windows。 */
+    if (process.platform === 'win32' && mod.detectTransport) {
+      const t = mod.detectTransport(INSTANCE, cfg);
+      if (t.enabled === false) { /* 按配置未启用：没有任务才是对的，不报 */ }
+      else if (!t.installed) add('传输层自启已安装', 'WARN', t.task, t.detail || '任务不存在');
+      else if (t.inSync === false) add('传输层任务形态与配置一致', 'WARN', '隐藏运行器 + 保活触发器 + 命令内容与配置一致', t.detail);
+      else add('传输层自启已安装', 'PASS', t.task, t.detail || '与配置一致');
+    }
   } else {
     add('安装器存在', 'FAIL', 'install/install.mjs', '找不到');
   }

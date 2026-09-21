@@ -619,6 +619,12 @@ async function main() {
     if (existsSync(hbTool)) {
       const hbArgs = [hbTool, '--instance', INSTANCE, '--json', '--quiet'];
       if (DRY) hbArgs.push('--dry-run'); // dry-run 时不要写去重状态、也不要弹通知
+      /* 2026-09-21（batch 18）：把本轮**刚观测到**的本机传输层事实一并交给告警器（同轮、同源）。
+         为什么必须补：运输层静默停 44 分钟那次，tick 只把「健康快照刷新失败（rc=1）」写进日志行，
+         告警账的 sig 仍是空 ⇒ **没有任何推送告警**，最后是靠对端报红才暴露的。 */
+      if (transportHealth?.broken) hbArgs.push(`--transport-broken=${transportHealth.rc ?? '?'}`);
+      else if (transportHealth?.missing) hbArgs.push('--transport-missing');
+      else if (Number(transportHealth?.problems) > 0) hbArgs.push(`--transport-problems=${transportHealth.problems}`);
       const r = spawnSync(process.execPath, hbArgs, { encoding: 'utf8', windowsHide: true, timeout: 60 * 1000, maxBuffer: 8 * 1024 * 1024 });
       try { hb = JSON.parse(String(r.stdout || '').trim()); } catch { hb = { broken: true }; }
       if (hb?.broken) line += ' | 心跳：检查器未返回结果';
