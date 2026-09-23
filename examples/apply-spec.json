@@ -23,6 +23,15 @@
       "run": { "argv": ["bash", "{instance}/apps/sync-tray/macos/build.sh"] },
       "timeoutSec": 300,
       "reason": "托盘源码变了才重编（产物比源码旧才算未生效）。Windows 侧托盘是解释执行的 .ps1 ⇒ 无需构建，故不设 unit"
+    },
+    {
+      "id": "stignore",
+      "platforms": ["win32", "darwin", "linux"],
+      "when": { "files": ["sync/syncthing/ignore-profiles.json", "sync/syncthing/allow-rules.json", "sync/syncthing/devices.json", "sync/machines/*.json"] },
+      "verify": { "kind": "cmd", "argv": ["{node}", "{instance}/tools/syncthing-render.mjs", "--instance", "{instance}", "--check"], "okExit": [0] },
+      "run": { "argv": ["{node}", "{instance}/tools/syncthing-render.mjs", "--instance", "{instance}", "--apply"] },
+      "timeoutSec": 120,
+      "reason": "各 folder 的 .stignore 必须与 ignore-profiles.json / allow-rules.json / 机器卡一致。2026-09-23 事故：某端把 `~$*` 加进 profiles 后**另两端一个都没落地**（tick 那三个渲染器不含 .stignore 生成器）⇒ 修复到不了该到的地方，且没有任何断言看得见。判据 = 生成器的 --check（一致 rc=0；漂移/缺失/手改 rc=2）。手改过的 .stignore 会被 --apply 拒绝覆盖 ⇒ run 之后 verify 仍不过 ⇒ 该 unit 记失败（人需介入），不静默。"
     }
   ],
   "_deferred": [
@@ -32,7 +41,7 @@
     },
     {
       "id": "render / prune",
-      "why": "tick 每轮已经在做（三个渲染器 + sync-prune.mjs）⇒ 登记为 apply unit 只会变成第二套机制。"
+      "why": "tick 每轮已经在做**另外三个**渲染器（agent 文件 / conventions / MCP）与 sync-prune.mjs ⇒ 那两个不需要 unit。★ 更正（2026-09-23）：这句话原先被读成'所有渲染都在 tick 里'，据此把 `.stignore` 生成器（syncthing-render.mjs）排除在外 —— 实测它**不在** tick 的三个渲染器里，于是 profiles 的改动到不了各端（campus 的 `~$*` 修复就卡在这里）。现已改为上面的 `stignore` unit。"
     }
   ]
 }

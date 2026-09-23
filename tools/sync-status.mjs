@@ -729,6 +729,26 @@ else {
 
 if (conv.statePush && conv.statePush.ok === false) add('跨端状态已推送', 'WARN', '推送成功', conv.statePush.error || '上轮推送失败');
 
+/* 问题条目的**类别**（2026-09-23 batch 19）：对端要能分清"这是我的故障"还是"这是我看到的别人"。
+ * 为什么必需（实测）：本机蓝屏重启期间，对端的传输层判 FAIL（它看不到本机），而本机把这条渲染成
+ * 「对端 <机> 报错」——把人指向了错的机器。只推名字（problems）时，消费端只能猜。
+ * 向后兼容：`problems`（名字数组）原样保留，本字段是**追加**；老对端没有它就按名字兜底分类。
+ * ★ 定义必须放在 fleet 循环**之前**：循环里的兜底分类要用它（2026-09-23 实测踩过 TDZ）。 */
+const KIND_RULES = [
+  [/^对端 |^远端 .*状态新鲜/, 'peer-relay'],
+  [/^传输层对端连接|^传输层无问题项|^传输层 REST/, 'transport-peers'],
+  [/^传输层/, 'transport'],
+  [/^本机 tick /, 'self-freshness'],
+  [/^tick 调度|^夜间任务|^调度/, 'schedule'],
+  [/^卫生/, 'hygiene'],
+  [/^迁移/, 'migrations'],
+  [/^应用/, 'apply'],
+  [/^误删审计|^备份/, 'backup'],
+  [/^引擎/, 'engine'],
+  [/^跨端状态/, 'state-push'],
+];
+const kindOfCheck = (name) => (KIND_RULES.find(([re]) => re.test(String(name))) || [null, 'other'])[1];
+
 /* 宽容同步的机器（instance.json 的 heartbeat.tolerantMachines，用户 2026-09-18 裁决）：
    移动端 / 按需同步的机器**不预警**，只记 INFO。判据必须与 tools/sync-heartbeat-alert.mjs **同一处** ——
    否则同一个名单"一个工具认、另一个不认"（2026-09-19 实测：心跳工具对同一台机器说"仅记录、不预警"，
@@ -745,14 +765,56 @@ for (const [id, s] of Object.entries(fleet.machines)) {
        · 对端 problems（FAIL 级）与传输层异常 ⇒ 本机 WARN：看得见、且让本机图表变黄，但不冒充"本机故障"；
        · 对端的普通 warnings ⇒ 本机 INFO：能看到它在黄什么，不重复报警。 */
   if (id !== machine) {
-    const peerProblems = s.problems || [];
-    if (peerProblems.length) add(`对端 ${id} 报错`, 'WARN', '该端 problems=0', `${peerProblems.length} 项：${peerProblems.slice(0, 3).join('、')}${peerProblems.length > 3 ? ' …' : ''}`);
-    const tpProblems = s.transport?.problems || [];
-    if (tpProblems.length) add(`对端 ${id} 传输层有问题`, 'WARN', '该端传输层无问题项', `${tpProblems.length} 项：${tpProblems.slice(0, 2).join('；')}`);
+    /* ── 归因与陈旧（2026-09-23 batch 19）────────────────────────────────────────────
+       ① 对端的问题条目里可能夹着"它看不到某台机器"。若被点名的是**本机**，那不是对端的故障：
+          实测（本机 09-23 09:06 蓝屏重启后）某对端的传输层判 FAIL，本机却渲染成「对端 <机> 报错」
+          —— 把人指向了错机器。这类条目改记 INFO，并明说"源头在本机"。
+       ② 对端上报超过新鲜度窗口（max(2×其间隔, 40min)）⇒ 它的问题条目按**陈旧**处理（只记 INFO）：
+          拿几分钟前甚至几小时前的照片当判据，是这套系统里反复出现过的一类假红。
+       ③ 宽容机器（heartbeat.tolerantMachines）的**自身 tick 过期**只记 INFO —— 用户 2026-09-21 裁决
+          "先不修"的那条，本批按"把待做事项并入"的指示一起做掉（判据仍只在这一处）。──────────── */
+    const tolerantPeer = tolerantMachines.has(id);
+    const peerInterval = Number(s.tick?.intervalMin) || cfg.tick.intervalMinutes || 20;
+    const stalePeer = age !== null && age > Math.max(peerInterval * 2, 40);
+    const staleNote = stalePeer ? `（该端上报已 ${age} 分钟 ⇒ 按陈旧处理，不当判据）` : '';
+    const mentionsMe = (txt) => new RegExp(`(^|[^\\w-])${machine}([^\\w-]|$)`).test(String(txt || ''));
+    const details = Array.isArray(s.problemDetails) && s.problemDetails.length ? s.problemDetails : null;
+    const entries = details
+      ? details.map((d) => ({ name: d.name || '?', kind: d.kind || 'other', text: d.text || '' }))
+      : (s.problems || []).map((n) => ({ name: String(n), kind: kindOfCheck(n), text: String(n) }));  // 老对端：按名字兜底
+    const aboutMe = entries.filter((e) => e.kind === 'transport-peers' && mentionsMe(e.text));
+    const own = entries.filter((e) => !aboutMe.includes(e));
+    const ownFresh = own.filter((e) => e.kind === 'self-freshness');
+    const ownOther = own.filter((e) => e.kind !== 'self-freshness');
+    if (aboutMe.length) {
+      checks.push({
+        name: `对端 ${id} 看不到本机`, level: 'INFO', expected: '该端应能连上本机',
+        actual: `${aboutMe.length} 项：${aboutMe.slice(0, 2).map((e) => e.name).join('、')} ⇒ **源头在本机**（本机在它眼里掉线/未连上），不算该端故障`,
+      });
+    }
+    if (ownOther.length) {
+      add(`对端 ${id} 报错`, stalePeer ? 'INFO' : 'WARN', '该端 problems=0',
+        `${ownOther.length} 项：${ownOther.slice(0, 3).map((e) => e.name).join('、')}${ownOther.length > 3 ? ' …' : ''}${staleNote}`);
+    }
+    if (ownFresh.length) {
+      // 宽容机器：合盖睡久了它自己就会记一条"tick 过期" ⇒ 只记 INFO（判据与心跳工具同一份名单）
+      const lvl = tolerantPeer || stalePeer ? 'INFO' : 'WARN';
+      add(`对端 ${id} 自身 tick 过期`, lvl, '该端 tick 在其 4× 间隔内', `${ownFresh.length} 项：${ownFresh.map((e) => e.name).join('、')}${tolerantPeer ? ' · 该端登记为宽容同步（移动端/按需）⇒ 仅记录' : ''}${staleNote}`);
+    }
+    const tpAll = s.transport?.problems || [];
+    const tpMine = tpAll.filter((p) => mentionsMe(p));
+    const tpHers = tpAll.filter((p) => !mentionsMe(p));
+    if (tpMine.length) {
+      checks.push({
+        name: `对端 ${id} 的传输层指向本机`, level: 'INFO', expected: '对端传输层问题应是它自己的',
+        actual: `${tpMine.length} 项（点名本机 ⇒ 源头在本机）：${tpMine.slice(0, 1).join('；').slice(0, 140)}`,
+      });
+    }
+    if (tpHers.length) add(`对端 ${id} 传输层有问题`, stalePeer ? 'INFO' : 'WARN', '该端传输层无问题项', `${tpHers.length} 项：${tpHers.slice(0, 2).join('；')}${staleNote}`);
     const badFolders = (s.transport?.folders || []).filter((f) => f.paused || (f.state && f.state !== 'idle') || (f.needFiles ?? 0) > 0);
     if (badFolders.length) {
-      add(`对端 ${id} 传输层 folder 异常`, 'WARN', '该端每 folder idle / 待同步 0', badFolders.slice(0, 3)
-        .map((f) => `${String(f.id).replace(/^projects--/, '文档集/')}(state=${f.state || '?'}${(f.needFiles ?? 0) > 0 ? `,待同步${f.needFiles}` : ''}${f.paused ? ',已暂停' : ''})`).join(' '));
+      add(`对端 ${id} 传输层 folder 异常`, stalePeer ? 'INFO' : 'WARN', '该端每 folder idle / 待同步 0', badFolders.slice(0, 3)
+        .map((f) => `${String(f.id).replace(/^projects--/, '文档集/')}(state=${f.state || '?'}${(f.needFiles ?? 0) > 0 ? `,待同步${f.needFiles}` : ''}${f.paused ? ',已暂停' : ''})`).join(' ') + staleNote);
     }
     const peerWarns = s.warnings || [];
     if (peerWarns.length) checks.push({ name: `对端 ${id} 的告警`, level: 'INFO', expected: '该端 warnings 为空', actual: `${peerWarns.length} 条：${peerWarns.slice(0, 3).join('、')}${peerWarns.length > 3 ? ' …' : ''}` });
@@ -886,6 +948,16 @@ const problems = checks.filter((c) => c.level === 'FAIL').map((c) => c.name);
 const warns = checks.filter((c) => c.level === 'WARN').map((c) => c.name);
 const state = problems.length ? 'fail' : actions.length || warns.length ? 'warn' : 'ok';
 
+/* 问题条目明细：名字 + 类别 + 原文（KIND_RULES/kindOfCheck 定义在 fleet 循环之前，见上）。 */
+const problemDetails = checks.filter((c) => c.level === 'FAIL').map((c) => ({
+  name: c.name,
+  kind: kindOfCheck(c.name),
+  // 传输层类的问题把**原始文本**带上（里面有被点名的机器名）⇒ 消费端才能判"这条其实是说本机"
+  text: ['transport', 'transport-peers'].includes(kindOfCheck(c.name))
+    ? (transport?.problems || []).join(' ；') || String(c.actual || '')
+    : String(c.actual || ''),
+}));
+
 const payload = {
   state,
   at: stamp(),
@@ -958,6 +1030,9 @@ if (WRITE_STATE) {
     actions: conv.actions.map((a) => ({ level: a.level || 'warn', text: a.text, owner: a.owner || null })),
     ops,
     problems,
+    /* 结构化问题条目（batch 19）：名字 + 类别 + 原文 ⇒ 对端能分清"这是它的故障"还是"它看到的别人"。
+       体积控制：只推 FAIL 级条目，且最多 8 条（对端展示用不到更多）。 */
+    problemDetails: problemDetails.slice(0, 8),
     /* 对端可见性（2026-09-20 加，用户点单）：把**本机的判定 / 告警 / 传输层状态**一起推上去。
        起因：某一端曾有 3 个 folder 报 `state=error`（= 3 条 WARN + 托盘黄），而**别的端完全看不见** ——
        只能靠人在那台机器上看截图。现在任何一端出问题，在任一端的状态页/托盘都能看到。

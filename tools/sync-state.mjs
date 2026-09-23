@@ -93,7 +93,9 @@ export function writeMachine(instance, machine, stateObj, { branch = 'sync-state
   if (!isGitRepo(instance)) return { ok: false, error: '实例目录不是 git 仓（单机本地模式，跳过跨端状态）' };
   const content = JSON.stringify(stateObj, null, 2) + '\n';
   let lastError = null;
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  /* 2026-09-23（batch 19）：重试 3 → 6 次并加**抖动**退避 —— 实测两次撞上 non-fast-forward 且三次重试全败
+     （三端都在推状态，其中一台曾 71 秒内推过两次）⇒ 3 次不够；固定退避会让两端同步退避后再次同刻相撞。 */
+  for (let attempt = 1; attempt <= 6; attempt++) {
     try {
       let parent = null;
       let parentTree = EMPTY_TREE;
@@ -130,6 +132,7 @@ export function writeMachine(instance, machine, stateObj, { branch = 'sync-state
       // 2026-09-17 TR6 实测，原先对所有错误重试 3 次 × 60s 超时，把整轮 tick 拖到 3 分钟
       // （而实例仓不可写是很容易发生的：克隆自只读来源、令牌过期…）。失败会被记成 statePush.ok=false 的 WARN。
       if (!/non-fast-forward|fetch first|rejected|cannot lock/i.test(lastError)) break;
+      try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150 * attempt + Math.floor(Math.random() * 250)); } catch { /* 环境不支持就跳过等待 */ }
     }
   }
   return { ok: false, error: lastError || '未知错误' };
