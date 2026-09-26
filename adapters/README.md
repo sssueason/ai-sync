@@ -40,11 +40,11 @@
 |---|---|---|
 | `none` | 不需要动作（例：文档、由 agent 逐请求读取的文件） | 只记录 |
 | `hot` | 应用自己 watch 该文件（写下去就生效） | 只记录 |
-| `http` | 应用提供分类/重载端点 | `GET classify` → 需要时 `POST request`（dsh 走这条） |
+| `http` | 应用提供分类/重载端点 | `GET classify` → 需要时 `POST request`（引擎侧自带的 owner 卡当前没有用这个模式的实例；模式本身保留） |
 | `command` | 需要跑一条命令才会重载/重启 | 记录 + 通知；`--apply-commands` 时才执行 |
 | `manual` | 交互式会话，**不能**自动重启（杀了会丢用户工作） | 通知 + 全队状态里点名 |
 
-`http` 的完整写法（dsh 实例）：
+`http` 模式的完整字段（示例；字段含义与 `adapters/owners/dsh.json` 当年那份相同，该卡已于 2026-09-26 随 dsh 转桌面端撤除）：
 
 ```json
 "reload": {
@@ -67,7 +67,6 @@
 | `producers/agentFiles.json` | 四个 agent 指令文件（dsh / opencode / WorkBuddy / vault） |
 | `producers/mcp.json` | MCP live 配置（dsh profile patch / opencode jsonc / WorkBuddy mcp.json） |
 | `producers/conventions.json` | conventions §1/§2 的 canonical 副本 |
-| `owners/dsh.json` | `http` 模式（restart-guard 的 classify/request） |
 | `owners/opencode.json` · `owners/workbuddy.json` | `manual`（交互式，只通知） |
 | `owners/claudian.json` | 默认关闭（Obsidian 内，需手动重载） |
 | `owners/vault.json` | `none`（vault 内的指令文件由 agent 自行读取） |

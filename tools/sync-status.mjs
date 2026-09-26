@@ -22,8 +22,6 @@ import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir, hostname } from 'node:os';
 import { execFileSync, spawnSync } from 'node:child_process';
-import http from 'node:http';
-import net from 'node:net';
 import { readFleet, writeMachine, isGitRepo } from './sync-state.mjs';
 import { pathToFileURL } from 'node:url';
 
@@ -215,103 +213,12 @@ function convergeFacts() {
   }
 }
 
-/* ---------------------------------------------------------------- dsh guard */
-
-const httpJson = (method, url, body, timeoutMs = 3000) =>
-  new Promise((done, fail) => {
-    let u;
-    try {
-      u = new URL(url);
-    } catch (e) {
-      fail(e);
-      return;
-    }
-    const payload = body === undefined ? null : Buffer.from(JSON.stringify(body), 'utf8');
-    const req = http.request(
-      {
-        method,
-        hostname: u.hostname,
-        port: u.port || 80,
-        path: u.pathname + u.search,
-        timeout: timeoutMs,
-        headers: payload ? { 'content-type': 'application/json', 'content-length': payload.length } : {},
-      },
-      (res) => {
-        const chunks = [];
-        res.on('data', (c) => chunks.push(c));
-        res.on('end', () => {
-          const text = Buffer.concat(chunks).toString('utf8');
-          let json = null;
-          try {
-            json = JSON.parse(text);
-          } catch {}
-          done({ status: res.statusCode ?? 0, json, text });
-        });
-      },
-    );
-    req.on('timeout', () => req.destroy(new Error('timeout')));
-    req.on('error', (e) => fail(e));
-    if (payload) req.write(payload);
-    req.end();
-  });
-
-const portListening = (host, port) =>
-  new Promise((done) => {
-    const s = net.connect({ host, port });
-    const fin = (v) => {
-      try {
-        s.destroy();
-      } catch {}
-      done(v);
-    };
-    s.setTimeout(800);
-    s.on('connect', () => fin(true));
-    s.on('timeout', () => fin(false));
-    s.on('error', () => fin(false));
-  });
-
-async function guardFacts() {
-  const ownersDir = join(ENGINE, 'adapters', 'owners');
-  const dshFile = join(ownersDir, 'dsh.json');
-  if (!existsSync(dshFile)) return { configured: false };
-  let dsh;
-  try {
-    dsh = JSON.parse(readFileSync(dshFile, 'utf8'));
-  } catch {
-    return { configured: false };
-  }
-  const sw = cfg.owners?.['dsh'];
-  const overrideBase = sw && typeof sw === 'object' ? sw.guardBase : null;
-  const base = overrideBase || dsh.reload?.guardBase;
-  if (!base) return { configured: false };
-  const u = new URL(base);
-  try {
-    const r = await httpJson('GET', `${base}/restart/status`);
-    if (r.status === 200 && r.json) {
-      // patch 层必须是 live（否则 MCP/约定改动不会自动生效）—— 用 classify 做**功能性**探测
-      const probe = expand('~/.dsh/profiles/web/cordis.patch.yml');
-      let patchKind = null;
-      try {
-        const c = await httpJson('GET', `${base}/restart/classify?path=${encodeURIComponent(probe)}`);
-        patchKind = c.json?.kind ?? null;
-      } catch {}
-      return {
-        configured: true,
-        reachable: true,
-        state: r.json.state,
-        pending: (r.json.pending || []).length,
-        lastRestart: r.json.lastRestart || null,
-        autoRestart: r.json.config?.autoRestart ?? null,
-        reloadEngine: r.json.reloadEngine ? { active: r.json.reloadEngine.active, watching: r.json.reloadEngine.watching } : null,
-        patchKind,
-      };
-    }
-    return { configured: true, reachable: true, badStatus: r.status };
-  } catch (e) {
-    const listening = await portListening(u.hostname, Number(u.port || 80));
-    return { configured: true, reachable: false, listening, error: e.message };
-  }
-}
+/* 2026-09-26（dsh 依赖撤除·第二步）：这里原先有一整段 "dsh guard" ——
+   `httpJson` / `portListening` / `guardFacts()`，用来探测 dsh 的 restart-guard
+   （`GET /restart/status`、`/restart/classify`）并断言「dsh restart-guard 可达」「patch 层为 live」。
+   随 dsh 转桌面端：① `adapters/owners/dsh.json` 已在第一步删除 ⇒ `guardFacts()` 恒返回 `configured:false`，
+   那两条断言**永远不会触发**（看着还在、其实早是死代码）；② 用户裁决"项目内 dsh 依赖与状态检测一并撤除"。
+   故整段删除（含只被它使用的 `http` / `net` 导入）。dsh 自身的健康由桌面端自己管，同步体系不再代劳。 */
 
 /* ---------------------------------------------------------------- 调度（间隔是否与配置一致） */
 
@@ -484,7 +391,6 @@ const tick = tickFacts();
 const conv = convergeFacts();
 const schedule = scheduleFacts();
 const artifacts = artifactFacts();
-const guard = await guardFacts();
 const fleet = readFleet(INSTANCE, { branch: cfg.state.branch, fetch: !has('--no-fetch') });
 
 const statePushMinutes = cfg.tick.statePushMinutes ?? 15;
@@ -518,17 +424,9 @@ for (const a of artifacts) {
   else add(`渲染对账 ${a.id}`, 'PASS', '0 drift', '0');
 }
 
-if (guard.configured) {
-  if (!guard.reachable) {
-    if (guard.listening) add('dsh restart-guard 可达', 'FAIL', 'HTTP 200', `端口在听但请求失败：${guard.error}`);
-    else add('dsh restart-guard 可达', 'WARN', 'HTTP 200', 'dsh 未运行（良性：下次启动自然读到新配置）');
-  } else if (guard.patchKind && guard.patchKind !== 'hot-patch') {
-    add('patch 层为 live', 'FAIL', 'classify=hot-patch', `classify=${guard.patchKind} ⇒ MCP/约定改动不会自动生效`);
-  } else {
-    add('dsh restart-guard 可达', 'PASS', 'HTTP 200', `state=${guard.state} autoRestart=${guard.autoRestart}`);
-    if (guard.patchKind) add('patch 层为 live', 'PASS', 'classify=hot-patch', guard.patchKind);
-  }
-}
+/* 2026-09-26：这里原有两条 dsh 断言（`dsh restart-guard 可达` / `patch 层为 live`）。
+   它们依赖 `adapters/owners/dsh.json`（第一步已删）⇒ `guardFacts()` 恒 `configured:false`、断言永不触发。
+   随 dsh 转桌面端一并撤除；dsh 自己的 patch 层是否 live 由桌面端自己保证。 */
 
 if (!schedule.installed) add('tick 调度已安装', 'FAIL', '有平台任务', `${schedule.task} 不存在`);
 else if (schedule.inSync === false) add('tick 间隔与配置一致', 'FAIL', `配置 ${schedule.want} 分钟`, `实际 ${schedule.actualMin ?? schedule.actualSec}${schedule.actualMin ? ' 分钟' : ' 秒'}`);
@@ -983,7 +881,6 @@ const payload = {
   actions,
   repos,
   machines: fleetList,
-  guard,
   converge: conv.present ? { at: conv.at, changed: conv.changed, targets: conv.targets, requested: conv.requested } : null,
   schedule,
 };
@@ -1026,7 +923,7 @@ if (WRITE_STATE) {
     at: payload.at,
     tick: { intervalMin: cfg.tick.intervalMinutes, lastAt: tickAt, rc: Number.isFinite(rc) ? rc : null, elapsedSec: Number.isFinite(elapsed) ? elapsed : null },
     repos: repos.map((r) => ({ id: r.id, ahead: r.ahead, behind: r.behind, dirty: r.dirty })),
-    converge: payload.converge ? { at: conv.at, changed: conv.changed, pendingOwners: [...new Set(conv.actions.map((a) => a.owner).filter(Boolean))], guard: guard.reachable ? 'ok' : guard.listening ? 'error' : 'down' } : null,
+    converge: payload.converge ? { at: conv.at, changed: conv.changed, pendingOwners: [...new Set(conv.actions.map((a) => a.owner).filter(Boolean))] } : null,
     actions: conv.actions.map((a) => ({ level: a.level || 'warn', text: a.text, owner: a.owner || null })),
     ops,
     problems,

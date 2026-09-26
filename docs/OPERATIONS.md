@@ -71,7 +71,8 @@ node <引擎根>/apps/sync-console/server.mjs --stop
 
 **处置**：重启那个应用（opencode / WorkBuddy / Obsidian…）。下次 tick 后待办自动消失。
 
-> dsh 不需要你做什么：`cordis.patch.yml`（MCP 配置）由 HMR 热重载，指令文件逐请求生效；只有**插件集合**变更才需要重启，而那由 restart-guard **空闲后自己重启**（见下条）。
+> dsh 不需要你做什么：`cordis.patch.yml`（MCP 配置）由 HMR 热重载，指令文件逐请求生效；只有**插件集合**变更才需要重启。
+> 2026-09-26：dsh 已转桌面端，它自己的重启由桌面端负责 —— 同步体系**不再为 dsh 登记待办**（原 `adapters/owners/dsh.json` 已撤除，见 `adapters/README.md`）。
 
 ### B. 图标变红：tick 过期 / git 冲突
 

@@ -2,7 +2,8 @@
 # build.sh — 编译 macOS 菜单栏托盘（SyncTray.app）
 #
 # 对应 Windows 侧 apps/sync-tray/windows/（PowerShell + WinForms）。
-# 与仓库既有做法一致（见 dsh/app/launcher-mac/build.sh）：swiftc 单文件直编 + ad-hoc 签名，不引入 Xcode 工程。
+# 做法：swiftc 单文件直编 + ad-hoc 签名，不引入 Xcode 工程（本仓 macOS 侧一贯如此）。
+# 2026-09-26：原先此处引 `dsh/app/launcher-mac/build.sh` 作先例，该目录已随 dsh 转桌面端撤除。
 #
 # 用法：
 #   bash build.sh             # 产出 dist/SyncTray.app

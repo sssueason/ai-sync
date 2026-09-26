@@ -36,10 +36,6 @@
   ],
   "_deferred": [
     {
-      "id": "dsh-launcher",
-      "why": "dsh/app/apply-app.ps1 幂等（内容相同则不动），但它没有可靠的'是否已一致'判据（-DryRun 的退出码不区分'无变化'与'有变化'）⇒ 按本项目纪律：**没有可靠 verify 的动作不进 apply**。要纳入先给它加一个 check 原语（例如 --check 在'已一致'时返回 0、'需更新'时返回 2）。"
-    },
-    {
       "id": "render / prune",
       "why": "tick 每轮已经在做**另外三个**渲染器（agent 文件 / conventions / MCP）与 sync-prune.mjs ⇒ 那两个不需要 unit。★ 更正（2026-09-23）：这句话原先被读成'所有渲染都在 tick 里'，据此把 `.stignore` 生成器（syncthing-render.mjs）排除在外 —— 实测它**不在** tick 的三个渲染器里，于是 profiles 的改动到不了各端（campus 的 `~$*` 修复就卡在这里）。现已改为上面的 `stignore` unit。"
     }

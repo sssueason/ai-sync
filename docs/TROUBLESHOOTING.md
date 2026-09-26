@@ -10,7 +10,7 @@
 |---|---|---|
 | `fatal: Cannot rebase onto multiple branches` | 两个同步进程同时 fetch/pull，把 `.git/FETCH_HEAD` 写成交错多行 | 已修：`sync/_load.ps1` 用命名互斥体串起来；看到 `[SKIP] 另一个同步进程正持锁` 就是它在让路，**不是故障** |
 | tick 日志 `repo=X integrate=FAIL rc=1` 但仓库没坏 | 同上（旧版本才会发生） | 已修；若重现，检查是否有第三方脚本也在 pull（编辑器插件、云盘客户端） |
-| `dsh` 里改了 patch 却不生效 | 本机 patch 层不是 live（`patchReload: startup`） | `sync-status.mjs` 会报 `patch 层为 live → FAIL`；对照 `profile-boot.ts` 的 `patchReload` 语义修 profile 清单 |
+| `dsh` 里改了 patch 却不生效 | 本机 patch 层不是 live（`patchReload: startup`） | **2026-09-26 起 `sync-status.mjs` 不再查这条**（dsh 转桌面端，其 guard/owner 卡已撤除）：自行核对 profile 清单与 `profile-boot.ts` 的 `patchReload` 语义 |
 | 改了 `mcp/servers.json` 但工具没变 | 渲染器没跑 / 渲染器 FAIL | 看 tick 日志的 `render … 退出码 N`；手动跑一次 `node <引擎根>/mcp/render/render_mcp.mjs` |
 | 渲染器打印 `[FAIL] … 找不到小节` | 目标文件的**小节标题**与渲染器期望不逐字一致 | 标题必须与渲染器里的常量逐字相同（含全角标点）；改标题或改渲染器常量，**别只改一边** |
 | 渲染产物里的指针指向一个不存在的文件 | 布局不同（拆分 vs 合并布局）被硬编码 | 已修：渲染器按"同级副本是否存在"选文案；若再遇到，说明有新布局没被覆盖 |

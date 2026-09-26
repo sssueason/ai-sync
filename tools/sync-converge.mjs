@@ -5,12 +5,14 @@
  * 为什么需要它（2026-09-17）：渲染链已经把「单源 → 各端 live 配置」自动化了，但没有一步把
  * "这些文件变了"翻译成"哪个应用要重载"。实测：`cordis.patch.yml`（MCP 配置）由 dsh 的 HMR 直接热重载、
  * `AGENTS.md` 由 agent-instructions 逐请求 reconcile —— **都不需要重启**；而插件集合
- * （`profiles/<p>/package.json`）在 boot 时解析，**必须重启**，却没有任何东西会通知 restart-guard
- * （它只 watch `pnpm-lock.yaml` 与 patch 文件）⇒ 这是唯一真正缺的自动触发点。
+ * （`profiles/<p>/package.json`）在 boot 时解析，**必须重启**，却没有任何东西会通知应用
+ * （当年 dsh 侧的 restart-guard 只 watch `pnpm-lock.yaml` 与 patch 文件）⇒ 这是唯一真正缺的自动触发点。
+ * ⚠️ 2026-09-26（dsh 依赖撤除·第二步）：dsh 已转桌面端，`adapters/owners/dsh.json` 随之撤除 ⇒
+ *    本工具不再替 dsh 登记重启；上面这段保留作**设计动机**（http 模式仍在，任何应用都能用 owner 卡接上）。
  *
  * 设计（不重造轮子）：
  *   - 目标清单来自**渲染器自己**（`--targets-json`），不在本文件里再抄一份路径表；
- *   - "要不要重启"由**应用自己**回答：dsh 走 restart-guard 的 `GET /restart/classify`（权威判据），
+ *   - "要不要重启"由**应用自己**回答：声明 `http` 模式的 owner 走它的 `GET /restart/classify`（权威判据），
  *     交互式应用走 `manual`（只通知，绝不杀用户会话）；
  *   - 本文件只做：变更检测（内容 sha256）→ 分类 → 登记/通知 → 落状态。
  *
@@ -79,7 +81,6 @@ const MACHINE = machineId();
 const DEFAULTS = {
   tick: { intervalMinutes: 5, jitterSeconds: 45, statePushMinutes: 15 },
   console: { enabled: true, bind: '127.0.0.1', port: 7788, autostart: true },
-  apps: { dsh: { autostart: false } },
   producers: {},
   owners: {},
   cloudMirror: { enabled: false, schedule: { mode: 'dailyAt', times: ['22:00'] } },

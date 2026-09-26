@@ -110,10 +110,12 @@ function loadGitattributes(repo) {
       // gitattributes 语义：**不含斜杠**的模式匹配任意层级（像 .gitignore）——
       // 少了这一步，`*.ps1 text eol=crlf` 对 `install/bootstrap.ps1` 不生效（实测踩到：整仓声明被判"未声明"）
       // 2026-09-19 修：**没有 eol= 的行也必须留下**（eol: null）。它们的语义是"这条路径不套用
-      // 行尾政策"（`* -text`、`dsh/plugins/** -text` 这类例外）。以前用 filter(Boolean) 把它们丢掉
+      // 行尾政策"（`* -text`、`<vendored 目录>/** -text` 这类例外）。以前用 filter(Boolean) 把它们丢掉
       // ⇒ "通用规则 + 更具体例外"这种正常写法在门禁眼里等于不存在，会拿前面那条通用规则去判，
       // 结论与 git 相反（假红）。
-      // pat 也留着：区分"没政策"（命中兜底 `*`）与"有意豁免"（具体例外，如 `dsh/plugins/** -text !eol`）
+      // pat 也留着：区分"没政策"（命中兜底 `*`）与"有意豁免"（具体例外，如 `<vendored 目录>/** -text !eol`）
+      // ⚠️ 举例只写占位符，别写具体仓里**已不存在**的路径（2026-09-26：原先这里举 `dsh/plugins/**`，
+      //    而 `dsh/` 整目录已随 dsh 转桌面端撤除 —— 示例会误导人去仓里找一个不存在的目录）。
       // 要用它 —— 只有前者才算"这个扩展名没人管"（2026-09-19 修那条误导性 INFO）。
       return { re: globToRe(parts[0].includes('/') ? parts[0] : '**/' + parts[0]), eol: m ? m.split('=')[1].toLowerCase() : null, pat: parts[0] }
     })
@@ -230,7 +232,7 @@ for (const repo of REPOS) {
     } else if (ext && !declEol) {
       /* 两类完全不同的东西（2026-09-19 修）：
        *   · 命中**兜底规则 `*`**（或压根没有 .gitattributes）⇒ 这个扩展名确实**没有行尾政策** ⇒ undeclared；
-       *   · 命中**具体例外**（`dsh/plugins/** -text !eol` 这类）⇒ 是"政策里明确写了这一处不套用" ⇒ exempted。
+       *   · 命中**具体例外**（`<vendored 目录>/** -text !eol` 这类）⇒ 是"政策里明确写了这一处不套用" ⇒ exempted。
        * 以前两者混在一个集合里 ⇒ 只要仓里有**一处** vendored 例外，整个扩展名就被报成
        * "未声明 eol（已跳过 EOL 检查）"：把"我查了"说成"我跳过了"。这不是假红也不是假绿，是**误导** ——
        * 比前两者更隐蔽，因为它会让人以为有整类文件没人管，从而去"修"一个不存在的问题。 */

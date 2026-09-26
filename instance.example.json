@@ -8,14 +8,11 @@
   "_console": "本地控制台（向导/仪表盘/设置）。默认只绑 127.0.0.1；要局域网访问必须同时设 token 并自担风险",
   "console": { "enabled": true, "bind": "127.0.0.1", "port": 7788, "autostart": true, "token": "" },
 
-  "_apps": "随登录自启哪些服务。dsh.autostart=false 表示只跑同步，不自动拉起 agent 服务",
-  "apps": { "dsh": { "autostart": false } },
-
   "_producers": "哪些渲染器参与（produces live 配置清单）。关掉某个 = 它的目标不再进入收敛",
   "producers": { "agentFiles": true, "mcp": true, "conventions": true },
 
-  "_owners": "每个应用变了要不要重载/重启：见 adapters/owners/*.json 的 reload.mode（none|hot|http|command|manual）",
-  "owners": { "dsh": true, "opencode": true, "workbuddy": true, "claudian": false, "vault": true },
+  "_owners": "每个应用变了要不要重载/重启：见 adapters/owners/*.json 的 reload.mode（none|hot|http|command|manual）。2026-09-26：dsh 已转桌面端，其 owner 卡已撤除",
+  "owners": { "opencode": true, "workbuddy": true, "claudian": false, "vault": true },
 
   "_cloudMirror": "云盘镜像（µ2）节拍：默认每天 22:00；也可写成 {\"mode\":\"interval\",\"intervalMinutes\":60}。enabled=false = 纯 git 同步",
   "cloudMirror": { "enabled": true, "schedule": { "mode": "dailyAt", "times": ["22:00"] } },
