@@ -232,6 +232,17 @@ function scheduleFacts() {
 }
 /* ---------------------------------------------------------------- 引擎自身版本（更新提示） */
 
+/** 把子进程异常压成**一行有信息量的**错误。
+ *  2026-10-15 实测（用户报"更新不了：没有 git 仓库权限"，三端都查不出真因）：
+ *  `execFileSync` 的 `e.message` 第一行**永远**是 `Command failed: git -C … <args>` —— 只留第一行
+ *  等于什么都没说：网络被挡 / 凭据被拒 / 仓库不存在，三种形态在对端状态里长得一模一样。
+ *  git 真正说的话在 stderr（message 的后续行）⇒ 取第一条不含 `Command failed` 的非空行；
+ *  仍然只留一行（状态要跨机推送，不灌垃圾），但那一行必须是 git 的原话。 */
+function gitErrLine(e) {
+  const lines = String((e && e.message) || e || '').split('\n').map((s) => s.trim()).filter(Boolean);
+  return lines.find((l) => !/^Command failed:/i.test(l)) || lines[0] || 'unknown';
+}
+
 /** 本机正在跑的引擎落后远端多少 —— 落后就提示更新，并把命令写清楚。
  *  为什么值得单列：引擎装在各机器的独立 clone 里，只有人手动 `git pull` 才会前进；
  *  没有这条检查时，"某台机器还在跑两周前的代码"是完全不可见的。 */
@@ -291,7 +302,7 @@ function engineFacts() {
       writeFileSync(stampFile, String(Date.now()), 'utf8');
       out.fetched = true;
     } catch (e) {
-      out.fetchError = String(e.message || e).split('\n')[0];
+      out.fetchError = gitErrLine(e);
     }
   }
   // 注意方向：`HEAD..origin/<branch>` 才是"远端有、本地没有"= 落后。
@@ -332,7 +343,7 @@ function engineFacts() {
       out.reachable = true;
     } catch (e) {
       out.reachable = false;
-      out.probeError = String(e.message || e).split('\n')[0];
+      out.probeError = gitErrLine(e);
     }
     probeMs = Date.now() - t0;
     out.probeMs = probeMs;
