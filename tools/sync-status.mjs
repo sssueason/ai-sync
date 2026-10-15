@@ -386,6 +386,15 @@ function artifactFacts() {
 const checks = [];
 const add = (name, level, expected, actual) => checks.push({ name, level, expected, actual });
 
+/* 宽容同步的机器（instance.json 的 heartbeat.tolerantMachines，用户 2026-09-18 裁决）：
+   移动端 / 按需同步的机器**不预警**，只记 INFO。判据必须与 tools/sync-heartbeat-alert.mjs **同一处** ——
+   否则同一个名单"一个工具认、另一个不认"（2026-09-19 实测：心跳工具对同一台机器说"仅记录、不预警"，
+   状态页却按 40 分钟阈值每天挂黄；而笔记本合盖本就是它的正常状态）⇒ 又是一条会训练人忽略黄色的假红。
+   ★ 2026-10-15 移到组装段之前：本机**自己**的「tick 新鲜」判据也要读它。原先只有对端渲染读，
+     于是同一台宽容机器在心跳层被宽容、在自身状态层却判 FAIL，还连带把另两端拉成 WARN（判据分叉）。
+   ★ 定义必须在 fleet 循环之前（循环里的兜底分类要用它；2026-09-23 实测踩过 TDZ）。 */
+const tolerantMachines = new Set((cfg.heartbeat?.tolerantMachines || []).map((x) => String(x)));
+
 const repos = repoFacts();
 const tick = tickFacts();
 const conv = convergeFacts();
@@ -407,8 +416,13 @@ for (const r of repos) {
 }
 
 const tickAge = mins(parseStamp(tick.lastAt));
+/* 本机自己也要认这份宽容名单（2026-10-15，用户裁决）：宽容机器（移动端/按需）**自身 tick 过期只记 INFO** ——
+   判据与心跳层、与本文件的对端渲染**同一份**。原先这里恒为 FAIL：macbook 合盖一夜 → 自己判 fail
+   → 另两端各挂一条「对端 macbook 报错」WARN ⇒ 全队常驻黄灯，而真实故障是零（实测 2026-10-15 07:14）。
+   ★ 只降「过期」，**不降 rc≠0**：上一轮 tick 非零退出是真故障（整合失败/推送失败），与"睡了一觉"无关。 */
+const selfTolerant = tolerantMachines.has(machine);
 if (tick.lastAt === null) add('本机 tick 有记录', 'FAIL', '有 tick 日志', '找不到 tick 日志');
-else if (tickAge > tickStaleMin) add('本机 tick 新鲜', 'FAIL', `≤ ${tickStaleMin} 分钟`, `${tickAge} 分钟前（rc=${tick.rc}）`);
+else if (tickAge > tickStaleMin) add('本机 tick 新鲜', selfTolerant ? 'INFO' : 'FAIL', `≤ ${tickStaleMin} 分钟`, `${tickAge} 分钟前（rc=${tick.rc}）${selfTolerant ? ' · 本机登记为宽容同步（移动端/按需）⇒ 仅记录，不预警' : ''}`);
 else add('本机 tick 新鲜', 'PASS', `≤ ${tickStaleMin} 分钟`, `${tickAge} 分钟前（rc=${tick.rc}）`);
 if (tick.rc !== null && tick.rc !== 0) add('本机上轮 tick rc=0', 'FAIL', 'rc=0', `rc=${tick.rc}`);
 
@@ -647,12 +661,10 @@ const KIND_RULES = [
 ];
 const kindOfCheck = (name) => (KIND_RULES.find(([re]) => re.test(String(name))) || [null, 'other'])[1];
 
-/* 宽容同步的机器（instance.json 的 heartbeat.tolerantMachines，用户 2026-09-18 裁决）：
-   移动端 / 按需同步的机器**不预警**，只记 INFO。判据必须与 tools/sync-heartbeat-alert.mjs **同一处** ——
-   否则同一个名单"一个工具认、另一个不认"（2026-09-19 实测：心跳工具对同一台机器说"仅记录、不预警"，
-   状态页却按 40 分钟阈值每天挂黄；而笔记本合盖本就是它的正常状态）⇒ 又是一条会训练人忽略黄色的假红。 */
-const tolerantMachines = new Set((cfg.heartbeat?.tolerantMachines || []).map((x) => String(x)));
+/* 宽容机器名单已提到组装段之前定义（2026-10-15：本机自身判据与对端判据必须同一份）。
+   `engineOnlyPeers`：对端**只剩「引擎比对不可用」一类**问题的机器 —— 循环里不逐端报警，循环后聚合成一条 INFO。 */
 const fleetList = [];
+const engineOnlyPeers = [];
 for (const [id, s] of Object.entries(fleet.machines)) {
   const age = mins(parseStamp(s.at));
   fleetList.push({ machine: id, at: s.at, ageMin: age, rc: s.tick?.rc ?? null, actions: s.actions || [], intervalMin: s.tick?.intervalMin ?? null, engineRev: s.engineRev ?? null, engineBehind: s.engineBehind ?? null, engineCompared: s.engineCompared ?? null, state: s.state ?? null, warnings: s.warnings ?? null, transport: s.transport ?? null, ops: s.ops ?? null });
@@ -691,8 +703,19 @@ for (const [id, s] of Object.entries(fleet.machines)) {
       });
     }
     if (ownOther.length) {
-      add(`对端 ${id} 报错`, stalePeer ? 'INFO' : 'WARN', '该端 problems=0',
-        `${ownOther.length} 项：${ownOther.slice(0, 3).map((e) => e.name).join('、')}${ownOther.length > 3 ? ' …' : ''}${staleNote}`);
+      /* 2026-10-15（用户裁决：「git 仓库保持不变，R1 不修复」）：对端**只剩「引擎比对不可用」一类**问题时，
+         不再逐端记 WARN。理由：那是**引擎仓远端可达性**造成的环境条件（两端 ls-remote 均失败），
+         与该端的内容同步无关；逐端 WARN 等于给全队按上一盏永不熄灭的黄灯 —— 而本项目的经验是
+         "久了所有黄都没人看"（见上面宽容名单那条注释里的同类教训）。
+         **不隐藏**：循环后聚合成一条 INFO，点名是哪几端、为什么不判定。
+         若该端还夹着**任何别类**问题（hygiene / transport / backup …），照旧按 WARN 逐端报，一条不漏。 */
+      const onlyEngine = ownOther.every((e) => e.kind === 'engine');
+      if (onlyEngine) {
+        engineOnlyPeers.push({ id, n: ownOther.length, names: ownOther.slice(0, 3).map((e) => e.name), stalePeer });
+      } else {
+        add(`对端 ${id} 报错`, stalePeer ? 'INFO' : 'WARN', '该端 problems=0',
+          `${ownOther.length} 项：${ownOther.slice(0, 3).map((e) => e.name).join('、')}${ownOther.length > 3 ? ' …' : ''}${staleNote}`);
+      }
     }
     if (ownFresh.length) {
       // 宽容机器：合盖睡久了它自己就会记一条"tick 过期" ⇒ 只记 INFO（判据与心跳工具同一份名单）
@@ -724,6 +747,18 @@ for (const [id, s] of Object.entries(fleet.machines)) {
       add(`远端 ${id} 状态新鲜`, 'WARN', `≤ ${statePushMinutes * 2} 分钟`, `${age} 分钟前`);
     }
   }
+}
+/* 引擎比对不可用的对端：聚合成一条 INFO（2026-10-15，用户裁决 R1「引擎远端保持不变、不修复」）。
+   **为什么不许悄悄丢掉**：本项目的假绿防线要求"找不到/不可判定"必须留信号；这里留的是一个**有名字、有原因**的
+   INFO —— 恢复可达（或换镜像）后，对端不再报 engine 类问题，这条自动消失，不需要谁来清。 */
+if (engineOnlyPeers.length) {
+  checks.push({
+    name: '对端引擎比对不可用', level: 'INFO',
+    expected: '各端都能判定自己的引擎是否落后',
+    actual: `${engineOnlyPeers.length} 端：${engineOnlyPeers.map((p) => p.id).join('、')}`
+      + `（${engineOnlyPeers.map((p) => `${p.id}: ${p.names.join('/')}`).join('；')}）`
+      + ' ⇒ 这些端到**引擎仓远端**不可达，"引擎是否落后"不可知；这是环境条件，不是它们的内容同步故障。',
+  });
 }
 if (fleet.note && !JSON_OUT && !QUIET) checks.push({ name: '状态分支', level: 'INFO', expected: cfg.state.branch, actual: fleet.note });
 
