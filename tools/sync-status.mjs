@@ -754,6 +754,11 @@ if (tCfg?.backup?.enabled === true) {
        实测 2026-10-23 22:00：ok=false / exitCode=1 / restic rc=10（备份盘不在），但 attention 仍是 false
        ⇒ 仪表盘只看 attention，于是"整晚没备份"显示成绿的。这是典型的假绿：状态文件里明明写着失败，
        却没有任何断言读它。此行的判据直接取状态文件的 ok 字段（不重算），失败原因一并显示。 */
+    /* batch 24（2026-11-04）：ok=true 但 exitCode≠0 也是"某步没跑成"——实测 10-24 / 10-27 / 10-28 / 11-01
+       连续四次出现（快照正常、退出码非零），而「备份上次运行」只看 ok ⇒ 一直是盲区。记 WARN，不冒充失败。 */
+    if (backup.ok !== false && typeof bs.exitCode === 'number' && bs.exitCode !== 0) {
+      add('备份退出码', 'WARN', 'exitCode=0', `rc=${bs.exitCode}（快照已生成，但某一步未成功${bs.errors ? '：' + String(bs.errors).slice(0, 140) : ''}）`);
+    }
     if (backup.ok === false) add('备份上次运行', 'FAIL', 'ok=true（成功）', `rc=${bs.exitCode ?? '?'}${bs.errors ? '：' + String(bs.errors).slice(0, 170) : ''}`);
     if (backup.attention) add('备份待处理信号', 'FAIL', 'attention=false', (backup.flags || []).join('、') || '见状态文件');
     if (backup.unreadable) add('备份读不到的文件', 'WARN', '0 个', `${backup.unreadable} 个（清单变化才升级，见 backup-restic.md §6）`);

@@ -169,7 +169,16 @@ function expand(v) {
   if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, expand(x)]));
   return v;
 }
-for (const [name, s] of Object.entries(src)) src[name] = expand(s);
+/* 2026-11-04（batch 24）：**先判"本机排除"，再展开占位符**。
+   此前上面这行对全部条目展开 ⇒ 某条在本机被 excludeMachines 排除、但它含该机不存在的占位符
+   （如 ${OBSCURA_CDP}）时，unresolved 命中 ⇒ 渲染硬失败 exit 2 ⇒ tick rc=1。
+   来源：某端 11-01~11-03 的连续 tick 失败 + 另一台报的「expand 先于 excludeMachines」。
+   excludedHere 是**单一判定**：expand 跳过它、filter 复用它，两处不再各写一份。 */
+const excludedHere = (s) => Array.isArray(s && s.excludeMachines) && s.excludeMachines.includes(MACHINE);
+for (const [name, s] of Object.entries(src)) {
+  if (excludedHere(s)) continue;   // 本机排除 ⇒ 原样保留，不展开（也就不会有未解析占位符）
+  src[name] = expand(s);
+}
 if (unresolved.size > 0) {
   console.error(`[FAIL] 以下占位符在本机（${MACHINE}）无法取值：${[...unresolved].join(', ')}`);
   console.error(`       修法：运行 node render_mcp.mjs --detect，把值填进 ${MACHINE_FILE}`);
@@ -188,8 +197,7 @@ const TOOLS = ['workbuddy', 'dsh', 'opencode'];
 const targetsOf = (s) => (Array.isArray(s.targets) && s.targets.length ? s.targets : TOOLS);
 const filter = (servers, tool) =>
   Object.fromEntries(Object.entries(servers).filter(([, s]) =>
-    targetsOf(s).includes(tool) &&
-    !(Array.isArray(s.excludeMachines) && s.excludeMachines.includes(MACHINE))));
+    targetsOf(s).includes(tool) && !excludedHere(s)));
 
 /* ---------------- helpers ---------------- */
 
